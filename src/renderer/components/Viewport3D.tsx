@@ -145,12 +145,99 @@ export function resolveClickAgainstVisibleDetail(
   };
 }
 
-function disposeGroupMeshes(group: THREE.Group): void {
+export function disposeGroupMeshes(group: THREE.Group): void {
   while (group.children.length > 0) {
     const child = group.children[0] as THREE.Mesh;
     group.remove(child);
     child.geometry.dispose();
   }
+}
+
+export interface OrbitDetailCallbacks {
+  onCameraMoved: () => void;
+  onCameraSettled: () => void;
+  settleDelayMs?: number;
+}
+
+/**
+ * Coordinates Three.js OrbitControls events with exact-detail vs moving-preview
+ * visibility. OrbitControls emits 'start' immediately on stationary pointerdown;
+ * this keeps exact detail visible until actual camera movement occurs on 'change'.
+ */
+export function attachOrbitDetailLifecycle(
+  controls: OrbitControls,
+  camera: THREE.Camera,
+  previewGroup: THREE.Group,
+  detailGroup: THREE.Group,
+  callbacks: OrbitDetailCallbacks,
+) {
+  let settleTimer: number | null = null;
+  let interacting = false;
+  let movedThisGesture = false;
+  const startCamPos = new THREE.Vector3();
+  const startTarget = new THREE.Vector3();
+  const settleDelayMs = callbacks.settleDelayMs ?? 120;
+
+  const syncRestSnapshot = () => {
+    startCamPos.copy(camera.position);
+    startTarget.copy(controls.target);
+  };
+  syncRestSnapshot();
+
+  const onStart = () => {
+    if (settleTimer !== null) {
+      window.clearTimeout(settleTimer);
+      settleTimer = null;
+    }
+    interacting = true;
+    movedThisGesture = false;
+    syncRestSnapshot();
+  };
+
+  const onChange = () => {
+    const camMoved =
+      camera.position.distanceToSquared(startCamPos) > 1e-10 ||
+      controls.target.distanceToSquared(startTarget) > 1e-10;
+    if (!camMoved) return;
+
+    if (!movedThisGesture) {
+      movedThisGesture = true;
+      callbacks.onCameraMoved();
+      if (previewGroup.children.length > 0) {
+        previewGroup.visible = true;
+        detailGroup.visible = false;
+      }
+    }
+    syncRestSnapshot();
+  };
+
+  const onEnd = () => {
+    interacting = false;
+    if (!movedThisGesture && detailGroup.visible) {
+      return;
+    }
+    if (settleTimer !== null) window.clearTimeout(settleTimer);
+    settleTimer = window.setTimeout(() => {
+      settleTimer = null;
+      if (!interacting) {
+        callbacks.onCameraSettled();
+      }
+    }, settleDelayMs);
+  };
+
+  controls.addEventListener('start', onStart);
+  controls.addEventListener('change', onChange);
+  controls.addEventListener('end', onEnd);
+
+  return {
+    syncRestSnapshot,
+    dispose: () => {
+      if (settleTimer !== null) window.clearTimeout(settleTimer);
+      controls.removeEventListener('start', onStart);
+      controls.removeEventListener('change', onChange);
+      controls.removeEventListener('end', onEnd);
+    },
+  };
 }
 
 export function Viewport3D({
@@ -192,6 +279,7 @@ export function Viewport3D({
     scene: THREE.Scene;
     camera: THREE.PerspectiveCamera;
     controls: OrbitControls;
+    orbitLifecycle: ReturnType<typeof attachOrbitDetailLifecycle>;
     renderer: THREE.WebGLRenderer;
     modelGroup: THREE.Group;
     previewGroup: THREE.Group;
@@ -336,10 +424,31 @@ export function Viewport3D({
     modelGroup.add(detailGroup);
     scene.add(modelGroup);
 
+    const orbitLifecycle = attachOrbitDetailLifecycle(
+      controls,
+      camera,
+      previewGroup,
+      detailGroup,
+      {
+        onCameraMoved: () => {
+          ++streamGenerationRef.current;
+          ++viewGenRef.current;
+          onViewChangeRef.current?.();
+        },
+        onCameraSettled: () => {
+          const m = activeModelRef.current;
+          if (m) {
+            void streamForCurrentCamera(m);
+          }
+        },
+      },
+    );
+
     sceneRefs.current = {
       scene,
       camera,
       controls,
+      orbitLifecycle,
       renderer,
       modelGroup,
       previewGroup,
@@ -347,27 +456,6 @@ export function Viewport3D({
       material,
       radius: 1,
     };
-
-    let settleTimer: number | null = null;
-    const onControlStart = () => {
-      if (settleTimer !== null) window.clearTimeout(settleTimer);
-      ++streamGenerationRef.current;
-      ++viewGenRef.current;
-      onViewChangeRef.current?.();
-      if (previewGroup.children.length > 0) {
-        previewGroup.visible = true;
-        detailGroup.visible = false;
-      }
-    };
-    const onControlEnd = () => {
-      const m = activeModelRef.current;
-      if (!m) return;
-      settleTimer = window.setTimeout(() => {
-        void streamForCurrentCamera(m);
-      }, 120);
-    };
-    controls.addEventListener('start', onControlStart);
-    controls.addEventListener('end', onControlEnd);
 
     let downX = 0;
     let downY = 0;
@@ -458,10 +546,8 @@ export function Viewport3D({
 
     return () => {
       window.cancelAnimationFrame(rafId);
-      if (settleTimer !== null) window.clearTimeout(settleTimer);
       resizeObserver.disconnect();
-      controls.removeEventListener('start', onControlStart);
-      controls.removeEventListener('end', onControlEnd);
+      orbitLifecycle.dispose();
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       renderer.domElement.removeEventListener('pointerup', onPointerUp);
       disposeGroupMeshes(previewGroup);
@@ -610,6 +696,7 @@ export function Viewport3D({
     refs.camera.far = Math.max(500, radius * 40);
     refs.camera.updateProjectionMatrix();
     refs.controls.update();
+    refs.orbitLifecycle.syncRestSnapshot();
 
     void streamForCurrentCamera(model);
   }, [model, orientation]);
@@ -640,6 +727,7 @@ export function Viewport3D({
         break;
     }
     refs.controls.update();
+    refs.orbitLifecycle.syncRestSnapshot();
     if (model) {
       void streamForCurrentCamera(model);
     }

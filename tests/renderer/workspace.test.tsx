@@ -4,8 +4,10 @@ import React from 'react';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react';
 import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import App from '../../src/renderer/App';
 import {
+  attachOrbitDetailLifecycle,
   findRayIntersectingBatchIndices,
   resolveClickAgainstVisibleDetail,
   selectCameraVisibleBatchIndices,
@@ -341,5 +343,86 @@ describe('UI import-orbit-orientation actions', () => {
     );
     expect(discardModel).toHaveBeenCalledWith('model_second');
     expect(screen.getByText('first.stl')).toBeInTheDocument();
+  });
+
+  it('keeps exact detail on stationary OrbitControls pointerdown/pointerup and enters preview only on real drag', async () => {
+    const canvas = document.createElement('canvas');
+    Object.defineProperty(canvas, 'clientWidth', { value: 800 });
+    Object.defineProperty(canvas, 'clientHeight', { value: 600 });
+    canvas.setPointerCapture = vi.fn();
+    canvas.releasePointerCapture = vi.fn();
+    canvas.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, width: 800, height: 600, right: 800, bottom: 600, x: 0, y: 0, toJSON: () => {} }) as DOMRect;
+    document.body.appendChild(canvas);
+
+    const camera = new THREE.PerspectiveCamera(42, 800 / 600, 0.1, 1000);
+    camera.position.set(0, 1, 5);
+    const controls = new OrbitControls(camera, canvas);
+
+    const previewGroup = new THREE.Group();
+    previewGroup.add(new THREE.Mesh(new THREE.BufferGeometry()));
+    previewGroup.visible = true;
+
+    const detailGroup = new THREE.Group();
+    detailGroup.add(new THREE.Mesh(new THREE.BufferGeometry()));
+    detailGroup.visible = true;
+
+    const onCameraMoved = vi.fn();
+    const onCameraSettled = vi.fn();
+    const lifecycle = attachOrbitDetailLifecycle(
+      controls,
+      camera,
+      previewGroup,
+      detailGroup,
+      { onCameraMoved, onCameraSettled, settleDelayMs: 20 },
+    );
+
+    const dispatchPointer = (type: string, x: number, y: number) => {
+      const evt = new Event(type, { bubbles: true, cancelable: true }) as unknown as PointerEvent;
+      Object.defineProperties(evt, {
+        pointerId: { value: 1 },
+        pointerType: { value: 'mouse' },
+        button: { value: 0 },
+        buttons: { value: type === 'pointerup' ? 0 : 1 },
+        clientX: { value: x },
+        clientY: { value: y },
+      });
+      canvas.dispatchEvent(evt);
+    };
+
+    // 1. Stationary press + release: real OrbitControls emits 'start' on pointerdown,
+    //    but detailGroup must stay visible and onCameraMoved must NOT fire.
+    dispatchPointer('pointerdown', 400, 300);
+    expect(detailGroup.visible).toBe(true);
+    expect(onCameraMoved).not.toHaveBeenCalled();
+
+    dispatchPointer('pointerup', 400, 300);
+    expect(detailGroup.visible).toBe(true);
+    expect(resolveClickAgainstVisibleDetail(detailGroup.visible, new Set([0]), [0])).toEqual({
+      kind: 'pick',
+      visibleBatchIds: [0],
+    });
+
+    // 2. Stationary repeat click
+    dispatchPointer('pointerdown', 400, 300);
+    dispatchPointer('pointerup', 400, 300);
+    expect(detailGroup.visible).toBe(true);
+    expect(onCameraMoved).not.toHaveBeenCalled();
+
+    // 3. Real drag that moves camera -> enters moving preview, then settles
+    dispatchPointer('pointerdown', 400, 300);
+    dispatchPointer('pointermove', 480, 340);
+    expect(onCameraMoved).toHaveBeenCalledTimes(1);
+    expect(detailGroup.visible).toBe(false);
+    expect(previewGroup.visible).toBe(true);
+
+    dispatchPointer('pointerup', 480, 340);
+    await waitFor(() => {
+      expect(onCameraSettled).toHaveBeenCalledTimes(1);
+    });
+
+    lifecycle.dispose();
+    controls.dispose();
+    canvas.remove();
   });
 });
