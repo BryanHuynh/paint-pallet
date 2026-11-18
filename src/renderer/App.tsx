@@ -14,6 +14,7 @@ import type { PaintRecipe } from './palette/types';
 import { createEmptyRecipe } from './palette/recipes';
 import { ShadowPanel } from './paint/ShadowPanel';
 import { useShadowPainting } from './paint/useShadowPainting';
+import { FILL_PREVIEW_REGION, unpackFillFaces, useConnectedFill } from './paint/useConnectedFill';
 import appLogoUrl from '../../assets/paint-pallet-logo.png';
 
 type PaletteComponent = React.ComponentType<Record<string, unknown>>;
@@ -54,6 +55,11 @@ export default function App({
   const shadow = useShadowPainting(recipes);
   const [activeTab, setActiveTab] = useState<'model' | 'palette'>('model');
   const [model, setModel] = useState<ModelSummary | null>(null);
+  const fill = useConnectedFill(api, shadow.tool === 'fill', model?.modelId, shadow.region?.id, shadow.committedCoverage);
+  const shadowColors = useMemo(() => {
+    if (!fill.previewCoverage) return shadow.colors;
+    return new Map([...shadow.colors, [FILL_PREVIEW_REGION, '#76d9ac']]);
+  }, [fill.previewCoverage, shadow.colors]);
   const [pendingModel, setPendingModel] = useState<ModelSummary | null>(null);
   const [orientation, setOrientation] = useState<ModelOrientation>({
     upright: '+Y',
@@ -190,8 +196,8 @@ export default function App({
 
     void importFrom(async () => {
       const file = files[0];
-      if (files.length !== 1 || !file || !/\.stl$/i.test(file.name)) {
-        throw new Error('Drop one .stl file at a time.');
+      if (files.length !== 1 || !file || !/\.(stl|obj)$/i.test(file.name)) {
+        throw new Error('Drop one .stl or .obj file at a time.');
       }
 
       return () => importDroppedStl(file);
@@ -252,6 +258,7 @@ export default function App({
         activeModelIdRef.current = committed.modelId;
         pendingModelRef.current = null;
         shadow.reset();
+        fill.cancel();
         setModel(committed);
         setPendingModel(null);
         setProgress(null);
@@ -312,7 +319,14 @@ export default function App({
     try {
       const sequence = ++pickSeqRef.current;
       const result = await api.pickFace(model.modelId, origin, direction, batchIndices);
-      if (sequence === pickSeqRef.current && isCurrent()) setPickResult(result);
+      if (sequence !== pickSeqRef.current || !isCurrent()) return;
+      if (shadow.tool === 'fill' && shadow.region) {
+        if (result.hit && result.originalFaceId !== null && result.partId === model.partId) {
+          fill.select({ modelId: model.modelId, faceId: result.originalFaceId, regionId: shadow.region.id });
+        }
+      } else {
+        setPickResult(result);
+      }
     } catch (error) {
       if (isCurrent()) setStatusMsg(error instanceof Error ? error.message : 'Surface pick failed.');
     }
@@ -389,7 +403,7 @@ export default function App({
             onClick={handleOpenStl}
             disabled={!api || isBusy}
           >
-            Open STL
+            Open model
           </button>
         </div>
       </header>
@@ -421,9 +435,9 @@ export default function App({
             cameraPresetRequest={cameraPresetRequest}
             onSurfacePick={handleSurfacePick}
             shadowPaint={{
-              enabled: Boolean(model && shadow.tool && shadow.recipe && !isBusy),
-              coverage: shadow.coverage,
-              colors: shadow.colors,
+              enabled: Boolean(model && shadow.tool && shadow.tool !== 'fill' && shadow.recipe && !isBusy),
+              coverage: fill.previewCoverage ?? shadow.coverage,
+              colors: shadowColors,
               diameter: shadow.brushSize,
               onFaces: shadow.paintFaces,
               onStart: shadow.beginStroke,
@@ -439,11 +453,11 @@ export default function App({
           {!model && !isBusy ? (
             <div className="viewport-empty">
               <div className="viewport-empty__card">
-                <h2>Binary STL surface inspector</h2>
-                {api?.importDroppedStl ? <p>Drop an STL file here to open it.</p> : null}
+                <h2>Model surface inspector</h2>
+                {api?.importDroppedStl ? <p>Drop an STL or OBJ file here.</p> : null}
                 <p>
-                  Open a print-ready binary STL up to {stlLimitLabel} to inspect original triangles,
-                  set upright and front axes, and pick original face IDs.
+                  Open an STL or OBJ model to inspect original triangles,
+                  set upright and front axes, and pick original face IDs. Binary STL files can be up to {stlLimitLabel}.
                 </p>
                 {api ? (
                   <button
@@ -451,7 +465,7 @@ export default function App({
                     className="btn btn--secondary"
                     onClick={handleOpenStl}
                   >
-                    Choose STL file
+                    Choose model file
                   </button>
                 ) : (
                   <p>Open the Electron app to import and inspect STL files.</p>
@@ -462,7 +476,7 @@ export default function App({
 
           {isDraggingStl && !isBusy ? (
             <div className="stl-drop-overlay" aria-hidden="true">
-              Drop STL to open
+              Drop model to open
             </div>
           ) : null}
 
@@ -510,7 +524,18 @@ export default function App({
         </section>
 
         <aside className="inspector-panel" aria-label="Model inspector">
-          {model && <ShadowPanel paint={shadow} recipes={recipes} busy={isBusy} />}
+          {model && (
+            <ShadowPanel
+              paint={shadow}
+              fill={fill}
+              recipes={recipes}
+              busy={isBusy}
+              onApplyFill={() => {
+                if (fill.packed) shadow.commitFill(unpackFillFaces(fill.packed));
+                fill.cancel();
+              }}
+            />
+          )}
           <section className="inspector-section">
             <h2>Model summary</h2>
             {model ? (

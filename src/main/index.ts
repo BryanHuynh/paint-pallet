@@ -3,13 +3,14 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { WorkerClient, readBatchBinary } from './workerClient';
-import type { ModelSummary, Vec3 } from '../shared/workerProtocol';
+import type { ConnectedFillRequest, ModelSummary, Vec3 } from '../shared/workerProtocol';
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 declare const MAIN_WINDOW_VITE_NAME: string;
 
 let mainWindow: BrowserWindow | null = null;
 let workerClient: WorkerClient | null = null;
+const activeFillJobs = new Set<string>();
 let activeImportJobId: string | null = null;
 const authorizedImportPaths = new Set<string>();
 let committedBatchPaths = new Set<string>();
@@ -98,9 +99,9 @@ app.whenReady().then(() => {
   ipcMain.handle('dialog:select-stl', async () => {
     if (!mainWindow) return null;
     const result = await dialog.showOpenDialog(mainWindow, {
-      title: 'Open Binary STL',
+      title: 'Open STL or OBJ',
       properties: ['openFile'],
-      filters: [{ name: 'STL Meshes', extensions: ['stl'] }],
+      filters: [{ name: 'STL and OBJ meshes', extensions: ['stl', 'obj'] }],
     });
     if (result.canceled || result.filePaths.length === 0) {
       return null;
@@ -145,9 +146,9 @@ app.whenReady().then(() => {
       event.senderFrame !== mainWindow.webContents.mainFrame ||
       typeof filePath !== 'string' ||
       !path.isAbsolute(filePath) ||
-      path.extname(filePath).toLowerCase() !== '.stl'
+      !['.stl', '.obj'].includes(path.extname(filePath).toLowerCase())
     ) {
-      throw new Error('Drop an STL file from your computer.');
+      throw new Error('Drop an STL or OBJ file from your computer.');
     }
     return importStl(path.resolve(filePath));
   });
@@ -206,6 +207,30 @@ app.whenReady().then(() => {
       return getWorkerClient().pickFace(modelId, origin, direction, batchIndices);
     },
   );
+
+  ipcMain.handle('worker:connected-fill', async (_event, request: ConnectedFillRequest) => {
+    if (!request || typeof request.modelId !== 'string' ||
+      typeof request.jobId !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(request.jobId) ||
+      !Number.isSafeInteger(request.faceId) || request.faceId < 0 ||
+      !Number.isFinite(request.maxCreaseDegrees) || request.maxCreaseDegrees < 0 || request.maxCreaseDegrees > 180 ||
+      !Array.isArray(request.blockedFaces) ||
+      request.blockedFaces.some((face) => !Number.isSafeInteger(face) || face < 0 || face > 0xffffffff) ||
+      activeFillJobs.has(request.jobId)) {
+      throw new Error('Invalid connected fill request.');
+    }
+
+    activeFillJobs.add(request.jobId);
+    try {
+      return await getWorkerClient().previewConnectedFill(request);
+    } finally {
+      activeFillJobs.delete(request.jobId);
+    }
+  });
+
+  ipcMain.handle('worker:cancel-fill', async (_event, jobId: string) => {
+    if (!activeFillJobs.has(jobId)) return { canceled: false };
+    return getWorkerClient().cancelImport(jobId);
+  });
 
   createWindow();
 

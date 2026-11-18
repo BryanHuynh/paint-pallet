@@ -1,4 +1,5 @@
 #include "stl_importer.hpp"
+#include "meshoptimizer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -799,23 +800,51 @@ ImportOutcome importBinaryStl(
     if (cancelFlag.load(std::memory_order_relaxed)) {
       return failOrCancel(true, "Import canceled");
     }
+    std::vector<std::array<float, 3>> previewPositions;
+    previewPositions.reserve(previewCells.size());
+    for (const ClusterCell& cell : previewCells) {
+      previewPositions.push_back({static_cast<float>(cell.sumX / cell.count),
+                                  static_cast<float>(cell.sumY / cell.count),
+                                  static_cast<float>(cell.sumZ / cell.count)});
+    }
+
+    std::vector<unsigned int> previewIndices;
+    previewIndices.reserve(previewClusterTris.size() * 3);
+    for (const ClusterTri& tri : previewClusterTris) {
+      previewIndices.push_back(tri.c0);
+      previewIndices.push_back(tri.c1);
+      previewIndices.push_back(tri.c2);
+    }
+
+    previewCellToId.clear();
+    previewCells.clear();
+    previewTriKeys.clear();
+    previewClusterTris.clear();
+
+    if (previewIndices.size() >= 6) {
+      std::vector<unsigned int> optimized(previewIndices.size());
+      const size_t targetTriangles = std::max<size_t>(1, std::min<size_t>(120000, previewIndices.size() / 4));
+      const size_t count = meshopt_simplify(
+          optimized.data(), previewIndices.data(), previewIndices.size(),
+          previewPositions.front().data(), previewPositions.size(), sizeof(previewPositions.front()),
+          targetTriangles * 3, 0.003f, meshopt_SimplifyLockBorder);
+      if (count >= 3 && count < previewIndices.size()) {
+        optimized.resize(count);
+        previewIndices = std::move(optimized);
+      }
+    }
+    if (cancelFlag.load(std::memory_order_relaxed)) {
+      return failOrCancel(true, "Import canceled");
+    }
+
     std::vector<PackedTri> previewTris;
-    previewTris.reserve(previewClusterTris.size());
-    for (uint32_t pIdx = 0; pIdx < static_cast<uint32_t>(previewClusterTris.size()); ++pIdx) {
-      const ClusterTri& ct = previewClusterTris[pIdx];
-      const ClusterCell& v0 = previewCells[ct.c0];
-      const ClusterCell& v1 = previewCells[ct.c1];
-      const ClusterCell& v2 = previewCells[ct.c2];
+    previewTris.reserve(previewIndices.size() / 3);
+    for (size_t corner = 0; corner < previewIndices.size(); corner += 3) {
       PackedTri pt{};
-      pt.pos[0] = static_cast<float>(v0.sumX / v0.count);
-      pt.pos[1] = static_cast<float>(v0.sumY / v0.count);
-      pt.pos[2] = static_cast<float>(v0.sumZ / v0.count);
-      pt.pos[3] = static_cast<float>(v1.sumX / v1.count);
-      pt.pos[4] = static_cast<float>(v1.sumY / v1.count);
-      pt.pos[5] = static_cast<float>(v1.sumZ / v1.count);
-      pt.pos[6] = static_cast<float>(v2.sumX / v2.count);
-      pt.pos[7] = static_cast<float>(v2.sumY / v2.count);
-      pt.pos[8] = static_cast<float>(v2.sumZ / v2.count);
+      for (size_t vertex = 0; vertex < 3; ++vertex) {
+        const auto& position = previewPositions[previewIndices[corner + vertex]];
+        std::copy(position.begin(), position.end(), &pt.pos[vertex * 3]);
+      }
       float fn[3];
       computeFaceNormal(pt.pos, fn);
       if (fn[0] == 0.0f && fn[1] == 0.0f && fn[2] == 0.0f) continue;
@@ -824,13 +853,9 @@ ImportOutcome importBinaryStl(
         pt.norm[3 + k] = fn[k];
         pt.norm[6 + k] = fn[k];
       }
-      pt.faceId = pIdx;
+      pt.faceId = static_cast<uint32_t>(previewTris.size());
       previewTris.push_back(pt);
     }
-    previewCellToId.clear();
-    previewCells.clear();
-    previewTriKeys.clear();
-    previewClusterTris.clear();
 
     if (!previewTris.empty()) {
       previewPath = pathToUtf8(jobDir / "preview.bin");

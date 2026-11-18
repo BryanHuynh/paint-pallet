@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type {
+  ConnectedFillRequest,
   ImportProgressEvent,
   PaintPalletApi,
   Vec3,
@@ -9,7 +10,7 @@ const api: PaintPalletApi = {
   selectStlFile: () => ipcRenderer.invoke('dialog:select-stl'),
   importDroppedStl: async (file: File) => {
     const filePath = webUtils.getPathForFile(file);
-    if (!filePath) throw new Error('Drop an STL file from your computer.');
+    if (!filePath) throw new Error('Drop an STL or OBJ file from your computer.');
     return ipcRenderer.invoke('worker:import-dropped-stl', filePath);
   },
   importStl: (filePath: string) =>
@@ -23,6 +24,8 @@ const api: PaintPalletApi = {
   readBatch: (filePath: string) => ipcRenderer.invoke('worker:read-batch', filePath),
   pickFace: (modelId: string, origin: Vec3, direction: Vec3, batchIndices?: number[]) =>
     ipcRenderer.invoke('worker:pick-face', modelId, origin, direction, batchIndices),
+  previewConnectedFill: (request: ConnectedFillRequest) => ipcRenderer.invoke('worker:connected-fill', request),
+  cancelConnectedFill: (jobId: string) => ipcRenderer.invoke('worker:cancel-fill', jobId),
   onImportProgress: (listener: (event: ImportProgressEvent) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, payload: ImportProgressEvent) => {
       listener(payload);

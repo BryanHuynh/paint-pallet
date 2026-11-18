@@ -18,7 +18,7 @@ import {
 export function useShadowPainting(recipes: PaintRecipe[]) {
   const [regions, setRegions] = useState<ShadowRegion[]>([]);
   const [regionId, setRegionId] = useState('');
-  const [tool, setTool] = useState<ShadowTool | null>(null);
+  const [tool, setTool] = useState<ShadowTool | 'fill' | null>(null);
   const [brushSize, setBrushSize] = useState(32);
   const [history, setHistory] = useState(emptyShadowHistory);
   const historyRef = useRef(history);
@@ -68,7 +68,7 @@ export function useShadowPainting(recipes: PaintRecipe[]) {
   }
 
   function beginStroke(): boolean {
-    if (!tool || !region || !recipe || strokeRef.current) return false;
+    if (!tool || tool === 'fill' || !region || !recipe || strokeRef.current) return false;
     strokeRef.current = startShadowStroke(historyRef.current.coverage, region.id, tool);
     setStrokePending(true);
     return true;
@@ -92,10 +92,19 @@ export function useShadowPainting(recipes: PaintRecipe[]) {
     setStrokePending(false);
   }
 
+  function commitFill(faces: Iterable<SurfaceFace>) {
+    if (!region || !recipe || strokeRef.current) return;
+    const history = historyRef.current;
+    const fill = startShadowStroke(history.coverage, region.id, 'brush');
+    if (paintShadowFaces(fill, faces)) updateHistory(commitShadowStroke(history, fill));
+  }
+
   return {
     regions, region, recipe, colors, tool, brushSize, setBrushSize, strokePending,
     paintedFaces: committedFaceCount + (draft?.faceDelta ?? 0),
     coverage: draft?.coverage ?? history.coverage,
+    committedCoverage: history.coverage,
+    commitFill,
     canUndo: history.undo.length > 0,
     canRedo: history.redo.length > 0,
     createRegion, updateRegion, setRegionId, setTool, reset, beginStroke, paintFaces, endStroke,

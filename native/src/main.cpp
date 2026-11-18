@@ -1,9 +1,12 @@
 #include "protocol.hpp"
 #include "stl_importer.hpp"
+#include "surface_topology.hpp"
 
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <condition_variable>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -65,6 +68,33 @@ std::string formatModelJson(const pp::ModelRecord& m) {
   return s;
 }
 
+void restoreOriginalSource(const std::string& line, pp::ImportOutcome& outcome) {
+  const auto name = pp::extractJsonString(line, "sourceName");
+  if (!outcome.ok || !name) return;
+  const auto metadata = pp::extractJsonNumberArray(line, "sourceMeta");
+  if (!metadata || metadata->size() != 1 || !((*metadata)[0] >= 0 && (*metadata)[0] <= 2147483648.0)) {
+    throw std::runtime_error("Invalid original model metadata.");
+  }
+
+  outcome.model.fileName = *name;
+  outcome.model.fileSizeBytes = static_cast<uint64_t>((*metadata)[0]);
+  const auto sourceGroups = pp::extractJsonString(line, "sourceGroups");
+  if (!sourceGroups) return;
+
+  const auto ids = std::filesystem::u8path(*sourceGroups);
+  const auto names = pp::extractJsonString(line, "sourceGroupNames");
+  if (!names || std::filesystem::file_size(ids) != static_cast<uint64_t>(outcome.model.triangleCount) * 4) {
+    throw std::runtime_error("Could not preserve the OBJ groups.");
+  }
+
+  const auto dir = std::filesystem::u8path(outcome.model.jobDir);
+  const auto destination = dir / "face-groups.bin";
+  std::filesystem::copy_file(ids, destination);
+  std::filesystem::copy_file(std::filesystem::u8path(*names), dir / "group-names.json");
+  const auto destinationUtf8 = destination.u8string();
+  outcome.model.groupIdsPath.assign(destinationUtf8.begin(), destinationUtf8.end());
+}
+
 struct QueuedJob {
   std::string line;
   std::shared_ptr<std::atomic<bool>> cancelFlag;
@@ -76,6 +106,7 @@ struct WorkerState {
   std::unordered_map<std::string, pp::ModelRecord> models;
   std::string activeModelId;
   pp::PickBatchCache pickCache{16};
+  pp::SurfaceTopology topology;
 };
 
 }  // namespace
@@ -140,6 +171,13 @@ int main() {
                      ",\"trianglesRead\":" + std::to_string(p.trianglesRead) +
                      ",\"totalTriangles\":" + std::to_string(p.totalTriangles) + "}");
           });
+          try {
+            restoreOriginalSource(line, outcome);
+          } catch (const std::exception& error) {
+            pp::cleanupJobDir(outcome.model.jobDir);
+            outcome.ok = false;
+            outcome.errorMessage = error.what();
+          }
         }
 
         {
@@ -159,6 +197,7 @@ int main() {
                 }
                 state.activeModelId = outcome.model.modelId;
                 state.pickCache.clear();
+                state.topology.clear();
               }
               state.models[outcome.model.modelId] = outcome.model;
             }
@@ -197,6 +236,7 @@ int main() {
             }
             state.activeModelId = modelId;
             state.pickCache.clear();
+            state.topology.clear();
             committed = true;
           }
         }
@@ -225,6 +265,43 @@ int main() {
         }
         emitLine("{\"type\":\"discard_ack\",\"reqId\":\"" + pp::jsonEscape(reqId) +
                  "\",\"discarded\":" + (discarded ? "true" : "false") + "}");
+      } else if (cmd == "connected_fill") {
+        const std::string jobId = pp::extractJsonString(line, "jobId").value_or("");
+        const std::string modelId = pp::extractJsonString(line, "modelId").value_or("");
+        const std::string prefix = "\",\"reqId\":\"" + pp::jsonEscape(reqId) + "\"";
+        try {
+          auto params = pp::extractJsonNumberArray(line, "fillParams");
+          auto blocked = pp::extractJsonUIntArray(line, "blockedFaces");
+          auto model = state.models.find(modelId);
+          if (!job.cancelFlag || !params || params->size() != 2 || !blocked ||
+              model == state.models.end() || modelId != state.activeModelId) {
+            throw std::runtime_error("The fill model or options are unavailable.");
+          }
+          const double seed = (*params)[0];
+          const double angle = (*params)[1];
+          if (!(seed >= 0 && seed < model->second.triangleCount && seed == std::floor(seed)) ||
+              !(angle >= 0 && angle <= 180)) {
+            throw std::runtime_error("Invalid fill face or crease angle.");
+          }
+
+          const bool ready = state.topology.matches(model->second) ||
+            state.topology.build(model->second, *job.cancelFlag);
+          const std::string filePath = ready
+            ? state.topology.writeConnectedFill(model->second, jobId, static_cast<uint32_t>(seed),
+                                                angle, *blocked, *job.cancelFlag)
+            : "";
+          if (filePath.empty()) {
+            emitLine("{\"type\":\"fill_canceled" + prefix + "}");
+          } else {
+            emitLine("{\"type\":\"fill_complete" + prefix + ",\"filePath\":\"" + pp::jsonEscape(filePath) + "\"}");
+          }
+        } catch (const std::exception& error) {
+          emitLine("{\"type\":\"fill_error" + prefix + ",\"error\":\"" + pp::jsonEscape(error.what()) + "\"}");
+        }
+        {
+          std::lock_guard<std::mutex> lock(state.jobsMutex);
+          state.pendingOrRunningJobs.erase(jobId);
+        }
       } else if (cmd == "pick") {
         const std::string modelId = pp::extractJsonString(line, "modelId").value_or("");
         auto originOpt = pp::extractJsonNumberArray(line, "origin");
@@ -316,7 +393,7 @@ int main() {
     }
 
     std::shared_ptr<std::atomic<bool>> flag;
-    if (*cmdOpt == "import") {
+    if (*cmdOpt == "import" || *cmdOpt == "connected_fill") {
       const std::string jobId = pp::extractJsonString(line, "jobId").value_or("");
       if (isValidJobId(jobId)) {
         std::lock_guard<std::mutex> lock(state.jobsMutex);

@@ -56,11 +56,11 @@ describe('UI import-orbit-orientation actions', () => {
     cleanup();
   });
 
-  it('imports an STL via Open STL and displays model stats', async () => {
+  it('imports an STL via Open model and displays model stats', async () => {
     const api = createMockApi();
     render(<App api={api} disableWebGL />);
 
-    const openBtn = screen.getByRole('button', { name: /open stl/i });
+    const openBtn = screen.getByRole('button', { name: /open model/i });
     fireEvent.click(openBtn);
 
     await waitFor(() => {
@@ -83,7 +83,7 @@ describe('UI import-orbit-orientation actions', () => {
     const dataTransfer = { types: ['Files'], files: [file], dropEffect: 'none' };
     fireEvent.dragOver(viewport, { dataTransfer });
     expect(dataTransfer.dropEffect).toBe('copy');
-    expect(screen.getByText('Drop STL to open')).toBeInTheDocument();
+    expect(screen.getByText('Drop model to open')).toBeInTheDocument();
 
     fireEvent.drop(viewport, { dataTransfer });
     fireEvent.drop(viewport, { dataTransfer });
@@ -92,7 +92,7 @@ describe('UI import-orbit-orientation actions', () => {
     expect(importDroppedStl).toHaveBeenCalledExactlyOnceWith(file);
     expect(api.importStl).toHaveBeenCalledExactlyOnceWith('C:/models/test_mini.stl');
     expect(api.selectStlFile).not.toHaveBeenCalled();
-    expect(screen.queryByText('Drop STL to open')).not.toBeInTheDocument();
+    expect(screen.queryByText('Drop model to open')).not.toBeInTheDocument();
   });
 
   it('rejects a non-STL or multiple dropped files before asking Electron for a path', async () => {
@@ -105,7 +105,7 @@ describe('UI import-orbit-orientation actions', () => {
     const png = new File(['image'], 'reference.png');
     for (const files of [[png], [stl, stl]]) {
       fireEvent.drop(viewport, { dataTransfer: { types: ['Files'], files } });
-      expect(await screen.findByRole('alert')).toHaveTextContent('Drop one .stl file at a time.');
+      expect(await screen.findByRole('alert')).toHaveTextContent('Drop one .stl or .obj file at a time.');
     }
     expect(importDroppedStl).not.toHaveBeenCalled();
     expect(api.importStl).not.toHaveBeenCalled();
@@ -133,10 +133,10 @@ describe('UI import-orbit-orientation actions', () => {
     const api = createMockApi({ selectStlFile, importStl });
     render(<App api={api} disableWebGL />);
 
-    fireEvent.click(screen.getByRole('button', { name: /open stl/i }));
+    fireEvent.click(screen.getByRole('button', { name: /open model/i }));
     expect(await screen.findByText('first.stl')).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: /open stl/i }));
+    fireEvent.click(screen.getByRole('button', { name: /open model/i }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/Truncated or malformed/i);
     expect(screen.getByText('first.stl')).toBeInTheDocument();
   });
@@ -278,18 +278,18 @@ describe('UI import-orbit-orientation actions', () => {
     render(<App api={api} disableWebGL />);
 
     // Commit first.stl
-    fireEvent.click(screen.getByRole('button', { name: /open stl/i }));
+    fireEvent.click(screen.getByRole('button', { name: /open model/i }));
     expect(await screen.findByText('first.stl')).toBeInTheDocument();
     expect(api.commitModel).toHaveBeenCalledWith('model_first');
 
     // Fail readBatch on second.stl -> discards secondModel and keeps first.stl open
-    fireEvent.click(screen.getByRole('button', { name: /open stl/i }));
+    fireEvent.click(screen.getByRole('button', { name: /open model/i }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/Disk batch read failed.*Kept first\.stl open/i);
     expect(api.discardModel).toHaveBeenCalledWith('model_second');
     expect(screen.getByText('first.stl')).toBeInTheDocument();
 
     // Start third attempt where readBatch is pending, then cancel geometry swap
-    fireEvent.click(screen.getByRole('button', { name: /open stl/i }));
+    fireEvent.click(screen.getByRole('button', { name: /open model/i }));
     const cancelBtn = await screen.findByRole('button', { name: /cancel import/i });
     fireEvent.click(cancelBtn);
 
@@ -384,11 +384,11 @@ describe('UI import-orbit-orientation actions', () => {
     render(<App api={api} disableWebGL />);
 
     // Commit first.stl
-    fireEvent.click(screen.getByRole('button', { name: /open stl/i }));
+    fireEvent.click(screen.getByRole('button', { name: /open model/i }));
     expect(await screen.findByText('first.stl')).toBeInTheDocument();
 
     // Start second.stl; commitModel is in-flight -> Cancel must be disabled
-    fireEvent.click(screen.getByRole('button', { name: /open stl/i }));
+    fireEvent.click(screen.getByRole('button', { name: /open model/i }));
     await waitFor(() => {
       expect(commitModel).toHaveBeenCalledWith('model_second');
     });

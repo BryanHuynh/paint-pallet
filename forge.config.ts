@@ -32,6 +32,7 @@ const config: ForgeConfig = {
     icon: APP_ICON_BASE_PATH,
     extraResource: [
       WORKER_BINARY_PATH,
+      path.resolve(__dirname, 'native/vendor/meshoptimizer/meshoptimizer-LICENSE.md'),
       APP_ICON_ICO_PATH,
       APP_ICON_PNG_PATH,
     ],

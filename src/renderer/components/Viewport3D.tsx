@@ -210,35 +210,41 @@ export function attachOrbitDetailLifecycle(
     syncRestSnapshot();
   };
 
-  const onChange = () => {
-    const camMoved =
-      camera.position.distanceToSquared(startCamPos) > 1e-10 ||
-      controls.target.distanceToSquared(startTarget) > 1e-10;
-    if (!camMoved) return;
+  const scheduleSettled = () => {
+    if (settleTimer !== null) window.clearTimeout(settleTimer);
+    settleTimer = window.setTimeout(() => {
+      settleTimer = null;
+      if (!interacting) callbacks.onCameraSettled();
+    }, settleDelayMs);
+  };
 
-    if (!movedThisGesture) {
-      movedThisGesture = true;
-      callbacks.onCameraMoved();
-      if (previewGroup.children.length > 0) {
-        previewGroup.visible = true;
-        detailGroup.visible = false;
+  const onChange = () => {
+    const radius = camera.position.distanceTo(controls.target);
+    const tolerance = Math.max(1e-6, radius * (interacting ? 0.0003 : 0.00002));
+    const moved = camera.position.distanceToSquared(startCamPos) > tolerance ** 2 ||
+      controls.target.distanceToSquared(startTarget) > tolerance ** 2;
+
+    if (interacting) {
+      if (!moved) return;
+      if (!movedThisGesture) {
+        movedThisGesture = true;
+        callbacks.onCameraMoved();
+        if (previewGroup.children.length > 0) {
+          previewGroup.visible = true;
+          detailGroup.visible = false;
+        }
       }
+    } else if (moved && settleTimer !== null) {
+      // Orbit damping can continue after release. Restore original batches once
+      // the remaining frame-to-frame motion is below the settling tolerance.
+      scheduleSettled();
     }
     syncRestSnapshot();
   };
 
   const onEnd = () => {
     interacting = false;
-    if (!movedThisGesture && detailGroup.visible) {
-      return;
-    }
-    if (settleTimer !== null) window.clearTimeout(settleTimer);
-    settleTimer = window.setTimeout(() => {
-      settleTimer = null;
-      if (!interacting) {
-        callbacks.onCameraSettled();
-      }
-    }, settleDelayMs);
+    if (movedThisGesture || !detailGroup.visible) scheduleSettled();
   };
 
   controls.addEventListener('start', onStart);
@@ -736,6 +742,8 @@ export function Viewport3D({
     const animate = () => {
       rafId = window.requestAnimationFrame(animate);
       controls.update();
+      const surfaceDetail = detailGroup.visible ? 'original' : 'preview';
+      if (canvas.dataset.surfaceDetail !== surfaceDetail) canvas.dataset.surfaceDetail = surfaceDetail;
       const paint = shadowPaintRef.current;
       brushPreview.update(renderer, paint?.enabled && detailGroup.visible ? hoverPoint : null, paint?.diameter ?? 1);
       renderer.render(scene, camera);

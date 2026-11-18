@@ -58,6 +58,14 @@ export interface BatchBinaryData {
   faceIds: Uint32Array;
 }
 
+export interface ConnectedFillRequest {
+  modelId: string;
+  jobId: string;
+  faceId: number;
+  maxCreaseDegrees: number;
+  blockedFaces: number[];
+}
+
 export interface PaintPalletApi {
   selectStlFile: () => Promise<string | null>;
   importDroppedStl?: (file: File) => Promise<ModelSummary>;
@@ -73,5 +81,7 @@ export interface PaintPalletApi {
     direction: Vec3,
     batchIndices?: number[],
   ) => Promise<PickResult>;
+  previewConnectedFill?: (request: ConnectedFillRequest) => Promise<Uint32Array>;
+  cancelConnectedFill?: (jobId: string) => Promise<{ canceled: boolean }>;
   onImportProgress: (listener: (event: ImportProgressEvent) => void) => () => void;
 }

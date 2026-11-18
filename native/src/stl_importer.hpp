@@ -37,6 +37,7 @@ struct ModelRecord {
   std::vector<BatchDescriptor> batches;
   std::string previewFilePath;
   std::string jobDir;
+  std::string groupIdsPath;
 };
 
 struct ImportProgress {

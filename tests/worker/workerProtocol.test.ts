@@ -84,6 +84,116 @@ describe('Worker import/batch/pick protocol', () => {
     expect(miss.originalFaceId).toBeNull();
   });
 
+  it('imports an ASCII STL with its original name and pickable face order', async () => {
+    const fixture = path.join(tempDir, 'faceted-ascii.stl');
+    const ascii = [
+      'solid ascii-model', ' facet normal 0 0 1', '  outer loop',
+      '   vertex 0 0 0', '   vertex 2 0 0', '   vertex 0 2 0',
+      '  endloop', ' endfacet', 'endsolid ascii-model', '',
+    ].join('\n');
+    fs.writeFileSync(fixture, ascii);
+    const model = await client.importStl(fixture, 'ascii-fixture');
+    expect(model.fileName).toBe('faceted-ascii.stl');
+    expect(model.fileSizeBytes).toBe(Buffer.byteLength(ascii));
+    expect(model.triangleCount).toBe(1);
+    const pick = await client.pickFace(model.modelId, [0.25, 0.25, 2], [0, 0, -1]);
+    expect(pick.originalFaceId).toBe(0);
+  });
+
+  it('keeps OBJ group boundaries across shared edges and ignores external material files', async () => {
+    const fixture = path.join(tempDir, 'grouped.obj');
+    fs.writeFileSync(fixture, [
+      'mtllib inaccessible.mtl', 'o Miniature kit', 'v 0 0 0', 'v 2 0 0', 'v 2 2 0', 'v 0 2 0', 'v 4 0 0',
+      'g cloak', 'usemtl unwanted', 'f 1 2 3 4', 'g armor', 'f -4 -1 -3', '',
+    ].join('\n'));
+    const model = await client.importStl(fixture, 'obj-fixture');
+    expect(model.fileName).toBe('grouped.obj');
+    expect(model.triangleCount).toBe(3);
+    expect((await client.getActiveModel())?.fileName).toBe(model.fileName);
+
+    const armor = await client.pickFace(model.modelId, [2.8, 0.25, 5], [0, 0, -1]);
+    expect(armor.originalFaceId).toBe(2);
+    const packed = await client.previewConnectedFill({
+      modelId: model.modelId, jobId: 'obj-fill', faceId: 0, maxCreaseDegrees: 180, blockedFaces: [],
+    });
+    expect(Array.from(packed).filter((_, i) => i % 3 === 0).sort()).toEqual([0, 1]);
+
+    const groupNames = fs.readFileSync(path.join(path.dirname(model.batches[0].filePath), 'group-names.json'), 'utf8');
+    expect(JSON.parse(groupNames)).toEqual([
+      { object: 'Miniature kit', groups: ['cloak'] },
+      { object: 'Miniature kit', groups: ['armor'] },
+    ]);
+  });
+
+  it('reports the line of a malformed text mesh and preserves the active model', async () => {
+    const activePath = path.join(tempDir, 'previous.stl');
+    writeBinaryStl(activePath, [{ v1: [0, 0, 0], v2: [1, 0, 0], v3: [0, 1, 0] }]);
+    const active = await client.importStl(activePath, 'previous');
+
+    const obj = path.join(tempDir, 'invalid.obj');
+    fs.writeFileSync(obj, 'v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 8\n');
+    await expect(client.importStl(obj, 'bad-obj')).rejects.toThrow(/Line 4.*invalid vertex/);
+
+    const ascii = path.join(tempDir, 'bad-ascii.stl');
+    fs.writeFileSync(ascii, 'solid broken\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\n');
+    await expect(client.importStl(ascii, 'bad-ascii')).rejects.toThrow(/ended before "endsolid"/);
+    expect((await client.getActiveModel())?.modelId).toBe(active.modelId);
+    expect(fs.readdirSync(path.join(tempDir, 'cache')).some((name) => name.startsWith('source-'))).toBe(false);
+  });
+
+  it('grows a fill only across shared edges allowed by crease and ownership', async () => {
+    const stlPath = path.join(tempDir, 'fill-hinge.stl');
+    writeBinaryStl(stlPath, [
+      { v1: [0, 0, 0], v2: [1, 0, 0], v3: [0, 1, 0] },
+      { v1: [1, 0, 0], v2: [1, 1, 0], v3: [0, 1, 0] },
+      { v1: [1, 1, 0], v2: [1, 0, 0], v3: [1, 0, 1] },
+      { v1: [5, 0, 0], v2: [6, 0, 0], v3: [5, 1, 0] },
+    ]);
+    const { modelId } = await client.importStl(stlPath, 'fill-hinge');
+
+    const fill = async (maxCreaseDegrees: number, blockedFaces: number[]) => {
+      const packed = await client.previewConnectedFill({
+        modelId, jobId: 'fill-hinge-preview', faceId: 0, maxCreaseDegrees, blockedFaces,
+      });
+      return Array.from(packed).filter((_, index) => index % 3 === 0).sort((a, b) => a - b);
+    };
+
+    expect(await fill(35, [])).toEqual([0, 1]);
+    expect(await fill(95, [])).toEqual([0, 1, 2]);
+    expect(await fill(95, [1])).toEqual([0]);
+    expect(await fill(95, [0])).toEqual([]);
+  });
+
+  it('follows original edges across all spatial batches of a connected surface', async () => {
+    const stlPath = path.join(tempDir, 'fill-grid.stl');
+    const cols = 182;
+    const rows = 181;
+    const triangles = [];
+    for (let x = 0; x < cols; x++) {
+      for (let y = 0; y < rows; y++) {
+        triangles.push(
+          { v1: [x, y, 0], v2: [x + 1, y, 0], v3: [x, y + 1, 0] },
+          { v1: [x + 1, y, 0], v2: [x + 1, y + 1, 0], v3: [x, y + 1, 0] },
+        );
+      }
+    }
+    writeBinaryStl(stlPath, triangles as Parameters<typeof writeBinaryStl>[1]);
+    const model = await client.importStl(stlPath, 'fill-grid');
+    expect(model.batches.length).toBeGreaterThan(1);
+
+    const packed = await client.previewConnectedFill({
+      modelId: model.modelId, jobId: 'fill-grid-preview', faceId: 0, maxCreaseDegrees: 0, blockedFaces: [],
+    });
+    const ids = new Set<number>();
+    const batches = new Set<number>();
+    for (let i = 0; i < packed.length; i += 3) {
+      ids.add(packed[i]);
+      batches.add(packed[i + 1]);
+    }
+    expect(ids.size).toBe(triangles.length);
+    expect(batches.size).toBe(model.batches.length);
+  });
+
   it('rejects malformed or truncated STLs, cleans up partial data, and keeps the previous model open', async () => {
     const validPath = path.join(tempDir, 'valid.stl');
     writeBinaryStl(validPath, [{ v1: [0, 0, 0], v2: [1, 0, 0], v3: [0, 1, 0] }]);

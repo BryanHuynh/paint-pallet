@@ -125,7 +125,12 @@ interface BandCoverage {
 async function measureCanvasBands(
   electronApp: Awaited<ReturnType<typeof electron.launch>>,
   canvasPng: Buffer,
-): Promise<{ totalModelPixels: number; bbox: [number, number, number, number]; bands: BandCoverage[] }> {
+): Promise<{
+  totalModelPixels: number;
+  bands: BandCoverage[];
+  head: [number, number];
+  base: [number, number];
+}> {
   return electronApp.evaluate(({ nativeImage }, pngBase64) => {
     const img = nativeImage.createFromBuffer(Buffer.from(pngBase64, 'base64'));
     const { width: w, height: h } = img.getSize();
@@ -201,7 +206,20 @@ async function measureCanvasBands(
       });
     }
 
-    return { totalModelPixels, bbox: [minX, minY, maxX, maxY], bands };
+    function interiorAt(fraction: number): [number, number] {
+      const row = minY + Math.floor((maxY - minY) * fraction);
+      let best = { start: minX, length: 0 };
+      let start = minX;
+      for (let x = minX; x <= maxX + 1; x++) {
+        if (x <= maxX && isModelPixel(x, row)) continue;
+        if (x - start > best.length) best = { start, length: x - start };
+        start = x + 1;
+      }
+      if (!best.length) throw new Error(`No rendered surface at row ${row}`);
+      return [best.start + Math.floor(best.length / 2), row];
+    }
+
+    return { totalModelPixels, bands, head: interiorAt(0.12), base: interiorAt(0.90) };
   }, canvasPng.toString('base64'));
 }
 
@@ -231,7 +249,7 @@ describe('End-to-end WebGL solid surface coverage on dense STL', () => {
       try {
         const page = await electronApp.firstWindow();
         await page.waitForLoadState('domcontentloaded');
-        await page.waitForSelector('button:has-text("Open STL")', { timeout: 15000 });
+        await page.waitForSelector('button:has-text("Open model")', { timeout: 15000 });
 
         await electronApp.evaluate(async ({ dialog }, targetPath) => {
           dialog.showOpenDialog = async () => ({
@@ -240,7 +258,7 @@ describe('End-to-end WebGL solid surface coverage on dense STL', () => {
           });
         }, stlPath);
 
-        await page.click('button:has-text("Open STL")');
+        await page.click('button:has-text("Open model")');
 
         await page.waitForFunction(
           () => {
@@ -255,7 +273,7 @@ describe('End-to-end WebGL solid surface coverage on dense STL', () => {
         await page.waitForTimeout(2500);
 
         const canvas = page.locator('canvas').first();
-        const settledShot = await canvas.screenshot();
+        const settledShot = await canvas.screenshot({ scale: 'css' });
         const settledMetrics = await measureCanvasBands(electronApp, settledShot);
 
         expect(settledMetrics.totalModelPixels).toBeGreaterThan(50000);
@@ -272,19 +290,19 @@ describe('End-to-end WebGL solid surface coverage on dense STL', () => {
           await page.mouse.down();
           await page.mouse.move(box.x + box.width * 0.65, box.y + box.height * 0.48, { steps: 8 });
           await page.mouse.up();
-          await page.waitForTimeout(1500);
+          await page.waitForSelector('canvas[data-surface-detail="original"]', { timeout: 15000 });
 
-          const orbitedShot = await canvas.screenshot();
+          const orbitedShot = await canvas.screenshot({ scale: 'css' });
           const orbitedMetrics = await measureCanvasBands(electronApp, orbitedShot);
           for (const band of orbitedMetrics.bands) {
             expect(band.fillRatio, `orbited band ${band.name} fillRatio`).toBeGreaterThanOrEqual(0.85);
           }
 
-          // Click near the center of the head band to verify exact picking outside central torso
-          const [, minY, , maxY] = orbitedMetrics.bbox;
-          const headY = box.y + minY + Math.floor((maxY - minY) * 0.12);
-          const centerX = box.x + Math.floor((orbitedMetrics.bbox[0] + orbitedMetrics.bbox[2]) * 0.5);
-          await page.mouse.click(centerX, headY);
+          // Measure pick points on the screenshot so orbital offset and display scaling
+          // cannot move a hard-coded point outside the head or base.
+          const pickBox = await canvas.boundingBox();
+          if (!pickBox) throw Error('Viewport disappeared after orbit');
+          await page.mouse.click(pickBox.x + orbitedMetrics.head[0], pickBox.y + orbitedMetrics.head[1]);
 
           const faceIdLocator = page.locator('[data-testid="picked-face-id"]');
           await faceIdLocator.waitFor({ state: 'visible', timeout: 10000 });
@@ -292,8 +310,7 @@ describe('End-to-end WebGL solid surface coverage on dense STL', () => {
           expect(Number.isInteger(headFaceId) && headFaceId >= 0).toBe(true);
 
           // Also click near the base band to verify picking at the opposite extremity
-          const baseY = box.y + minY + Math.floor((maxY - minY) * 0.90);
-          await page.mouse.click(centerX, baseY);
+          await page.mouse.click(pickBox.x + orbitedMetrics.base[0], pickBox.y + orbitedMetrics.base[1]);
           await page.waitForFunction(
             (prevId) => {
               const el = document.querySelector('[data-testid="picked-face-id"]');

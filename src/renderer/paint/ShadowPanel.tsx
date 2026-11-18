@@ -1,12 +1,17 @@
 import type { PaintRecipe } from '../palette/types';
+import type { useConnectedFill } from './useConnectedFill';
 import type { useShadowPainting } from './useShadowPainting';
 
 export function ShadowPanel({
   paint,
+  fill,
+  onApplyFill,
   recipes,
   busy,
 }: {
   paint: ReturnType<typeof useShadowPainting>;
+  fill: ReturnType<typeof useConnectedFill>;
+  onApplyFill: () => void;
   recipes: PaintRecipe[];
   busy: boolean;
 }) {
@@ -21,7 +26,10 @@ export function ShadowPanel({
           <div className="field-row">
             <label htmlFor="paint-region">Region</label>
             <select id="paint-region" className="select-input" value={region.id}
-              disabled={locked} onChange={(event) => paint.setRegionId(event.target.value)}>
+              disabled={locked} onChange={(event) => {
+                fill.cancel();
+                paint.setRegionId(event.target.value);
+              }}>
               {paint.regions.map((item) => (
                 <option key={item.id} value={item.id}>{item.name.trim() || 'Untitled region'}</option>
               ))}
@@ -42,7 +50,7 @@ export function ShadowPanel({
           </div>
         </>
       ) : <p className="hint-text">Add a region and choose its paint recipe.</p>}
-      <button type="button" className="btn btn--secondary btn--small" disabled={locked} onClick={paint.createRegion}>
+      <button type="button" className="btn btn--secondary btn--small" disabled={locked} onClick={() => { fill.cancel(); paint.createRegion(); }}>
         Add region
       </button>
 
@@ -50,13 +58,41 @@ export function ShadowPanel({
         <>
           <div className="shadow-tools" role="group" aria-label="Shadow tools">
             <button type="button" className="btn btn--secondary btn--small" aria-pressed={paint.tool === null}
-              disabled={locked} onClick={() => paint.setTool(null)}>Inspect</button>
+              disabled={locked} onClick={() => { fill.cancel(); paint.setTool(null); }}>Inspect</button>
             <button type="button" className="btn btn--secondary btn--small" aria-pressed={paint.tool === 'brush'}
-              disabled={locked || !recipe} onClick={() => paint.setTool('brush')}>Brush</button>
+              disabled={locked || !recipe} onClick={() => { fill.cancel(); paint.setTool('brush'); }}>Brush</button>
             <button type="button" className="btn btn--secondary btn--small" aria-pressed={paint.tool === 'erase'}
-              disabled={locked || !recipe} onClick={() => paint.setTool('erase')}>Erase</button>
+              disabled={locked || !recipe} onClick={() => { fill.cancel(); paint.setTool('erase'); }}>Erase</button>
+            {fill.available && (
+              <button type="button" className="btn btn--secondary btn--small" aria-pressed={paint.tool === 'fill'}
+                disabled={locked || !recipe} onClick={() => paint.setTool('fill')}>Fill</button>
+            )}
           </div>
-          {recipe && paint.tool && (
+          {recipe && paint.tool === 'fill' && (
+            <>
+              <div className="shadow-size">
+                <label htmlFor="fill-crease">Cross creases up to</label>
+                <input id="fill-crease" type="range" min={0} max={180} value={fill.creaseDegrees}
+                  onChange={(event) => fill.setCreaseDegrees(Number(event.target.value))} />
+                <output htmlFor="fill-crease">{fill.creaseDegrees}°</output>
+              </div>
+              <p className="hint-text" role="status">
+                {fill.loading ? 'Preparing connected surface preview…'
+                  : fill.error ?? (fill.seeded
+                    ? `${fill.added.toLocaleString()} new faces in preview`
+                    : 'Click the surface where the fill should start.')}
+              </p>
+              {fill.seeded && (
+                <div className="shadow-tools">
+                  <button type="button" className="btn btn--primary btn--small"
+                    disabled={locked || !fill.added || fill.loading} onClick={onApplyFill}>Apply fill</button>
+                  <button type="button" className="btn btn--secondary btn--small"
+                    onClick={fill.cancel}>Cancel fill</button>
+                </div>
+              )}
+            </>
+          )}
+          {recipe && paint.tool && paint.tool !== 'fill' && (
             <>
               <div className="shadow-size">
                 <label htmlFor="shadow-brush-size">Brush size</label>
