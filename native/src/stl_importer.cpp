@@ -367,7 +367,8 @@ bool rayTriangleMollerTrumbore(
       dir[0] * e2[1] - dir[1] * e2[0],
   };
   float a = e1[0] * h[0] + e1[1] * h[1] + e1[2] * h[2];
-  if (a > -kEps && a < kEps) return false;
+  // Match Three.js FrontSide culling: reject backfaces (a <= 0) and grazing rays
+  if (a <= kEps) return false;
   float f = 1.0f / a;
   float s[3] = {orig[0] - v0[0], orig[1] - v0[1], orig[2] - v0[2]};
   float u = f * (s[0] * h[0] + s[1] * h[1] + s[2] * h[2]);

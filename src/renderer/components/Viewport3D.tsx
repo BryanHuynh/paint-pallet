@@ -14,23 +14,66 @@ export type CameraPreset = 'reset' | 'front' | 'top' | 'right';
 export interface Viewport3DProps {
   api?: PaintPalletApi;
   model: ModelSummary | null;
+  pendingModel: ModelSummary | null;
   orientation: ModelOrientation;
   cameraPresetRequest: { preset: CameraPreset; seq: number } | null;
   onSurfacePick: (origin: Vec3, direction: Vec3) => void;
+  onPendingModelCommit: (committed: ModelSummary) => void;
+  onPendingModelError: (error: Error) => void;
   disableWebGL?: boolean;
+}
+
+const MAX_DETAIL_BATCHES = 16;
+
+function selectBoundedBatches(model: ModelSummary) {
+  const modelCenter = new THREE.Vector3(
+    (model.bounds.min[0] + model.bounds.max[0]) * 0.5,
+    (model.bounds.min[1] + model.bounds.max[1]) * 0.5,
+    (model.bounds.min[2] + model.bounds.max[2]) * 0.5,
+  );
+  return [...model.batches]
+    .sort((a, b) => {
+      const ac = new THREE.Vector3(
+        (a.bounds.min[0] + a.bounds.max[0]) * 0.5,
+        (a.bounds.min[1] + a.bounds.max[1]) * 0.5,
+        (a.bounds.min[2] + a.bounds.max[2]) * 0.5,
+      );
+      const bc = new THREE.Vector3(
+        (b.bounds.min[0] + b.bounds.max[0]) * 0.5,
+        (b.bounds.min[1] + b.bounds.max[1]) * 0.5,
+        (b.bounds.min[2] + b.bounds.max[2]) * 0.5,
+      );
+      return ac.distanceToSquared(modelCenter) - bc.distanceToSquared(modelCenter);
+    })
+    .slice(0, MAX_DETAIL_BATCHES);
+}
+
+function disposeGroupMeshes(group: THREE.Group): void {
+  while (group.children.length > 0) {
+    const child = group.children[0] as THREE.Mesh;
+    group.remove(child);
+    child.geometry.dispose();
+  }
 }
 
 export function Viewport3D({
   api,
   model,
+  pendingModel,
   orientation,
   cameraPresetRequest,
   onSurfacePick,
+  onPendingModelCommit,
+  onPendingModelError,
   disableWebGL = false,
 }: Viewport3DProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const onPickRef = useRef(onSurfacePick);
   onPickRef.current = onSurfacePick;
+  const onCommitRef = useRef(onPendingModelCommit);
+  onCommitRef.current = onPendingModelCommit;
+  const onErrorRef = useRef(onPendingModelError);
+  onErrorRef.current = onPendingModelError;
 
   const sceneRefs = useRef<{
     scene: THREE.Scene;
@@ -190,90 +233,86 @@ export function Viewport3D({
     };
   }, [disableWebGL]);
 
-  // Load model batches into Three.js groups when `model` changes
+  // Stage pendingModel batches in isolation; keep previous committed model intact until
+  // replacement geometry opens and mounts cleanly.
   useEffect(() => {
-    const refs = sceneRefs.current;
-    if (!refs) return;
+    if (!pendingModel || !api) return;
     let cancelled = false;
 
-    const clearGroup = (g: THREE.Group) => {
-      while (g.children.length > 0) {
-        const child = g.children[0] as THREE.Mesh;
-        g.remove(child);
-        child.geometry.dispose();
-      }
-    };
-    clearGroup(refs.previewGroup);
-    clearGroup(refs.detailGroup);
+    const stagedPreviewGeos: THREE.BufferGeometry[] = [];
+    const stagedDetailGeos: THREE.BufferGeometry[] = [];
 
-    if (!model || !api) return;
+    const stageBatches = async () => {
+      try {
+        if (pendingModel.previewFilePath) {
+          const previewBin = await api.readBatch(pendingModel.previewFilePath);
+          if (cancelled) return;
+          const geo = new THREE.BufferGeometry();
+          geo.setAttribute('position', new THREE.BufferAttribute(previewBin.positions, 3));
+          geo.setAttribute('normal', new THREE.BufferAttribute(previewBin.normals, 3));
+          stagedPreviewGeos.push(geo);
+        }
 
-    const mat = new THREE.MeshStandardMaterial({
-      color: 0xd4d9d2,
-      roughness: 0.62,
-      metalness: 0.08,
-    });
+        const boundedBatches = selectBoundedBatches(pendingModel);
+        for (const batch of boundedBatches) {
+          const bin = await api.readBatch(batch.filePath);
+          if (cancelled) return;
+          const geo = new THREE.BufferGeometry();
+          geo.setAttribute('position', new THREE.BufferAttribute(bin.positions, 3));
+          geo.setAttribute('normal', new THREE.BufferAttribute(bin.normals, 3));
+          stagedDetailGeos.push(geo);
+        }
 
-    const loadBatches = async () => {
-      if (model.previewFilePath) {
-        const previewBin = await api.readBatch(model.previewFilePath);
-        if (cancelled) return;
-        const geo = new THREE.BufferGeometry();
-        geo.setAttribute('position', new THREE.BufferAttribute(previewBin.positions, 3));
-        geo.setAttribute('normal', new THREE.BufferAttribute(previewBin.normals, 3));
-        refs.previewGroup.add(new THREE.Mesh(geo, mat));
-      }
+        const refs = sceneRefs.current;
+        if (refs) {
+          const mat = new THREE.MeshStandardMaterial({
+            color: 0xd4d9d2,
+            roughness: 0.62,
+            metalness: 0.08,
+          });
+          disposeGroupMeshes(refs.previewGroup);
+          disposeGroupMeshes(refs.detailGroup);
 
-      // Bound renderer detail memory to at most MAX_DETAIL_BATCHES simultaneously.
-      // Dense models (>16 batches) use the LOD preview for global orbit and load
-      // bounded detail batches around the model center without exhausting GPU/JS RAM.
-      const MAX_DETAIL_BATCHES = 16;
-      const modelCenter = new THREE.Vector3(
-        (model.bounds.min[0] + model.bounds.max[0]) * 0.5,
-        (model.bounds.min[1] + model.bounds.max[1]) * 0.5,
-        (model.bounds.min[2] + model.bounds.max[2]) * 0.5,
-      );
-      const sortedBatches = [...model.batches]
-        .sort((a, b) => {
-          const ac = new THREE.Vector3(
-            (a.bounds.min[0] + a.bounds.max[0]) * 0.5,
-            (a.bounds.min[1] + a.bounds.max[1]) * 0.5,
-            (a.bounds.min[2] + a.bounds.max[2]) * 0.5,
+          for (const geo of stagedPreviewGeos) {
+            refs.previewGroup.add(new THREE.Mesh(geo, mat));
+          }
+          for (const geo of stagedDetailGeos) {
+            refs.detailGroup.add(new THREE.Mesh(geo, mat));
+          }
+
+          if (pendingModel.batches.length <= MAX_DETAIL_BATCHES || !pendingModel.previewFilePath) {
+            refs.previewGroup.visible = false;
+            refs.detailGroup.visible = true;
+          } else {
+            refs.previewGroup.visible = true;
+            refs.detailGroup.visible = false;
+          }
+        } else {
+          for (const g of stagedPreviewGeos) g.dispose();
+          for (const g of stagedDetailGeos) g.dispose();
+        }
+
+        onCommitRef.current(pendingModel);
+      } catch (err) {
+        for (const g of stagedPreviewGeos) g.dispose();
+        for (const g of stagedDetailGeos) g.dispose();
+        if (!cancelled) {
+          onErrorRef.current(
+            err instanceof Error ? err : new Error('Failed loading replacement geometry batches'),
           );
-          const bc = new THREE.Vector3(
-            (b.bounds.min[0] + b.bounds.max[0]) * 0.5,
-            (b.bounds.min[1] + b.bounds.max[1]) * 0.5,
-            (b.bounds.min[2] + b.bounds.max[2]) * 0.5,
-          );
-          return ac.distanceToSquared(modelCenter) - bc.distanceToSquared(modelCenter);
-        })
-        .slice(0, MAX_DETAIL_BATCHES);
-
-      for (const batch of sortedBatches) {
-        const bin = await api.readBatch(batch.filePath);
-        if (cancelled) return;
-        const geo = new THREE.BufferGeometry();
-        geo.setAttribute('position', new THREE.BufferAttribute(bin.positions, 3));
-        geo.setAttribute('normal', new THREE.BufferAttribute(bin.normals, 3));
-        refs.detailGroup.add(new THREE.Mesh(geo, mat));
-      }
-
-      if (model.batches.length <= MAX_DETAIL_BATCHES || !model.previewFilePath) {
-        refs.previewGroup.visible = false;
-        refs.detailGroup.visible = true;
-      } else {
-        refs.previewGroup.visible = true;
-        refs.detailGroup.visible = false;
+        }
       }
     };
 
-    void loadBatches();
+    void stageBatches();
     return () => {
       cancelled = true;
+      for (const g of stagedPreviewGeos) g.dispose();
+      for (const g of stagedDetailGeos) g.dispose();
     };
-  }, [api, model]);
+  }, [api, pendingModel]);
 
-  // Apply upright & front orientation and fit camera
+  // Apply upright & front orientation and fit camera for the committed model
   useEffect(() => {
     const refs = sceneRefs.current;
     if (!refs || !model) return;
@@ -288,7 +327,6 @@ export function Viewport3D({
     const radius = Math.max(0.5, size.length() * 0.5);
     refs.radius = radius;
 
-    // Position model so its center sits above the ground plane at y = radius * 0.6
     const rotatedCenter = center.clone().applyQuaternion(q);
     refs.modelGroup.position.set(-rotatedCenter.x, -rotatedCenter.y + radius * 0.5, -rotatedCenter.z);
     refs.modelGroup.updateMatrixWorld(true);

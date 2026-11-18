@@ -246,4 +246,20 @@ describe('Worker import/batch/pick protocol', () => {
       /Missing required x64 native worker binary/i,
     );
   });
+
+  it('matches Three.js FrontSide culling by skipping a nearer hidden backface', async () => {
+    const stlPath = path.join(tempDir, 'backface_in_front.stl');
+    writeBinaryStl(stlPath, [
+      // Face 0: z = 8, CW winding when viewed from +Z (normal -Z -> backface!)
+      { v1: [0, 0, 8], v2: [0, 2, 8], v3: [2, 0, 8] },
+      // Face 1: z = 2, CCW winding when viewed from +Z (normal +Z -> visible frontface!)
+      { v1: [0, 0, 2], v2: [2, 0, 2], v3: [0, 2, 2] },
+    ]);
+
+    const summary = await client.importStl(stlPath, 'job_cull');
+    const pick = await client.pickFace(summary.modelId, [0.25, 0.25, 10], [0, 0, -1]);
+    expect(pick.hit).toBe(true);
+    expect(pick.originalFaceId).toBe(1);
+    expect(pick.distance).toBeCloseTo(8, 4);
+  });
 });

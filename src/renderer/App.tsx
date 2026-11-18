@@ -45,6 +45,7 @@ export default function App({
 
   const [activeTab, setActiveTab] = useState<'model' | 'palette'>('model');
   const [model, setModel] = useState<ModelSummary | null>(null);
+  const [pendingModel, setPendingModel] = useState<ModelSummary | null>(null);
   const [orientation, setOrientation] = useState<ModelOrientation>({
     upright: '+Y',
     front: '+Z',
@@ -52,7 +53,7 @@ export default function App({
   const [pickResult, setPickResult] = useState<PickResult | null>(null);
   const [progress, setProgress] = useState<ImportProgressEvent | null>(null);
   const [isImporting, setIsImporting] = useState(false);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [cameraPresetRequest, setCameraPresetRequest] = useState<{
     preset: CameraPreset;
     seq: number;
@@ -93,7 +94,7 @@ export default function App({
 
   const handleOpenStl = async () => {
     if (!api) return;
-    setErrorMsg(null);
+    setStatusMsg(null);
     const selectedPath = await api.selectStlFile();
     if (!selectedPath) return;
 
@@ -110,12 +111,21 @@ export default function App({
 
     try {
       const summary = await api.importStl(selectedPath);
-      setModel(summary);
-      setPickResult(null);
+      setPendingModel(summary);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Import failed';
-      if (!/canceled/i.test(msg)) {
-        setErrorMsg(msg);
+      if (/canceled/i.test(msg)) {
+        setStatusMsg(
+          model
+            ? `Import canceled; kept ${model.fileName} open.`
+            : 'Import canceled.',
+        );
+      } else {
+        setStatusMsg(
+          model
+            ? `${msg} Kept ${model.fileName} open.`
+            : msg,
+        );
       }
     } finally {
       setIsImporting(false);
@@ -124,9 +134,38 @@ export default function App({
   };
 
   const handleCancelImport = async () => {
-    if (!api || !isImporting) return;
-    await api.cancelImport();
+    if (!api) return;
+    if (isImporting) {
+      await api.cancelImport();
+      return;
+    }
+    if (pendingModel) {
+      setPendingModel(null);
+      setStatusMsg(
+        model
+          ? `Canceled geometry swap; kept ${model.fileName} open.`
+          : 'Canceled geometry swap.',
+      );
+    }
   };
+
+  const handlePendingModelCommit = useCallback((committed: ModelSummary) => {
+    setModel(committed);
+    setPendingModel(null);
+    setPickResult(null);
+  }, []);
+
+  const handlePendingModelError = useCallback(
+    (err: Error) => {
+      setPendingModel(null);
+      setStatusMsg(
+        model
+          ? `${err.message} Kept ${model.fileName} open.`
+          : err.message,
+      );
+    },
+    [model],
+  );
 
   const handleSurfacePick = useCallback(
     async (origin: Vec3, direction: Vec3) => {
@@ -145,6 +184,8 @@ export default function App({
     progress && progress.totalBytes > 0
       ? Math.min(100, Math.round((progress.bytesRead / progress.totalBytes) * 100))
       : 0;
+
+  const isBusy = isImporting || Boolean(pendingModel);
 
   return (
     <div className="app-shell">
@@ -184,7 +225,7 @@ export default function App({
         </nav>
 
         <div className="header-actions">
-          {isImporting ? (
+          {isBusy ? (
             <button
               type="button"
               className="btn btn--secondary"
@@ -197,217 +238,224 @@ export default function App({
             type="button"
             className="btn btn--primary"
             onClick={handleOpenStl}
-            disabled={isImporting}
+            disabled={isBusy}
           >
             Open STL
           </button>
         </div>
       </header>
 
-      {activeTab === 'palette' && ResolvedPalette ? (
-        <main className="palette-host">
+      {ResolvedPalette ? (
+        <main
+          className="palette-host"
+          data-testid="palette-host"
+          hidden={activeTab !== 'palette'}
+        >
           <ResolvedPalette />
         </main>
-      ) : (
-        <main className="workbench-main">
-          <section
-            id="viewport-region"
-            className="viewport-region"
-            aria-label="STL surface viewport"
-          >
-            <Viewport3D
-              api={api}
-              model={model}
-              orientation={orientation}
-              cameraPresetRequest={cameraPresetRequest}
-              onSurfacePick={handleSurfacePick}
-              disableWebGL={disableWebGL}
-            />
+      ) : null}
 
-            {!model && !isImporting ? (
-              <div className="viewport-empty">
-                <div className="viewport-empty__card">
-                  <h2>Binary STL surface inspector</h2>
-                  <p>
-                    Open a print-ready binary STL up to 2 GiB to inspect original triangles,
-                    set upright and front axes, and pick original face IDs.
-                  </p>
-                  <button
-                    type="button"
-                    className="btn btn--secondary"
-                    onClick={handleOpenStl}
-                  >
-                    Choose STL file
-                  </button>
-                </div>
-              </div>
-            ) : null}
+      <main className="workbench-main" hidden={activeTab !== 'model'}>
+        <section
+          id="viewport-region"
+          className="viewport-region"
+          aria-label="STL surface viewport"
+        >
+          <Viewport3D
+            api={api}
+            model={model}
+            pendingModel={pendingModel}
+            orientation={orientation}
+            cameraPresetRequest={cameraPresetRequest}
+            onSurfacePick={handleSurfacePick}
+            onPendingModelCommit={handlePendingModelCommit}
+            onPendingModelError={handlePendingModelError}
+            disableWebGL={disableWebGL}
+          />
 
-            {errorMsg ? (
-              <div className="error-banner" role="alert">
-                <span>{errorMsg}</span>
+          {!model && !isBusy ? (
+            <div className="viewport-empty">
+              <div className="viewport-empty__card">
+                <h2>Binary STL surface inspector</h2>
+                <p>
+                  Open a print-ready binary STL up to 2 GiB to inspect original triangles,
+                  set upright and front axes, and pick original face IDs.
+                </p>
                 <button
                   type="button"
-                  className="btn btn--secondary btn--small"
-                  onClick={() => setErrorMsg(null)}
+                  className="btn btn--secondary"
+                  onClick={handleOpenStl}
                 >
-                  Dismiss
+                  Choose STL file
                 </button>
               </div>
-            ) : null}
+            </div>
+          ) : null}
 
-            {progress ? (
-              <div className="progress-overlay" role="status" aria-live="polite">
-                <div className="progress-overlay__row">
-                  <span>Importing STL ({progress.phase})</span>
-                  <span>{progressPct}%</span>
-                </div>
-                <div className="progress-bar">
-                  <div
-                    className="progress-bar__fill"
-                    style={{ width: `${progressPct}%` }}
-                  />
-                </div>
-                <div className="progress-overlay__row">
-                  <span>
-                    {progress.trianglesRead.toLocaleString()} /{' '}
-                    {progress.totalTriangles.toLocaleString()} triangles
-                  </span>
-                  <button
-                    type="button"
-                    className="btn btn--secondary btn--small"
-                    onClick={handleCancelImport}
-                  >
-                    Cancel import
-                  </button>
-                </div>
-              </div>
-            ) : null}
-          </section>
-
-          <aside className="inspector-panel" aria-label="Model inspector">
-            <section className="inspector-section">
-              <h2>Model summary</h2>
-              {model ? (
-                <dl className="kv-list">
-                  <dt>File</dt>
-                  <dd>{model.fileName}</dd>
-                  <dt>Triangles</dt>
-                  <dd>{model.triangleCount.toLocaleString()}</dd>
-                  <dt>Spatial batches</dt>
-                  <dd>{model.batches.length}</dd>
-                  <dt>Bounds min</dt>
-                  <dd>
-                    {model.bounds.min.map((v) => v.toFixed(1)).join(', ')}
-                  </dd>
-                  <dt>Bounds max</dt>
-                  <dd>
-                    {model.bounds.max.map((v) => v.toFixed(1)).join(', ')}
-                  </dd>
-                </dl>
-              ) : (
-                <p className="hint-text">No STL loaded.</p>
-              )}
-            </section>
-
-            <section className="inspector-section">
-              <h2>Orientation</h2>
-              <div className="field-row">
-                <label htmlFor="upright-select">Upright axis</label>
-                <select
-                  id="upright-select"
-                  className="select-input"
-                  value={orientation.upright}
-                  onChange={(e) => handleUprightChange(e.target.value as AxisDirection)}
-                >
-                  {ALL_AXES.map((axis) => (
-                    <option key={axis} value={axis}>
-                      {axis}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="field-row">
-                <label htmlFor="front-select">Front axis</label>
-                <select
-                  id="front-select"
-                  className="select-input"
-                  value={orientation.front}
-                  onChange={(e) => handleFrontChange(e.target.value as AxisDirection)}
-                >
-                  {frontOptions.map((axis) => (
-                    <option key={axis} value={axis}>
-                      {axis}
-                    </option>
-                  ))}
-                </select>
-              </div>
+          {statusMsg ? (
+            <div className="error-banner" role="alert">
+              <span>{statusMsg}</span>
               <button
                 type="button"
                 className="btn btn--secondary btn--small"
-                onClick={() => updateOrientation({ upright: '+Y', front: '+Z' })}
+                onClick={() => setStatusMsg(null)}
               >
-                Reset orientation
+                Dismiss
               </button>
-            </section>
+            </div>
+          ) : null}
 
-            <section className="inspector-section">
-              <h2>Surface pick</h2>
-              {pickResult && pickResult.hit ? (
-                <dl className="kv-list">
-                  <dt>Original face ID</dt>
-                  <dd data-testid="picked-face-id">{pickResult.originalFaceId}</dd>
-                  <dt>Part ID</dt>
-                  <dd>{pickResult.partId}</dd>
-                  <dt>Hit point</dt>
-                  <dd>
-                    {pickResult.point?.map((v) => v.toFixed(2)).join(', ')}
-                  </dd>
-                </dl>
-              ) : (
-                <p className="hint-text">Click a surface triangle to inspect its face ID.</p>
-              )}
-            </section>
-
-            <section className="inspector-section">
-              <h2>Camera controls</h2>
-              <div className="preset-grid">
+          {progress ? (
+            <div className="progress-overlay" role="status" aria-live="polite">
+              <div className="progress-overlay__row">
+                <span>Importing STL ({progress.phase})</span>
+                <span>{progressPct}%</span>
+              </div>
+              <div className="progress-bar">
+                <div
+                  className="progress-bar__fill"
+                  style={{ width: `${progressPct}%` }}
+                />
+              </div>
+              <div className="progress-overlay__row">
+                <span>
+                  {progress.trianglesRead.toLocaleString()} /{' '}
+                  {progress.totalTriangles.toLocaleString()} triangles
+                </span>
                 <button
                   type="button"
                   className="btn btn--secondary btn--small"
-                  onClick={() => triggerCameraPreset('reset')}
+                  onClick={handleCancelImport}
                 >
-                  Reset view
-                </button>
-                <button
-                  type="button"
-                  className="btn btn--secondary btn--small"
-                  onClick={() => triggerCameraPreset('front')}
-                >
-                  Front view
-                </button>
-                <button
-                  type="button"
-                  className="btn btn--secondary btn--small"
-                  onClick={() => triggerCameraPreset('top')}
-                >
-                  Top view
-                </button>
-                <button
-                  type="button"
-                  className="btn btn--secondary btn--small"
-                  onClick={() => triggerCameraPreset('right')}
-                >
-                  Right view
+                  Cancel import
                 </button>
               </div>
-              <p className="hint-text">
-                Drag to orbit · Right-drag to pan · Scroll to zoom
-              </p>
-            </section>
-          </aside>
-        </main>
-      )}
+            </div>
+          ) : null}
+        </section>
+
+        <aside className="inspector-panel" aria-label="Model inspector">
+          <section className="inspector-section">
+            <h2>Model summary</h2>
+            {model ? (
+              <dl className="kv-list">
+                <dt>File</dt>
+                <dd>{model.fileName}</dd>
+                <dt>Triangles</dt>
+                <dd>{model.triangleCount.toLocaleString()}</dd>
+                <dt>Spatial batches</dt>
+                <dd>{model.batches.length}</dd>
+                <dt>Bounds min</dt>
+                <dd>
+                  {model.bounds.min.map((v) => v.toFixed(1)).join(', ')}
+                </dd>
+                <dt>Bounds max</dt>
+                <dd>
+                  {model.bounds.max.map((v) => v.toFixed(1)).join(', ')}
+                </dd>
+              </dl>
+            ) : (
+              <p className="hint-text">No STL loaded.</p>
+            )}
+          </section>
+
+          <section className="inspector-section">
+            <h2>Orientation</h2>
+            <div className="field-row">
+              <label htmlFor="upright-select">Upright axis</label>
+              <select
+                id="upright-select"
+                className="select-input"
+                value={orientation.upright}
+                onChange={(e) => handleUprightChange(e.target.value as AxisDirection)}
+              >
+                {ALL_AXES.map((axis) => (
+                  <option key={axis} value={axis}>
+                    {axis}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="field-row">
+              <label htmlFor="front-select">Front axis</label>
+              <select
+                id="front-select"
+                className="select-input"
+                value={orientation.front}
+                onChange={(e) => handleFrontChange(e.target.value as AxisDirection)}
+              >
+                {frontOptions.map((axis) => (
+                  <option key={axis} value={axis}>
+                    {axis}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <button
+              type="button"
+              className="btn btn--secondary btn--small"
+              onClick={() => updateOrientation({ upright: '+Y', front: '+Z' })}
+            >
+              Reset orientation
+            </button>
+          </section>
+
+          <section className="inspector-section">
+            <h2>Surface pick</h2>
+            {pickResult && pickResult.hit ? (
+              <dl className="kv-list">
+                <dt>Original face ID</dt>
+                <dd data-testid="picked-face-id">{pickResult.originalFaceId}</dd>
+                <dt>Part ID</dt>
+                <dd>{pickResult.partId}</dd>
+                <dt>Hit point</dt>
+                <dd>
+                  {pickResult.point?.map((v) => v.toFixed(2)).join(', ')}
+                </dd>
+              </dl>
+            ) : (
+              <p className="hint-text">Click a surface triangle to inspect its face ID.</p>
+            )}
+          </section>
+
+          <section className="inspector-section">
+            <h2>Camera controls</h2>
+            <div className="preset-grid">
+              <button
+                type="button"
+                className="btn btn--secondary btn--small"
+                onClick={() => triggerCameraPreset('reset')}
+              >
+                Reset view
+              </button>
+              <button
+                type="button"
+                className="btn btn--secondary btn--small"
+                onClick={() => triggerCameraPreset('front')}
+              >
+                Front view
+              </button>
+              <button
+                type="button"
+                className="btn btn--secondary btn--small"
+                onClick={() => triggerCameraPreset('top')}
+              >
+                Top view
+              </button>
+              <button
+                type="button"
+                className="btn btn--secondary btn--small"
+                onClick={() => triggerCameraPreset('right')}
+              >
+                Right view
+              </button>
+            </div>
+            <p className="hint-text">
+              Drag to orbit · Right-drag to pan · Scroll to zoom
+            </p>
+          </section>
+        </aside>
+      </main>
     </div>
   );
 }

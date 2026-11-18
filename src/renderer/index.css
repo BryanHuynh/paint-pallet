@@ -81,6 +81,10 @@ body,
   outline-offset: 2px;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 .app-shell {
   display: flex;
   flex-direction: column;
