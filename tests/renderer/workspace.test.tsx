@@ -7,6 +7,7 @@ import * as THREE from 'three';
 import App from '../../src/renderer/App';
 import {
   findRayIntersectingBatchIndices,
+  resolveClickAgainstVisibleDetail,
   selectCameraVisibleBatchIndices,
 } from '../../src/renderer/components/Viewport3D';
 import { computeOrientationQuaternion } from '../../src/renderer/orientation';
@@ -256,5 +257,89 @@ describe('UI import-orbit-orientation actions', () => {
     // Ray aimed at batch 20
     const rayHits = findRayIntersectingBatchIndices(batches, [202, 2, 20], [0, 0, -1]);
     expect(rayHits).toEqual([20]);
+  });
+
+  it('rejects preview-only clicks, requests second click when detail is missing, and resolves visible detail', () => {
+    // 1. Preview-only click (detailGroup hidden or empty)
+    expect(resolveClickAgainstVisibleDetail(false, new Set([0, 1]), [0])).toEqual({
+      kind: 'preview-only',
+    });
+    expect(resolveClickAgainstVisibleDetail(true, new Set(), [0])).toEqual({
+      kind: 'preview-only',
+    });
+
+    // 2. Clicked region needs more detail -> load targetBatches and ask for second click
+    expect(resolveClickAgainstVisibleDetail(true, new Set([0, 1]), [12, 13])).toEqual({
+      kind: 'needs-detail',
+      targetBatches: [12, 13],
+    });
+
+    // 3. Clicked region is visible in detail -> resolve against captured visibleBatchIds
+    expect(resolveClickAgainstVisibleDetail(true, new Set([0, 12]), [12, 13])).toEqual({
+      kind: 'pick',
+      visibleBatchIds: [0, 12],
+    });
+  });
+
+  it('disables Cancel during atomic commit and rolls back on rejected commit', async () => {
+    const firstModel: ModelSummary = {
+      modelId: 'model_first',
+      partId: 'part_0',
+      fileName: 'first.stl',
+      fileSizeBytes: 512,
+      triangleCount: 120,
+      bounds: { min: [0, 0, 0], max: [1, 1, 1] },
+      batches: [{ batchIndex: 0, filePath: 'first_b0.bin', triangleCount: 120, bounds: { min: [0, 0, 0], max: [1, 1, 1] } }],
+      previewFilePath: null,
+    };
+    const secondModel: ModelSummary = {
+      modelId: 'model_second',
+      partId: 'part_0',
+      fileName: 'second.stl',
+      fileSizeBytes: 1024,
+      triangleCount: 240,
+      bounds: { min: [0, 0, 0], max: [2, 2, 2] },
+      batches: [{ batchIndex: 0, filePath: 'second_b0.bin', triangleCount: 240, bounds: { min: [0, 0, 0], max: [2, 2, 2] } }],
+      previewFilePath: null,
+    };
+
+    let resolveCommit: ((v: { committed: boolean }) => void) | undefined;
+    const commitModel = vi
+      .fn()
+      .mockResolvedValueOnce({ committed: true })
+      .mockImplementationOnce(
+        () =>
+          new Promise<{ committed: boolean }>((resolve) => {
+            resolveCommit = resolve;
+          }),
+      );
+    const discardModel = vi.fn().mockResolvedValue({ discarded: true });
+    const importStl = vi
+      .fn()
+      .mockResolvedValueOnce(firstModel)
+      .mockResolvedValueOnce(secondModel);
+
+    const api = createMockApi({ importStl, commitModel, discardModel });
+    render(<App api={api} disableWebGL />);
+
+    // Commit first.stl
+    fireEvent.click(screen.getByRole('button', { name: /open stl/i }));
+    expect(await screen.findByText('first.stl')).toBeInTheDocument();
+
+    // Start second.stl; commitModel is in-flight -> Cancel must be disabled
+    fireEvent.click(screen.getByRole('button', { name: /open stl/i }));
+    await waitFor(() => {
+      expect(commitModel).toHaveBeenCalledWith('model_second');
+    });
+    const cancelBtn = screen.getByRole('button', { name: /cancel import/i });
+    expect(cancelBtn).toBeDisabled();
+
+    // Reject commit -> discards secondModel and preserves first.stl
+    resolveCommit?.({ committed: false });
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /Replacement commit was rejected; kept first\.stl open/i,
+    );
+    expect(discardModel).toHaveBeenCalledWith('model_second');
+    expect(screen.getByText('first.stl')).toBeInTheDocument();
   });
 });

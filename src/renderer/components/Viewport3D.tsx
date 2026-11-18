@@ -12,14 +12,27 @@ import { computeOrientationQuaternion } from '../orientation';
 
 export type CameraPreset = 'reset' | 'front' | 'top' | 'right';
 
+export interface PickGenerationToken {
+  modelId: string;
+  modelGen: number;
+  viewGen: number;
+}
+
 export interface Viewport3DProps {
   api?: PaintPalletApi;
   model: ModelSummary | null;
   pendingModel: ModelSummary | null;
   orientation: ModelOrientation;
   cameraPresetRequest: { preset: CameraPreset; seq: number } | null;
-  onSurfacePick: (origin: Vec3, direction: Vec3, batchIndices?: number[]) => void;
-  onPendingModelCommit: (committed: ModelSummary) => void;
+  onSurfacePick: (
+    origin: Vec3,
+    direction: Vec3,
+    batchIndices: number[],
+    token: PickGenerationToken,
+  ) => void;
+  onPickNeedsDetail?: (message: string) => void;
+  onViewChange?: () => void;
+  onPendingModelCommit: (committed: ModelSummary) => Promise<boolean> | boolean;
   onPendingModelError: (error: Error) => void;
   disableWebGL?: boolean;
 }
@@ -102,6 +115,36 @@ export function findRayIntersectingBatchIndices(
   return hits.map((h) => h.batchIndex);
 }
 
+export type ClickResolution =
+  | { kind: 'preview-only' }
+  | { kind: 'needs-detail'; targetBatches: number[] }
+  | { kind: 'pick'; visibleBatchIds: number[] };
+
+/**
+ * Pure click-time decision: resolves only against original-detail batches visible
+ * at click time; rejects preview-only clicks and requests a second click when more
+ * detail must be streamed.
+ */
+export function resolveClickAgainstVisibleDetail(
+  detailVisible: boolean,
+  visibleBatchSet: ReadonlySet<number>,
+  rayIntersectingBatches: number[],
+): ClickResolution {
+  if (!detailVisible || visibleBatchSet.size === 0) {
+    return { kind: 'preview-only' };
+  }
+  if (rayIntersectingBatches.length > 0 && !visibleBatchSet.has(rayIntersectingBatches[0])) {
+    return {
+      kind: 'needs-detail',
+      targetBatches: rayIntersectingBatches.slice(0, MAX_DETAIL_BATCHES),
+    };
+  }
+  return {
+    kind: 'pick',
+    visibleBatchIds: Array.from(visibleBatchSet),
+  };
+}
+
 function disposeGroupMeshes(group: THREE.Group): void {
   while (group.children.length > 0) {
     const child = group.children[0] as THREE.Mesh;
@@ -117,6 +160,8 @@ export function Viewport3D({
   orientation,
   cameraPresetRequest,
   onSurfacePick,
+  onPickNeedsDetail,
+  onViewChange,
   onPendingModelCommit,
   onPendingModelError,
   disableWebGL = false,
@@ -124,6 +169,10 @@ export function Viewport3D({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const onPickRef = useRef(onSurfacePick);
   onPickRef.current = onSurfacePick;
+  const onPickNeedsDetailRef = useRef(onPickNeedsDetail);
+  onPickNeedsDetailRef.current = onPickNeedsDetail;
+  const onViewChangeRef = useRef(onViewChange);
+  onViewChangeRef.current = onViewChange;
   const onCommitRef = useRef(onPendingModelCommit);
   onCommitRef.current = onPendingModelCommit;
   const onErrorRef = useRef(onPendingModelError);
@@ -136,6 +185,8 @@ export function Viewport3D({
   const detailCacheRef = useRef<Map<number, { mesh: THREE.Mesh; lastUsed: number }>>(new Map());
   const lruTickRef = useRef(0);
   const streamGenerationRef = useRef(0);
+  const modelGenRef = useRef(0);
+  const viewGenRef = useRef(0);
 
   const sceneRefs = useRef<{
     scene: THREE.Scene;
@@ -161,7 +212,6 @@ export function Viewport3D({
     const batchByIndex = new Map(targetModel.batches.map((b) => [b.batchIndex, b]));
     const cache = detailCacheRef.current;
 
-    // Touch already-cached batches
     for (const idx of desiredIndices) {
       const existing = cache.get(idx);
       if (existing) {
@@ -169,7 +219,6 @@ export function Viewport3D({
       }
     }
 
-    // Stream in missing batches progressively
     for (const idx of desiredIndices) {
       if (streamGenerationRef.current !== generation) return;
       if (cache.has(idx)) continue;
@@ -179,7 +228,6 @@ export function Viewport3D({
       const bin = await currentApi.readBatch(desc.filePath);
       if (streamGenerationRef.current !== generation) return;
 
-      // Evict least-recently-used batch if at capacity (and not in desiredIndices)
       while (cache.size >= MAX_DETAIL_BATCHES) {
         let victimKey: number | null = null;
         let oldestTick = Infinity;
@@ -222,7 +270,10 @@ export function Viewport3D({
     );
     await ensureDetailBatchesLoaded(targetModel, desired, gen);
     if (streamGenerationRef.current === gen && refs.detailGroup.children.length > 0) {
-      refs.previewGroup.visible = false;
+      // Keep whole-model overview available when model exceeds detail budget,
+      // and enable detailGroup for original-triangle picking.
+      refs.previewGroup.visible =
+        targetModel.batches.length > MAX_DETAIL_BATCHES && refs.previewGroup.children.length > 0;
       refs.detailGroup.visible = true;
     }
   };
@@ -301,6 +352,8 @@ export function Viewport3D({
     const onControlStart = () => {
       if (settleTimer !== null) window.clearTimeout(settleTimer);
       ++streamGenerationRef.current;
+      ++viewGenRef.current;
+      onViewChangeRef.current?.();
       if (previewGroup.children.length > 0) {
         previewGroup.visible = true;
         detailGroup.visible = false;
@@ -322,7 +375,7 @@ export function Viewport3D({
       downX = e.clientX;
       downY = e.clientY;
     };
-    const onPointerUp = async (e: PointerEvent) => {
+    const onPointerUp = (e: PointerEvent) => {
       if (e.button !== 0) return;
       const dist = Math.hypot(e.clientX - downX, e.clientY - downY);
       if (dist > 4) return;
@@ -344,23 +397,44 @@ export function Viewport3D({
 
       const orig: Vec3 = [localRay.origin.x, localRay.origin.y, localRay.origin.z];
       const dir: Vec3 = [localRay.direction.x, localRay.direction.y, localRay.direction.z];
+      const rayBatches = findRayIntersectingBatchIndices(currentModel.batches, orig, dir);
 
-      // Ensure exact ray-intersected detail batches are loaded & rendered before resolving pick
-      const rayBatches = findRayIntersectingBatchIndices(currentModel.batches, orig, dir).slice(
-        0,
-        MAX_DETAIL_BATCHES,
+      const resolution = resolveClickAgainstVisibleDetail(
+        detailGroup.visible,
+        new Set(detailCacheRef.current.keys()),
+        rayBatches,
       );
-      if (rayBatches.length > 0) {
-        const gen = ++streamGenerationRef.current;
-        await ensureDetailBatchesLoaded(currentModel, rayBatches, gen);
-        if (streamGenerationRef.current === gen) {
-          previewGroup.visible = false;
-          detailGroup.visible = true;
-        }
+
+      if (resolution.kind === 'preview-only') {
+        void streamForCurrentCamera(currentModel);
+        onPickNeedsDetailRef.current?.(
+          'Loading original surface detail for this view; click again to pick face.',
+        );
+        return;
       }
 
-      const renderedBatchIndices = Array.from(detailCacheRef.current.keys());
-      onPickRef.current(orig, dir, renderedBatchIndices);
+      if (resolution.kind === 'needs-detail') {
+        const gen = ++streamGenerationRef.current;
+        void ensureDetailBatchesLoaded(currentModel, resolution.targetBatches, gen).then(() => {
+          if (streamGenerationRef.current === gen) {
+            previewGroup.visible =
+              currentModel.batches.length > MAX_DETAIL_BATCHES &&
+              previewGroup.children.length > 0;
+            detailGroup.visible = true;
+          }
+        });
+        onPickNeedsDetailRef.current?.(
+          'Loading original detail for clicked region; click again to pick face.',
+        );
+        return;
+      }
+
+      // Frame remains unchanged; capture visible batch IDs and generations synchronously before async pick
+      onPickRef.current(orig, dir, resolution.visibleBatchIds, {
+        modelId: currentModel.modelId,
+        modelGen: modelGenRef.current,
+        viewGen: viewGenRef.current,
+      });
     };
     renderer.domElement.addEventListener('pointerdown', onPointerDown);
     renderer.domElement.addEventListener('pointerup', onPointerUp);
@@ -403,8 +477,8 @@ export function Viewport3D({
     };
   }, [disableWebGL]);
 
-  // Stage pendingModel batches in isolation; keep previous committed model intact until
-  // replacement geometry opens and mounts cleanly.
+  // Stage pendingModel batches in isolation; keep old geometry intact until atomic
+  // native commit returns committed:true.
   useEffect(() => {
     if (!pendingModel || !api) return;
     let cancelled = false;
@@ -412,11 +486,19 @@ export function Viewport3D({
     const stagedPreviewGeos: THREE.BufferGeometry[] = [];
     const stagedDetailEntries: { batchIndex: number; geo: THREE.BufferGeometry }[] = [];
 
+    const disposeStaged = () => {
+      for (const g of stagedPreviewGeos) g.dispose();
+      for (const e of stagedDetailEntries) e.geo.dispose();
+    };
+
     const stageBatches = async () => {
       try {
         if (pendingModel.previewFilePath) {
           const previewBin = await api.readBatch(pendingModel.previewFilePath);
-          if (cancelled) return;
+          if (cancelled) {
+            disposeStaged();
+            return;
+          }
           const geo = new THREE.BufferGeometry();
           geo.setAttribute('position', new THREE.BufferAttribute(previewBin.positions, 3));
           geo.setAttribute('normal', new THREE.BufferAttribute(previewBin.normals, 3));
@@ -440,13 +522,23 @@ export function Viewport3D({
           const batch = batchByIndex.get(idx);
           if (!batch) continue;
           const bin = await api.readBatch(batch.filePath);
-          if (cancelled) return;
+          if (cancelled) {
+            disposeStaged();
+            return;
+          }
           const geo = new THREE.BufferGeometry();
           geo.setAttribute('position', new THREE.BufferAttribute(bin.positions, 3));
           geo.setAttribute('normal', new THREE.BufferAttribute(bin.normals, 3));
           stagedDetailEntries.push({ batchIndex: idx, geo });
         }
 
+        const committed = await onCommitRef.current(pendingModel);
+        if (cancelled || !committed) {
+          disposeStaged();
+          return;
+        }
+
+        ++modelGenRef.current;
         const refs = sceneRefs.current;
         if (refs) {
           ++streamGenerationRef.current;
@@ -466,17 +558,15 @@ export function Viewport3D({
             });
           }
 
-          refs.previewGroup.visible = false;
+          refs.previewGroup.visible =
+            pendingModel.batches.length > MAX_DETAIL_BATCHES &&
+            refs.previewGroup.children.length > 0;
           refs.detailGroup.visible = true;
         } else {
-          for (const g of stagedPreviewGeos) g.dispose();
-          for (const e of stagedDetailEntries) e.geo.dispose();
+          disposeStaged();
         }
-
-        onCommitRef.current(pendingModel);
       } catch (err) {
-        for (const g of stagedPreviewGeos) g.dispose();
-        for (const e of stagedDetailEntries) e.geo.dispose();
+        disposeStaged();
         if (!cancelled) {
           onErrorRef.current(
             err instanceof Error ? err : new Error('Failed loading replacement geometry batches'),
@@ -488,8 +578,7 @@ export function Viewport3D({
     void stageBatches();
     return () => {
       cancelled = true;
-      for (const g of stagedPreviewGeos) g.dispose();
-      for (const e of stagedDetailEntries) e.geo.dispose();
+      disposeStaged();
     };
   }, [api, pendingModel]);
 
@@ -497,6 +586,9 @@ export function Viewport3D({
   useEffect(() => {
     const refs = sceneRefs.current;
     if (!refs || !model) return;
+
+    ++viewGenRef.current;
+    onViewChangeRef.current?.();
 
     const q = computeOrientationQuaternion(orientation.upright, orientation.front);
     refs.modelGroup.quaternion.copy(q);
@@ -526,6 +618,9 @@ export function Viewport3D({
   useEffect(() => {
     const refs = sceneRefs.current;
     if (!refs || !cameraPresetRequest) return;
+    ++viewGenRef.current;
+    onViewChangeRef.current?.();
+
     const r = refs.radius;
     const targetY = r * 0.5;
     refs.controls.target.set(0, targetY, 0);

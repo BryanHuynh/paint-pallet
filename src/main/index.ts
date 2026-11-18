@@ -12,7 +12,15 @@ let workerClient: WorkerClient | null = null;
 let activeImportJobId: string | null = null;
 const authorizedImportPaths = new Set<string>();
 let committedBatchPaths = new Set<string>();
-let stagedBatchPaths = new Set<string>();
+const stagedBatchesByModelId = new Map<string, Set<string>>();
+
+function isAuthorizedBatchPath(resolvedPath: string): boolean {
+  if (committedBatchPaths.has(resolvedPath)) return true;
+  for (const paths of stagedBatchesByModelId.values()) {
+    if (paths.has(resolvedPath)) return true;
+  }
+  return false;
+}
 
 function collectBatchPaths(summary: ModelSummary): Set<string> {
   const paths = new Set<string>();
@@ -94,7 +102,7 @@ app.whenReady().then(() => {
     activeImportJobId = jobId;
     try {
       const summary = await getWorkerClient().importStl(resolved, jobId, { staged: true });
-      stagedBatchPaths = collectBatchPaths(summary);
+      stagedBatchesByModelId.set(summary.modelId, collectBatchPaths(summary));
       return summary;
     } finally {
       if (activeImportJobId === jobId) {
@@ -104,17 +112,28 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle('worker:commit-model', async (_event, modelId: string) => {
+    if (typeof modelId !== 'string' || !modelId) {
+      return { committed: false };
+    }
     const res = await getWorkerClient().commitModel(modelId);
     if (res.committed) {
-      committedBatchPaths = stagedBatchPaths;
-      stagedBatchPaths = new Set<string>();
+      const promoted = stagedBatchesByModelId.get(modelId);
+      if (promoted) {
+        committedBatchPaths = promoted;
+      }
+      stagedBatchesByModelId.delete(modelId);
     }
     return res;
   });
 
   ipcMain.handle('worker:discard-model', async (_event, modelId: string) => {
+    if (typeof modelId !== 'string' || !modelId) {
+      return { discarded: false };
+    }
     const res = await getWorkerClient().discardModel(modelId);
-    stagedBatchPaths = new Set<string>();
+    if (res.discarded) {
+      stagedBatchesByModelId.delete(modelId);
+    }
     return res;
   });
 
@@ -134,7 +153,7 @@ app.whenReady().then(() => {
       throw new Error('Invalid batch path');
     }
     const resolved = path.resolve(filePath);
-    if (!committedBatchPaths.has(resolved) && !stagedBatchPaths.has(resolved)) {
+    if (!isAuthorizedBatchPath(resolved)) {
       throw new Error('Unauthorized batch file path');
     }
     return readBatchBinary(resolved);

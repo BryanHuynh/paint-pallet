@@ -290,6 +290,11 @@ describe('Worker import/batch/pick protocol', () => {
     expect(comm.committed).toBe(true);
     expect((await client.getActiveModel())?.modelId).toBe(third.modelId);
     expect(fs.existsSync(path.dirname(first.batches[0].filePath))).toBe(false);
+
+    // Committing an already-discarded or unknown modelId returns committed:false and preserves active model
+    const rejected = await client.commitModel(second.modelId);
+    expect(rejected.committed).toBe(false);
+    expect((await client.getActiveModel())?.modelId).toBe(third.modelId);
   });
 
   it('restricts pickFace to rendered batchIndices when provided', async () => {
