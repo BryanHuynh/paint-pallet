@@ -6,12 +6,14 @@ export function ShadowPanel({
   paint,
   fill,
   onApplyFill,
+  onToolChange,
   recipes,
   busy,
 }: {
   paint: ReturnType<typeof useShadowPainting>;
   fill: ReturnType<typeof useConnectedFill>;
   onApplyFill: () => void;
+  onToolChange: ReturnType<typeof useShadowPainting>['setTool'];
   recipes: PaintRecipe[];
   busy: boolean;
 }) {
@@ -58,14 +60,14 @@ export function ShadowPanel({
         <>
           <div className="shadow-tools" role="group" aria-label="Shadow tools">
             <button type="button" className="btn btn--secondary btn--small" aria-pressed={paint.tool === null}
-              disabled={locked} onClick={() => { fill.cancel(); paint.setTool(null); }}>Inspect</button>
+              disabled={locked} onClick={() => { fill.cancel(); onToolChange(null); }}>Inspect</button>
             <button type="button" className="btn btn--secondary btn--small" aria-pressed={paint.tool === 'brush'}
-              disabled={locked || !recipe} onClick={() => { fill.cancel(); paint.setTool('brush'); }}>Brush</button>
+              disabled={locked || !recipe} onClick={() => { fill.cancel(); onToolChange('brush'); }}>Brush</button>
             <button type="button" className="btn btn--secondary btn--small" aria-pressed={paint.tool === 'erase'}
-              disabled={locked || !recipe} onClick={() => { fill.cancel(); paint.setTool('erase'); }}>Erase</button>
+              disabled={locked || !recipe} onClick={() => { fill.cancel(); onToolChange('erase'); }}>Erase</button>
             {fill.available && (
               <button type="button" className="btn btn--secondary btn--small" aria-pressed={paint.tool === 'fill'}
-                disabled={locked || !recipe} onClick={() => paint.setTool('fill')}>Fill</button>
+                disabled={locked || !recipe} onClick={() => onToolChange('fill')}>Fill</button>
             )}
           </div>
           {recipe && paint.tool === 'fill' && (

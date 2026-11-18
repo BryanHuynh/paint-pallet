@@ -66,6 +66,12 @@ export interface ConnectedFillRequest {
   blockedFaces: number[];
 }
 
+export interface ExposureRequest {
+  modelId: string;
+  jobId: string;
+  direction: Vec3;
+}
+
 export interface PaintPalletApi {
   selectStlFile: () => Promise<string | null>;
   importDroppedStl?: (file: File) => Promise<ModelSummary>;
@@ -83,5 +89,7 @@ export interface PaintPalletApi {
   ) => Promise<PickResult>;
   previewConnectedFill?: (request: ConnectedFillRequest) => Promise<Uint32Array>;
   cancelConnectedFill?: (jobId: string) => Promise<{ canceled: boolean }>;
+  computeLightExposure?: (request: ExposureRequest) => Promise<Float32Array>;
+  cancelLightExposure?: (jobId: string) => Promise<{ canceled: boolean }>;
   onImportProgress: (listener: (event: ImportProgressEvent) => void) => () => void;
 }

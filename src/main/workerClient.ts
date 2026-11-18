@@ -7,6 +7,7 @@ import readline from 'node:readline';
 import {
   BatchBinaryData,
   ConnectedFillRequest,
+  ExposureRequest,
   ImportProgressEvent,
   ModelSummary,
   PickResult,
@@ -144,6 +145,10 @@ export class WorkerClient {
         entry.resolve(msg.filePath);
       } else if (msg.type === 'fill_error' || msg.type === 'fill_canceled') {
         entry.reject(new Error(String(msg.error ?? 'Fill canceled')));
+      } else if (msg.type === 'light_complete') {
+        entry.resolve(msg.filePath);
+      } else if (msg.type === 'light_error' || msg.type === 'light_canceled') {
+        entry.reject(new Error(String(msg.error ?? 'Lighting canceled')));
       } else if (msg.type === 'active_model') {
         entry.resolve((msg.model as ModelSummary | null) ?? null);
       }
@@ -280,16 +285,25 @@ export class WorkerClient {
       fillParams: [request.faceId, request.maxCreaseDegrees],
       blockedFaces: request.blockedFaces,
     });
+    return new Uint32Array(await this.readAnalysisResult(filePath, `fill-${request.jobId}.bin`, 12));
+  }
+
+  async computeLightExposure(request: ExposureRequest): Promise<Float32Array> {
+    if (!SAFE_JOB_ID_RE.test(request.jobId)) throw new Error('Invalid lighting job ID');
+    const filePath = await this.sendRequest<string>({ cmd: 'light_exposure', ...request });
+    return new Float32Array(await this.readAnalysisResult(filePath, `exposure-${request.jobId}.bin`, 4));
+  }
+
+  private async readAnalysisResult(filePath: string, expectedName: string, stride: number): Promise<ArrayBuffer> {
     const relative = path.relative(this.cacheDir, filePath);
-    if (relative.startsWith('..') || path.isAbsolute(relative) ||
-      path.basename(relative) !== `fill-${request.jobId}.bin`) {
-      throw new Error('Invalid fill preview path');
+    if (relative.startsWith('..') || path.isAbsolute(relative) || path.basename(relative) !== expectedName) {
+      throw new Error('Invalid worker analysis path');
     }
 
     try {
       const data = await fs.promises.readFile(filePath);
-      if (data.byteLength % 12 !== 0) throw new Error('Invalid fill preview result');
-      return new Uint32Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+      if (data.byteLength % stride !== 0) throw new Error('Invalid worker analysis result');
+      return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     } finally {
       await fs.promises.unlink(filePath).catch(() => {});
     }

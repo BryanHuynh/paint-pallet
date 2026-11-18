@@ -15,11 +15,22 @@ add_executable(paint_pallet_worker
   src/main.cpp
   src/stl_importer.cpp
   src/surface_topology.cpp
+  src/surface_lighting.cpp
 )
 
 target_link_libraries(paint_pallet_worker PRIVATE meshoptimizer)
 
 if(WIN32)
+  set(PAINT_PALLET_EMBREE_ROOT "" CACHE PATH "Pinned Embree Windows SDK")
+  target_include_directories(paint_pallet_worker PRIVATE "${PAINT_PALLET_EMBREE_ROOT}/include")
+  target_link_libraries(paint_pallet_worker PRIVATE "${PAINT_PALLET_EMBREE_ROOT}/lib/embree4.lib")
+  foreach(dll embree4.dll tbb12.dll tbbmalloc.dll)
+    configure_file("${PAINT_PALLET_EMBREE_ROOT}/bin/${dll}" "${CMAKE_BINARY_DIR}/${dll}" COPYONLY)
+  endforeach()
+  foreach(license LICENSE.txt third-party-programs.txt third-party-programs-TBB.txt)
+    configure_file("${PAINT_PALLET_EMBREE_ROOT}/share/doc/Embree_superbuild/${license}"
+      "${CMAKE_BINARY_DIR}/embree-notices/${license}" COPYONLY)
+  endforeach()
   target_compile_definitions(paint_pallet_worker PRIVATE
     NOMINMAX
     WIN32_LEAN_AND_MEAN

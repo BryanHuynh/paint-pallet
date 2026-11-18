@@ -14,6 +14,9 @@ import type { PaintRecipe } from './palette/types';
 import { createEmptyRecipe } from './palette/recipes';
 import { ShadowPanel } from './paint/ShadowPanel';
 import { useShadowPainting } from './paint/useShadowPainting';
+import { LightingPanel } from './paint/LightingPanel';
+import { renderToneMask, toneColorKey } from './paint/lightingState';
+import { useSurfaceLighting } from './paint/useSurfaceLighting';
 import { FILL_PREVIEW_REGION, unpackFillFaces, useConnectedFill } from './paint/useConnectedFill';
 import appLogoUrl from '../../assets/paint-pallet-logo.png';
 
@@ -56,15 +59,28 @@ export default function App({
   const [activeTab, setActiveTab] = useState<'model' | 'palette'>('model');
   const [model, setModel] = useState<ModelSummary | null>(null);
   const fill = useConnectedFill(api, shadow.tool === 'fill', model?.modelId, shadow.region?.id, shadow.committedCoverage);
-  const shadowColors = useMemo(() => {
-    if (!fill.previewCoverage) return shadow.colors;
-    return new Map([...shadow.colors, [FILL_PREVIEW_REGION, '#76d9ac']]);
-  }, [fill.previewCoverage, shadow.colors]);
   const [pendingModel, setPendingModel] = useState<ModelSummary | null>(null);
   const [orientation, setOrientation] = useState<ModelOrientation>({
     upright: '+Y',
     front: '+Z',
   });
+  const lighting = useSurfaceLighting(api, model?.modelId, orientation, shadow.committedCoverage);
+  const coverage = useMemo(
+    () => renderToneMask(fill.previewCoverage ?? shadow.coverage, lighting.mask),
+    [fill.previewCoverage, shadow.coverage, lighting.mask],
+  );
+  const shadowColors = useMemo(() => {
+    const colors = new Map(shadow.colors);
+    if (fill.previewCoverage) colors.set(FILL_PREVIEW_REGION, '#76d9ac');
+    const byId = new Map(recipes.map((recipe) => [recipe.id, recipe]));
+    for (const region of shadow.regions) {
+      const recipe = byId.get(region.recipeId);
+      if (!recipe) continue;
+      colors.set(toneColorKey(region.id, 'midtone'), recipe.swatches.midtone.hex);
+      colors.set(toneColorKey(region.id, 'highlight'), recipe.swatches.highlight.hex);
+    }
+    return colors;
+  }, [fill.previewCoverage, shadow.colors, recipes, shadow.regions]);
   const [pickResult, setPickResult] = useState<PickResult | null>(null);
   const [progress, setProgress] = useState<ImportProgressEvent | null>(null);
   const [isImporting, setIsImporting] = useState(false);
@@ -259,6 +275,7 @@ export default function App({
         pendingModelRef.current = null;
         shadow.reset();
         fill.cancel();
+        lighting.reset();
         setModel(committed);
         setPendingModel(null);
         setProgress(null);
@@ -435,13 +452,14 @@ export default function App({
             cameraPresetRequest={cameraPresetRequest}
             onSurfacePick={handleSurfacePick}
             shadowPaint={{
-              enabled: Boolean(model && shadow.tool && shadow.tool !== 'fill' && shadow.recipe && !isBusy),
-              coverage: fill.previewCoverage ?? shadow.coverage,
+              enabled: Boolean(model && !isBusy && (lighting.brushTool ||
+                (shadow.tool && shadow.tool !== 'fill' && shadow.recipe))),
+              coverage,
               colors: shadowColors,
               diameter: shadow.brushSize,
-              onFaces: shadow.paintFaces,
-              onStart: shadow.beginStroke,
-              onEnd: shadow.endStroke,
+              onFaces: lighting.brushTool ? lighting.paintFaces : shadow.paintFaces,
+              onStart: lighting.brushTool ? lighting.beginBrush : shadow.beginStroke,
+              onEnd: lighting.brushTool ? lighting.endBrush : shadow.endStroke,
             }}
             onPickNeedsDetail={handlePickNeedsDetail}
             onViewChange={handleViewChange}
@@ -529,13 +547,33 @@ export default function App({
               paint={shadow}
               fill={fill}
               recipes={recipes}
-              busy={isBusy}
+              busy={isBusy || lighting.brushPending}
+              onToolChange={(tool) => {
+                lighting.setBrushTool(null);
+                shadow.setTool(tool);
+              }}
               onApplyFill={() => {
                 if (fill.packed) shadow.commitFill(unpackFillFaces(fill.packed));
                 fill.cancel();
               }}
             />
           )}
+          {model && lighting.available && (
+            <LightingPanel
+              lighting={lighting}
+              busy={isBusy || shadow.strokePending || lighting.brushPending}
+              brushSize={shadow.brushSize}
+              onBrushSize={shadow.setBrushSize}
+              onChooseBrush={(tool) => {
+                if (tool) {
+                  fill.cancel();
+                  shadow.setTool(null);
+                }
+                lighting.setBrushTool(tool);
+              }}
+            />
+          )}
+
           <section className="inspector-section">
             <h2>Model summary</h2>
             {model ? (

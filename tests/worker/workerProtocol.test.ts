@@ -194,6 +194,48 @@ describe('Worker import/batch/pick protocol', () => {
     expect(batches.size).toBe(model.batches.length);
   });
 
+  it('traces full-resolution shadows across spatial partitions with Embree', async () => {
+    const stlPath = path.join(tempDir, 'lighting-overhang.stl');
+    const triangles: Parameters<typeof writeBinaryStl>[1] = [
+      { v1: [0, 0, 0], v2: [1, 0, 0], v3: [0, 1, 0] },
+      { v1: [0, 0, 100], v2: [1, 0, 100], v3: [0, 1, 100] },
+      { v1: [3, 0, 0], v2: [4, 0, 0], v3: [3, 1, 0] },
+      { v1: [5, 0, 0], v2: [6, 0, 0], v3: [5, 1, 1] },
+    ];
+    for (let i = 0; i < 2050; i++) {
+      const x = 10 + (i % 50) * 0.1;
+      const y = 10 + Math.floor(i / 50) * 0.1;
+      triangles.push({ v1: [x, y, 0], v2: [x + 0.05, y, 0], v3: [x, y + 0.05, 0] });
+    }
+    writeBinaryStl(stlPath, triangles);
+    const model = await client.importStl(stlPath, 'lighting-overhang');
+    const batches = new Map<number, number>();
+    for (const batch of model.batches) {
+      const binary = await readBatchBinary(batch.filePath);
+      for (const faceId of binary.faceIds) if (faceId <= 1) batches.set(faceId, batch.batchIndex);
+    }
+    expect(batches.size).toBe(2);
+    expect(batches.get(0)).not.toBe(batches.get(1));
+
+    const first = await client.computeLightExposure({
+      modelId: model.modelId, jobId: 'first-light', direction: [0, 0, 1],
+    });
+    expect(first).toHaveLength(triangles.length);
+    expect(first[0]).toBe(0);
+    expect(first[1]).toBeCloseTo(1);
+    expect(first[2]).toBeCloseTo(1);
+    expect(first[3]).toBeCloseTo(Math.SQRT1_2);
+
+    const cached = await client.computeLightExposure({
+      modelId: model.modelId, jobId: 'same-light', direction: [0, 0, 1],
+    });
+    expect(cached).toEqual(first);
+    const reversed = await client.computeLightExposure({
+      modelId: model.modelId, jobId: 'reversed-light', direction: [0, 0, -1],
+    });
+    expect(reversed[1]).toBe(0);
+  });
+
   it('rejects malformed or truncated STLs, cleans up partial data, and keeps the previous model open', async () => {
     const validPath = path.join(tempDir, 'valid.stl');
     writeBinaryStl(validPath, [{ v1: [0, 0, 0], v2: [1, 0, 0], v3: [0, 1, 0] }]);

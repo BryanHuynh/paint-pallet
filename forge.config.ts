@@ -32,6 +32,9 @@ const config: ForgeConfig = {
     icon: APP_ICON_BASE_PATH,
     extraResource: [
       WORKER_BINARY_PATH,
+      ...['embree4.dll', 'tbb12.dll', 'tbbmalloc.dll', 'embree-notices'].map(
+        (name) => path.join(path.dirname(WORKER_BINARY_PATH), name),
+      ),
       path.resolve(__dirname, 'native/vendor/meshoptimizer/meshoptimizer-LICENSE.md'),
       APP_ICON_ICO_PATH,
       APP_ICON_PNG_PATH,

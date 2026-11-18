@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type {
   ConnectedFillRequest,
+  ExposureRequest,
   ImportProgressEvent,
   PaintPalletApi,
   Vec3,
@@ -26,6 +27,8 @@ const api: PaintPalletApi = {
     ipcRenderer.invoke('worker:pick-face', modelId, origin, direction, batchIndices),
   previewConnectedFill: (request: ConnectedFillRequest) => ipcRenderer.invoke('worker:connected-fill', request),
   cancelConnectedFill: (jobId: string) => ipcRenderer.invoke('worker:cancel-fill', jobId),
+  computeLightExposure: (request: ExposureRequest) => ipcRenderer.invoke('worker:light-exposure', request),
+  cancelLightExposure: (jobId: string) => ipcRenderer.invoke('worker:cancel-light', jobId),
   onImportProgress: (listener: (event: ImportProgressEvent) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, payload: ImportProgressEvent) => {
       listener(payload);

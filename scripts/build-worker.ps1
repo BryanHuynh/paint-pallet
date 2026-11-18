@@ -3,6 +3,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $nativeDir = Join-Path $repoRoot 'native'
 $buildDir = Join-Path $nativeDir 'build'
+$embreeRoot = & (Join-Path $PSScriptRoot 'prepare-embree.ps1') -DependenciesDir (Join-Path $buildDir 'deps')
 
 function Find-Tool([string]$name) {
   $cmd = Get-Command $name -ErrorAction SilentlyContinue
@@ -15,7 +16,7 @@ $cmakeExe = Find-Tool 'cmake.exe'
 $ninjaExe = Find-Tool 'ninja.exe'
 
 if ($clOnPath -and $cmakeExe) {
-  $genArgs = @('-S', $nativeDir, '-B', $buildDir, '-DCMAKE_BUILD_TYPE=Release')
+  $genArgs = @('-S', $nativeDir, '-B', $buildDir, '-DCMAKE_BUILD_TYPE=Release', "-DPAINT_PALLET_EMBREE_ROOT=$embreeRoot")
   if ($ninjaExe) {
     $genArgs += @('-G', 'Ninja', "-DCMAKE_MAKE_PROGRAM=$ninjaExe")
   }
@@ -59,7 +60,7 @@ if (-not $ninjaExe) {
 }
 
 $generatorPart = if ($ninjaExe) { "-G Ninja -DCMAKE_MAKE_PROGRAM=`"$ninjaExe`"" } else { '' }
-$cmdLine = "call `"$vcvars`" && `"$cmakeExe`" -S `"$nativeDir`" -B `"$buildDir`" $generatorPart -DCMAKE_BUILD_TYPE=Release && `"$cmakeExe`" --build `"$buildDir`""
+$cmdLine = "call `"$vcvars`" && `"$cmakeExe`" -S `"$nativeDir`" -B `"$buildDir`" $generatorPart -DCMAKE_BUILD_TYPE=Release -DPAINT_PALLET_EMBREE_ROOT=`"$embreeRoot`" && `"$cmakeExe`" --build `"$buildDir`""
 cmd /c $cmdLine
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE

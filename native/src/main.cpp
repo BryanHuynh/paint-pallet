@@ -1,6 +1,7 @@
 #include "protocol.hpp"
 #include "stl_importer.hpp"
 #include "surface_topology.hpp"
+#include "surface_lighting.hpp"
 
 #include <atomic>
 #include <cctype>
@@ -107,6 +108,7 @@ struct WorkerState {
   std::string activeModelId;
   pp::PickBatchCache pickCache{16};
   pp::SurfaceTopology topology;
+  pp::SurfaceLighting lighting;
 };
 
 }  // namespace
@@ -198,6 +200,7 @@ int main() {
                 state.activeModelId = outcome.model.modelId;
                 state.pickCache.clear();
                 state.topology.clear();
+                state.lighting.clear();
               }
               state.models[outcome.model.modelId] = outcome.model;
             }
@@ -237,6 +240,7 @@ int main() {
             state.activeModelId = modelId;
             state.pickCache.clear();
             state.topology.clear();
+            state.lighting.clear();
             committed = true;
           }
         }
@@ -297,6 +301,34 @@ int main() {
           }
         } catch (const std::exception& error) {
           emitLine("{\"type\":\"fill_error" + prefix + ",\"error\":\"" + pp::jsonEscape(error.what()) + "\"}");
+        }
+        {
+          std::lock_guard<std::mutex> lock(state.jobsMutex);
+          state.pendingOrRunningJobs.erase(jobId);
+        }
+      } else if (cmd == "light_exposure") {
+        const std::string jobId = pp::extractJsonString(line, "jobId").value_or("");
+        const std::string modelId = pp::extractJsonString(line, "modelId").value_or("");
+        const std::string prefix = "\",\"reqId\":\"" + pp::jsonEscape(reqId) + "\"";
+        try {
+          const auto direction = pp::extractJsonNumberArray(line, "direction");
+          auto model = state.models.find(modelId);
+          if (!job.cancelFlag || !direction || direction->size() != 3 ||
+              model == state.models.end() || modelId != state.activeModelId) {
+            throw std::runtime_error("The lighting model or direction is unavailable.");
+          }
+          const std::array<float, 3> vector{
+              static_cast<float>((*direction)[0]),
+              static_cast<float>((*direction)[1]),
+              static_cast<float>((*direction)[2])};
+          const std::string filePath = state.lighting.writeExposure(model->second, jobId, vector, *job.cancelFlag);
+          if (filePath.empty()) {
+            emitLine("{\"type\":\"light_canceled" + prefix + "}");
+          } else {
+            emitLine("{\"type\":\"light_complete" + prefix + ",\"filePath\":\"" + pp::jsonEscape(filePath) + "\"}");
+          }
+        } catch (const std::exception& error) {
+          emitLine("{\"type\":\"light_error" + prefix + ",\"error\":\"" + pp::jsonEscape(error.what()) + "\"}");
         }
         {
           std::lock_guard<std::mutex> lock(state.jobsMutex);
@@ -393,7 +425,7 @@ int main() {
     }
 
     std::shared_ptr<std::atomic<bool>> flag;
-    if (*cmdOpt == "import" || *cmdOpt == "connected_fill") {
+    if (*cmdOpt == "import" || *cmdOpt == "connected_fill" || *cmdOpt == "light_exposure") {
       const std::string jobId = pp::extractJsonString(line, "jobId").value_or("");
       if (isValidJobId(jobId)) {
         std::lock_guard<std::mutex> lock(state.jobsMutex);
@@ -409,6 +441,12 @@ int main() {
     queueCv.notify_one();
   }
 
+  {
+    std::lock_guard<std::mutex> lock(state.jobsMutex);
+    for (const auto& [id, flag] : state.pendingOrRunningJobs) {
+      flag->store(true, std::memory_order_relaxed);
+    }
+  }
   {
     std::lock_guard<std::mutex> lock(queueMutex);
     shuttingDown = true;

@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { WorkerClient, readBatchBinary } from './workerClient';
-import type { ConnectedFillRequest, ModelSummary, Vec3 } from '../shared/workerProtocol';
+import type { ConnectedFillRequest, ExposureRequest, ModelSummary, Vec3 } from '../shared/workerProtocol';
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 declare const MAIN_WINDOW_VITE_NAME: string;
@@ -11,6 +11,7 @@ declare const MAIN_WINDOW_VITE_NAME: string;
 let mainWindow: BrowserWindow | null = null;
 let workerClient: WorkerClient | null = null;
 const activeFillJobs = new Set<string>();
+const activeLightingJobs = new Set<string>();
 let activeImportJobId: string | null = null;
 const authorizedImportPaths = new Set<string>();
 let committedBatchPaths = new Set<string>();
@@ -229,6 +230,26 @@ app.whenReady().then(() => {
 
   ipcMain.handle('worker:cancel-fill', async (_event, jobId: string) => {
     if (!activeFillJobs.has(jobId)) return { canceled: false };
+    return getWorkerClient().cancelImport(jobId);
+  });
+
+  ipcMain.handle('worker:light-exposure', async (_event, request: ExposureRequest) => {
+    if (!request || typeof request.modelId !== 'string' ||
+      typeof request.jobId !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(request.jobId) ||
+      !Array.isArray(request.direction) || request.direction.length !== 3 ||
+      !request.direction.every(Number.isFinite) || activeLightingJobs.has(request.jobId)) {
+      throw new Error('Invalid lighting request.');
+    }
+    activeLightingJobs.add(request.jobId);
+    try {
+      return await getWorkerClient().computeLightExposure(request);
+    } finally {
+      activeLightingJobs.delete(request.jobId);
+    }
+  });
+
+  ipcMain.handle('worker:cancel-light', async (_event, jobId: string) => {
+    if (!activeLightingJobs.has(jobId)) return { canceled: false };
     return getWorkerClient().cancelImport(jobId);
   });
 
