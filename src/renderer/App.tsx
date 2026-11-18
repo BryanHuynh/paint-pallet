@@ -170,7 +170,7 @@ export default function App({
   useEffect(() => {
     if (!api) return;
     const unsub = api.onImportProgress((evt) => {
-      setProgress(evt);
+      if (importInFlight.current) setProgress(evt);
     });
     return unsub;
   }, [api]);
@@ -837,7 +837,7 @@ export default function App({
             <div className="progress-overlay" role="status">{projectAction === 'open' ? 'Opening project…' : 'Saving project…'}</div>
           ) : null}
 
-          {progress ? (
+          {progress && (isImporting || kitImporting || projectAction === 'open') ? (
             <div className="progress-overlay" role="status" aria-live="polite">
               <div className="progress-overlay__row">
                 <span>Importing STL ({progress.phase})</span>
