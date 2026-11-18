@@ -21,6 +21,7 @@ const activeLightingJobs = new Set<string>();
 let activeImportJobId: string | null = null;
 let activeKitImport: AbortController | null = null;
 const kitModels = new Map<string, ModelSummary>();
+const stagedKitsByAnchor = new Map<string, ModelSummary[]>();
 const MAX_KIT_BYTES = 2 * 1024 * 1024 * 1024;
 const authorizedImportPaths = new Set<string>();
 let committedBatchPaths = new Set<string>();
@@ -167,7 +168,7 @@ app.whenReady().then(() => {
 
   async function importStl(
     resolved: string,
-    original?: { name: string; cleanup: () => Promise<void> },
+    original?: { name: string; cleanup?: () => Promise<void> },
   ): Promise<ModelSummary> {
     if (activeImportJobId) {
       throw new Error('An STL import is already in progress');
@@ -280,7 +281,8 @@ app.whenReady().then(() => {
     if (typeof modelId !== 'string' || !modelId) {
       return { committed: false };
     }
-    const res = await getWorkerClient().commitModel(modelId);
+    const replacement = stagedKitsByAnchor.get(modelId) ?? [];
+    const res = await getWorkerClient().commitModel(modelId, replacement.map((part) => part.modelId));
     if (res.committed) {
       const previous = loadedModelId;
       loadedModelId = modelId;
@@ -290,6 +292,8 @@ app.whenReady().then(() => {
         await releaseOriginalSource(partId);
       }
       kitModels.clear();
+      stagedKitsByAnchor.delete(modelId);
+      for (const part of replacement) kitModels.set(part.modelId, part);
       const promoted = stagedBatchesByModelId.get(modelId);
       if (promoted) {
         committedBatchPaths = promoted;
@@ -299,17 +303,26 @@ app.whenReady().then(() => {
     return res;
   });
 
-  ipcMain.handle('worker:discard-model', async (_event, modelId: string) => {
-    if (typeof modelId !== 'string' || !modelId) {
-      return { discarded: false };
-    }
-    const res = await getWorkerClient().discardModel(modelId);
-    if (res.discarded) {
+  async function discardStagedPart(modelId: string) {
+    const result = await getWorkerClient().discardModel(modelId);
+    if (result.discarded) {
       kitModels.delete(modelId);
       stagedBatchesByModelId.delete(modelId);
       await releaseOriginalSource(modelId);
     }
-    return res;
+    return result;
+  }
+
+  ipcMain.handle('worker:discard-model', async (_event, modelId: string) => {
+    if (typeof modelId !== 'string' || !modelId) {
+      return { discarded: false };
+    }
+    const stagedParts = stagedKitsByAnchor.get(modelId);
+    if (stagedParts) {
+      stagedKitsByAnchor.delete(modelId);
+      for (const part of stagedParts) await discardStagedPart(part.modelId);
+    }
+    return discardStagedPart(modelId);
   });
 
   ipcMain.handle('worker:cancel-import', async () => {
@@ -344,6 +357,7 @@ app.whenReady().then(() => {
 
   ipcMain.handle('worker:connected-fill', async (_event, request: ConnectedFillRequest) => {
     if (!request || typeof request.modelId !== 'string' ||
+      (request.modelId !== loadedModelId && !kitModels.has(request.modelId)) ||
       typeof request.jobId !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(request.jobId) ||
       !Number.isSafeInteger(request.faceId) || request.faceId < 0 ||
       !Number.isFinite(request.maxCreaseDegrees) || request.maxCreaseDegrees < 0 || request.maxCreaseDegrees > 180 ||
@@ -383,6 +397,7 @@ app.whenReady().then(() => {
 
   ipcMain.handle('worker:light-exposure', async (_event, request: ExposureRequest) => {
     if (!request || typeof request.modelId !== 'string' ||
+      (request.modelId !== loadedModelId && !kitModels.has(request.modelId)) ||
       typeof request.jobId !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(request.jobId) ||
       !Array.isArray(request.direction) || request.direction.length !== 3 ||
       !request.direction.every(Number.isFinite) || activeLightingJobs.has(request.jobId)) {
@@ -417,7 +432,12 @@ app.whenReady().then(() => {
       filters: [{ name: 'Paint Pallet projects', extensions: ['paintproject'] }],
     });
     if (target.canceled || !target.filePath) return false;
-    await writeProjectArchive(target.filePath, source.path, source.name, request);
+    const ids = request.kitModelIds ?? [];
+    if (!Array.isArray(ids) || new Set(ids).size !== ids.length || ids.length !== kitModels.size ||
+        ids.some((id) => !kitModels.has(id) || !originalSources.has(id))) {
+      throw new Error('The saved part list does not match the open kit.');
+    }
+    await writeProjectArchive(target.filePath, source.path, source.name, request, ids.map((id) => originalSources.get(id)!.path));
     return true;
   });
 
@@ -432,15 +452,19 @@ app.whenReady().then(() => {
     if (activeImportJobId) throw new Error('Wait for the current model import.');
     const archive = await openProjectArchive(selection.filePaths[0], path.join(app.getPath('userData'), 'project-cache'));
     let model: ModelSummary | undefined;
+    const kitParts: ModelSummary[] = [];
     try {
       model = await importStl(archive.originalPath, { name: archive.sourceName, cleanup: archive.cleanup });
       await validateProjectFaces(model, archive.contents);
-      return { model, ...archive.contents };
+      for (const part of archive.kitParts) {
+        kitParts.push(await importStl(part.originalPath, { name: part.sourceName }));
+      }
+      if (kitParts.length) stagedKitsByAnchor.set(model.modelId, kitParts);
+      return { model, kitModels: kitParts, ...archive.contents };
     } catch (error) {
+      for (const part of kitParts) await discardStagedPart(part.modelId);
       if (model) {
-        await getWorkerClient().discardModel(model.modelId);
-        stagedBatchesByModelId.delete(model.modelId);
-        await releaseOriginalSource(model.modelId);
+        await discardStagedPart(model.modelId);
       } else {
         await archive.cleanup();
       }

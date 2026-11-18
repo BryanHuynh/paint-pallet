@@ -20,6 +20,7 @@ class SurfaceTopology {
       uint32_t seed,
       double maxCreaseDegrees,
       const std::vector<uint32_t>& blockedFaces,
+      bool coplanar,
       const std::atomic<bool>& canceled) const;
   std::string writeRidgeBand(
       const ModelRecord& model,

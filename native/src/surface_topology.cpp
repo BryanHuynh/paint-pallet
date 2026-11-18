@@ -206,11 +206,18 @@ std::string SurfaceTopology::writeConnectedFill(
     uint32_t seed,
     double maxCreaseDegrees,
     const std::vector<uint32_t>& blockedFaces,
+    bool coplanar,
     const std::atomic<bool>& canceled) const {
   if (!matches(model) || seed >= faces_.size()) throw std::runtime_error("The fill seed is unavailable.");
   if (canceled.load(std::memory_order_relaxed)) return {};
 
   const double minDot = std::cos(std::clamp(maxCreaseDegrees, 0.0, 180.0) * std::numbers::pi / 180.0);
+  const auto& seedFace = faces_[seed];
+  double span = 0;
+  for (size_t axis = 0; axis < 3; ++axis) {
+    span = std::max(span, static_cast<double>(model.bounds.max[axis]) - model.bounds.min[axis]);
+  }
+  const double planeTolerance = span * 1e-5;
   std::vector<uint8_t> excluded(faces_.size());
   for (uint32_t id : blockedFaces) {
     if (id < excluded.size()) excluded[id] = 1;
@@ -226,7 +233,16 @@ std::string SurfaceTopology::writeConnectedFill(
     const Face& face = faces_[queue[cursor]];
     for (uint32_t neighbor : face.neighbors) {
       if (neighbor == noNeighbor || excluded[neighbor]) continue;
-      if (normalDot(face.normal, faces_[neighbor].normal) + 1.0e-6 < minDot) continue;
+      const auto& candidate = faces_[neighbor];
+      if (normalDot(face.normal, candidate.normal) + 1.0e-6 < minDot) continue;
+      if (coplanar) {
+        const auto& normal = seedFace.normal;
+        const double projection =
+            normal[0] * (static_cast<double>(candidate.center[0]) - seedFace.center[0]) +
+            normal[1] * (static_cast<double>(candidate.center[1]) - seedFace.center[1]) +
+            normal[2] * (static_cast<double>(candidate.center[2]) - seedFace.center[2]);
+        if (std::abs(projection) > planeTolerance || normalDot(normal, candidate.normal) + 1.0e-6 < minDot) continue;
+      }
       excluded[neighbor] = 1;
       queue.push_back(neighbor);
     }

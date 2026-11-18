@@ -6,12 +6,13 @@ import { pipeline } from 'node:stream/promises';
 import { crc32 } from 'node:zlib';
 import * as yazl from 'yazl';
 import * as yauzl from 'yauzl';
+import type { KitState } from '../shared/kit';
 import { GUIDE_VIEWS } from '../shared/paintingGuide';
 import type { ProjectContents, ProjectManifest, ProjectState } from '../shared/paintProject';
 
 const MANIFEST = 'manifest.json';
 const SHADOW = 'paint.bin';
-const PROJECT_ENTRY: RegExp = /^(manifest\.json|paint\.bin|model\.(stl|obj)|reference\/\d+|tone\/\d+|edge\/\d+)$/;
+const PROJECT_ENTRY: RegExp = /^(manifest\.json|paint\.bin|model\.(stl|obj)|reference\/\d+|tone\/\d+|edge\/\d+|part\/\d+\.stl)$/;
 const MAX_MODEL_BYTES = 2 * 1024 * 1024 * 1024;
 const AXIS = /^[+-][XYZ]$/;
 
@@ -37,6 +38,48 @@ function validSwatch(entry: unknown) {
     [entry.brand, entry.bottleName, entry.mixNotes].every((field) => typeof field === 'string');
 }
 
+function finiteTuple(value: unknown, length: number): value is number[] {
+  return Array.isArray(value) && value.length === length && value.every(Number.isFinite);
+}
+
+function validateKit(value: unknown): asserts value is KitState {
+  if (!isRecord(value) || !Array.isArray(value.parts) || !value.parts.length || !Array.isArray(value.joints) ||
+    !value.parts.every((part) => isRecord(part) && nonemptyId(part.id) && typeof part.name === 'string' &&
+      nonemptyId(part.sourceName) && typeof part.staged === 'boolean' && typeof part.hidden === 'boolean' &&
+      isRecord(part.pose) && finiteTuple(part.pose.translation, 3) && finiteTuple(part.pose.rotation, 4) &&
+      Math.abs(1 - Math.hypot(...part.pose.rotation)) < 1e-5)) {
+    throw new Error('Invalid kit part metadata.');
+  }
+  const parts = new Map(value.parts.map((part) => [part.id, part]));
+  const anchor = value.parts[0];
+  if (parts.size !== value.parts.length || anchor.staged ||
+    anchor.pose.translation.some((axis: number) => axis !== 0) ||
+    anchor.pose.rotation.some((axis: number, index: number) => axis !== (index === 3 ? 1 : 0))) {
+    throw new Error('Invalid kit anchor or part IDs.');
+  }
+
+  const parents = new Map<string, string>();
+  for (const joint of value.joints) {
+    if (!isRecord(joint) || !nonemptyId(joint.childId) || !nonemptyId(joint.parentId) || !finiteTuple(joint.point, 3) ||
+      !['authored', 'six-face', 'manual', 'nearby'].some((method) => method === joint.method) ||
+      joint.childId === anchor.id || !parts.has(joint.childId) || !parts.has(joint.parentId) ||
+      parts.get(joint.childId)?.staged || parts.get(joint.parentId)?.staged || parents.has(joint.childId)) {
+      throw new Error('Invalid kit attachment.');
+    }
+    parents.set(joint.childId, joint.parentId);
+  }
+  for (const part of value.parts) {
+    if (part.staged || part.id === anchor.id) continue;
+    const visited = new Set<string>();
+    let id: string | undefined = part.id;
+    while (id && id !== anchor.id && !visited.has(id)) {
+      visited.add(id);
+      id = parents.get(id);
+    }
+    if (id !== anchor.id) throw new Error('Kit attachments must lead back to the anchor.');
+  }
+}
+
 function validateState(value: unknown): asserts value is ProjectState {
   if (!isRecord(value) || !isRecord(value.orientation)) throw new Error('Invalid paint project settings.');
   const { upright, front } = value.orientation;
@@ -45,6 +88,7 @@ function validateState(value: unknown): asserts value is ProjectState {
     throw new Error('Invalid paint project orientation.');
   }
 
+  if (value.kit !== undefined) validateKit(value.kit);
   const { recipes, references, regions, snapshots } = value;
   if (!Array.isArray(recipes) || !recipes.every((recipe) => isRecord(recipe) && nonemptyId(recipe.id) &&
       typeof recipe.name === 'string' && isRecord(recipe.swatches) &&
@@ -123,10 +167,20 @@ export async function writeProjectArchive(
   sourcePath: string,
   sourceName: string,
   contents: ProjectContents,
+  partSources: readonly string[] = [],
 ) {
   validatePayload(contents);
   const extension = path.extname(sourcePath).toLowerCase();
   if (extension !== '.stl' && extension !== '.obj') throw new Error('Project source must be an STL or OBJ.');
+  if (partSources.length !== (contents.state.kit ? contents.state.kit.parts.length - 1 : 0) ||
+    partSources.some((file) => path.extname(file).toLowerCase() !== '.stl')) {
+    throw new Error('One or more original kit files are missing.');
+  }
+  const stats = await Promise.all([sourcePath, ...partSources].map((file) => fs.promises.stat(file)));
+  if (stats.some((file) => !file.isFile() || file.size <= 0) ||
+      stats.reduce((total, file) => total + file.size, 0) > MAX_MODEL_BYTES) {
+    throw new Error('Original kit files exceed the 2 GiB project limit.');
+  }
   const manifest: ProjectManifest = {
     ...contents.state,
     version: 1,
@@ -141,6 +195,7 @@ export async function writeProjectArchive(
   try {
     zip.addBuffer(Buffer.from(JSON.stringify(manifest)), MANIFEST);
     zip.addFile(sourcePath, `model${extension}`, { compress: false });
+    partSources.forEach((file, index) => zip.addFile(file, `part/${index}.stl`, { compress: false }));
     contents.referenceBytes.forEach((bytes, index) => zip.addBuffer(asBuffer(bytes), `reference/${index}`, { compress: false }));
     zip.addBuffer(asBuffer(contents.paint), SHADOW);
     contents.tones.forEach((tones, index) => zip.addBuffer(asBuffer(tones), `tone/${index}`));
@@ -181,7 +236,8 @@ function openEntry(zip: yauzl.ZipFile, entry: yauzl.Entry): Promise<Readable> {
 async function extractEntry(zip: yauzl.ZipFile, entry: yauzl.Entry, dir: string, seen: Set<string>) {
   const name = entry.fileName;
   if (!PROJECT_ENTRY.test(name) || seen.has(name)) throw new Error('The archive contains an unexpected project entry.');
-  if (name.startsWith('model.') && (entry.uncompressedSize > MAX_MODEL_BYTES || entry.uncompressedSize <= 0)) {
+  if ((name.startsWith('model.') || name.startsWith('part/')) &&
+    (entry.uncompressedSize > MAX_MODEL_BYTES || entry.uncompressedSize <= 0)) {
     throw new Error('Original model entry exceeds the supported size.');
   }
   const destination = path.join(dir, name);
@@ -203,11 +259,19 @@ async function extractEntry(zip: yauzl.ZipFile, entry: yauzl.Entry, dir: string,
 async function extractArchive(archive: string, dir: string): Promise<Set<string>> {
   const zip = await openZip(archive);
   const seen = new Set<string>();
+  let totalModelBytes = 0;
   try {
     await new Promise<void>((resolve, reject) => {
       zip.once('error', reject);
       zip.once('end', resolve);
       zip.on('entry', (entry: yauzl.Entry) => {
+        if (entry.fileName.startsWith('model.') || entry.fileName.startsWith('part/')) {
+          totalModelBytes += entry.uncompressedSize;
+          if (totalModelBytes > MAX_MODEL_BYTES) {
+            reject(new Error('The archive exceeds the 2 GiB limit for original geometry.'));
+            return;
+          }
+        }
         void extractEntry(zip, entry, dir, seen).then(() => zip.readEntry(), reject);
       });
       zip.readEntry();
@@ -236,9 +300,10 @@ export async function openProjectArchive(archive: string, cache: string) {
     const entries = await extractArchive(archive, root);
     const manifest = parseManifest(await fs.promises.readFile(path.join(root, MANIFEST), 'utf8'));
     const original = `model${manifest.sourceExtension}`;
+    const partEntries = manifest.kit?.parts.slice(1).map((_, index) => 'part/' + index + '.stl') ?? [];
     const hasEdges = manifest.snapshots.some((snapshot) => snapshot.edgeManualRegions !== undefined);
     const expected = new Set([
-      MANIFEST, SHADOW, original,
+      MANIFEST, SHADOW, original, ...partEntries,
       ...manifest.references.map((_, index) => `reference/${index}`),
       ...manifest.snapshots.map((_, index) => `tone/${index}`),
       ...(hasEdges ? manifest.snapshots.map((_, index) => `edge/${index}`) : []),
@@ -266,6 +331,9 @@ export async function openProjectArchive(archive: string, cache: string) {
     const paint = await readPackedFile(path.join(root, SHADOW));
     return {
       originalPath: path.join(root, original), sourceName: manifest.sourceName,
+      kitParts: partEntries.map((entry, index) => ({
+        originalPath: path.join(root, entry), sourceName: manifest.kit!.parts[index + 1].sourceName,
+      })),
       contents: { state: manifest, referenceBytes, paint, tones, edges }, cleanup,
     };
   } catch (error) {

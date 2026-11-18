@@ -20,6 +20,8 @@ import { createEmptyRecipe } from './palette/recipes';
 import { EdgePanel } from './paint/EdgePanel';
 import { EDGE_PREVIEW, applyEdgesOver, clipEdgeCoverage, edgeColorKey, useEdgeHighlight } from './paint/useEdgeHighlight';
 import { IDENTITY_PART_POSE, type KitPart } from '../shared/kit';
+import { JointPanel } from './kit/JointPanel';
+import { JOINT_HIGHLIGHT, useKitAssembly } from './kit/useKitAssembly';
 import { KitPanel } from './kit/KitPanel';
 import { ShadowPanel } from './paint/ShadowPanel';
 import { useShadowPainting } from './paint/useShadowPainting';
@@ -90,6 +92,16 @@ export default function App({
   const selectedPart = parts.find((part) => part.id === focusId);
   const displayModel = selectedPart?.model ?? model;
   const onAnchor = displayModel?.modelId === model?.modelId;
+  const assembly = useKitAssembly(api, parts, setParts, choosePart);
+  const ghostPart = assembly.draft && (assembly.draft.preview || assembly.draft.method === 'manual')
+    ? parts.find((part) => part.id === assembly.draft?.childId)
+    : undefined;
+  const isolatedPartId = assembly.isolated;
+  const companionParts = useMemo(() => parts.length > 1 ? parts.map((part) => ({
+    ...part,
+    hidden: Boolean(isolatedPartId && isolatedPartId !== part.id) || part.hidden,
+    pose: part.id === ghostPart?.id ? assembly.draft!.pose : part.pose,
+  })) : undefined, [parts, isolatedPartId, ghostPart?.id, assembly.draft?.pose]);
   const fill = useConnectedFill(api, shadow.tool === 'fill', model?.modelId, shadow.region?.id, shadow.committedCoverage);
   const [pendingModel, setPendingModel] = useState<ModelSummary | null>(null);
   const [orientation, setOrientation] = useState<ModelOrientation>({
@@ -108,6 +120,7 @@ export default function App({
     const colors = new Map(shadow.colors);
     if (fill.previewCoverage) colors.set(FILL_PREVIEW_REGION, '#76d9ac');
     colors.set(EDGE_PREVIEW, '#72dfae');
+    colors.set(JOINT_HIGHLIGHT, '#ffce78');
     const byId = new Map(recipes.map((recipe) => [recipe.id, recipe]));
     for (const region of shadow.regions) {
       const recipe = byId.get(region.recipeId);
@@ -276,6 +289,7 @@ export default function App({
       const palette = await paletteProject.current.exportProject();
       await api.saveProject({
         modelId: model.modelId,
+        kitModelIds: parts.slice(1).map((part) => part.model.modelId),
         state: {
           orientation,
           recipes,
@@ -285,6 +299,12 @@ export default function App({
           snapshots: snapshots.snapshots.map((snapshot, index) => ({ ...snapshot, edgeManualRegions: edgeSnapshots[index].manual })),
           activeSnapshotId: snapshots.activeSnapshotId,
           guideCallouts,
+          kit: parts.length ? {
+            parts: parts.map(({ id, name, model: partModel, pose, hidden, staged }) => ({
+              id, name, sourceName: partModel.fileName, pose, hidden, staged,
+            })),
+            joints: assembly.joints,
+          } : undefined,
         },
         referenceBytes: palette.referenceBytes,
         paint: paint.paint,
@@ -325,6 +345,22 @@ export default function App({
     }
   }
 
+  function fitKit(parts: KitPart[]) {
+    if (parts.length <= 1) {
+      setKitBounds(undefined);
+      return;
+    }
+    const min: Vec3 = [...parts[0].model.bounds.min];
+    const max: Vec3 = [...parts[0].model.bounds.max];
+    for (const { model: part } of parts) {
+      for (let axis = 0; axis < 3; axis++) {
+        min[axis] = Math.min(min[axis], part.bounds.min[axis]);
+        max[axis] = Math.max(max[axis], part.bounds.max[axis]);
+      }
+    }
+    setKitBounds({ min, max });
+  }
+
   function choosePart(part: KitPart, remove?: KitPart) {
     if (pendingModelRef.current || importInFlight.current || part.id === focusId) return;
     fill.cancel();
@@ -355,15 +391,7 @@ export default function App({
       if (added.length) {
         const next = [...parts, ...added];
         setParts(next);
-        const min: Vec3 = [...model.bounds.min];
-        const max: Vec3 = [...model.bounds.max];
-        for (const { model: part } of next) {
-          for (let axis = 0; axis < 3; axis++) {
-            min[axis] = Math.min(min[axis], part.bounds.min[axis]);
-            max[axis] = Math.max(max[axis], part.bounds.max[axis]);
-          }
-        }
-        setKitBounds({ min, max });
+        fitKit(next);
       }
       const feedback = [...result.errors];
       if (result.canceled) feedback.push('Import canceled. Previously staged parts are still available.');
@@ -382,7 +410,7 @@ export default function App({
       const discarded = await api?.discardModel?.(part.model.modelId);
       if (discarded?.discarded) {
         setParts((current) => current.filter((item) => item.id !== part.id));
-        if (parts.length === 2) setKitBounds(undefined);
+        fitKit(parts.filter((item) => item.id !== part.id));
       } else {
         setStatusMsg('Could not remove the staged part.');
       }
@@ -480,10 +508,16 @@ export default function App({
           edge.reset();
         }
         setModel(committed);
-        setParts([{ id: committed.partId, name: committed.fileName.replace(/\.(stl|obj)$/i, ''),
-          model: committed, pose: IDENTITY_PART_POSE, hidden: false, staged: false }]);
-        setFocusId(committed.partId);
-        setKitBounds(undefined);
+        const kit = opened?.project.state.kit;
+        const sourceModels = [committed, ...(opened?.project.kitModels ?? [])];
+        const nextParts: KitPart[] = kit
+          ? kit.parts.map((part, index) => ({ ...part, model: sourceModels[index] }))
+          : [{ id: committed.partId, name: committed.fileName.replace(/\.(stl|obj)$/i, ''),
+            model: committed, pose: IDENTITY_PART_POSE, hidden: false, staged: false }];
+        setParts(nextParts);
+        setFocusId(nextParts[0].id);
+        fitKit(nextParts);
+        assembly.reset(kit?.joints);
         setPendingModel(null);
         setProgress(null);
         setPickResult(null);
@@ -551,7 +585,10 @@ export default function App({
       const sequence = ++pickSeqRef.current;
       const result = await api.pickFace(displayModel.modelId, origin, direction, batchIndices);
       if (sequence !== pickSeqRef.current || !isCurrent()) return;
-      if (onAnchor && shadow.tool === 'fill' && shadow.region && model) {
+      if (assembly.draft && selectedPart) {
+        void assembly.capture(selectedPart, result);
+        setPickResult(result);
+      } else if (onAnchor && shadow.tool === 'fill' && shadow.region && model) {
         if (result.hit && result.originalFaceId !== null && result.partId === model.partId) {
           fill.select({ modelId: model.modelId, faceId: result.originalFaceId, regionId: shadow.region.id });
         }
@@ -683,18 +720,19 @@ export default function App({
           <Viewport3D
             api={api}
             model={displayModel}
-            companionParts={parts.length > 1 ? parts : undefined}
+            companionParts={companionParts}
+            ghostModelId={ghostPart?.model.modelId}
             focusPose={selectedPart?.pose}
-            hideFocused={selectedPart?.hidden}
+            hideFocused={selectedPart?.hidden || selectedPart?.id === ghostPart?.id && Boolean(ghostPart) || Boolean(isolatedPartId && isolatedPartId !== selectedPart?.id)}
             fitBounds={kitBounds}
             pendingModel={pendingModel}
             orientation={orientation}
             cameraPresetRequest={cameraPresetRequest}
             onSurfacePick={handleSurfacePick}
             shadowPaint={{
-              enabled: Boolean(model && onAnchor && !isBusy && (edge.tool || lighting.brushTool ||
+              enabled: Boolean(model && onAnchor && !assembly.draft && !isBusy && (edge.tool || lighting.brushTool ||
                 (shadow.tool && shadow.tool !== 'fill' && shadow.recipe))),
-              coverage: onAnchor ? coverage : EMPTY_COVERAGE,
+              coverage: assembly.draft ? assembly.overlay : onAnchor ? coverage : EMPTY_COVERAGE,
               colors: shadowColors,
               diameter: shadow.brushSize,
               onFaces: edge.tool ? edge.paintFaces : lighting.brushTool ? lighting.paintFaces : shadow.paintFaces,
@@ -787,13 +825,15 @@ export default function App({
 
         <aside className="inspector-panel" aria-label="Model inspector">
           {api?.importKitParts && model && (
-            <KitPanel parts={parts} selected={selectedPart} busy={isBusy}
+            <KitPanel parts={parts} selected={selectedPart} busy={isBusy || Boolean(assembly.draft)}
               choose={choosePart} add={addKitParts}
               rename={(name) => setParts((current) => current.map((part) => part.id === focusId ? { ...part, name } : part))}
               remove={(part) => parts[0] && choosePart(parts[0], part)}
             />
           )}
-          {model && onAnchor && (
+          {parts.length > 1 && <JointPanel assembly={assembly} parts={parts} selected={selectedPart}
+            busy={isBusy || shadow.strokePending || lighting.brushPending || edge.stroke} />}
+          {model && onAnchor && !assembly.draft && (
             <ShadowPanel
               paint={shadow}
               fill={fill}
@@ -811,7 +851,7 @@ export default function App({
               }}
             />
           )}
-          {model && onAnchor && lighting.available && (
+          {model && onAnchor && !assembly.draft && lighting.available && (
             <LightingPanel
               lighting={lighting}
               busy={isBusy || shadow.strokePending || lighting.brushPending || edge.stroke}
@@ -845,7 +885,7 @@ export default function App({
             />
           )}
 
-          {model && onAnchor && edge.available && (
+          {model && onAnchor && !assembly.draft && edge.available && (
             <EdgePanel edge={edge} busy={isBusy || shadow.strokePending || lighting.brushPending || edge.stroke}
               brushSize={shadow.brushSize} setBrushSize={shadow.setBrushSize}
               beginPreview={() => {
@@ -979,6 +1019,11 @@ export default function App({
               >
                 Right view
               </button>
+              {assembly.draft && (['back', 'bottom', 'left'] as const).map((preset) => (
+                <button type="button" key={preset} className="btn btn--secondary btn--small" onClick={() => triggerCameraPreset(preset)}>
+                  {preset[0].toUpperCase() + preset.slice(1)} view
+                </button>
+              ))}
             </div>
             <p className="hint-text">
               Drag to orbit · Right-drag to pan · Scroll to zoom

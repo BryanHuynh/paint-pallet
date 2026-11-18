@@ -228,9 +228,16 @@ int main() {
         std::vector<std::string> dirsToCleanup;
         {
           std::lock_guard<std::mutex> lock(state.jobsMutex);
-          if (state.models.find(modelId) != state.models.end()) {
+          std::vector<std::string> retained;
+          const auto encoded = pp::extractJsonString(line, "kitModelIds").value_or("");
+          std::istringstream fields(encoded);
+          for (std::string partId; std::getline(fields, partId, ',');) retained.push_back(partId);
+          if (state.models.find(modelId) != state.models.end() &&
+              std::all_of(retained.begin(), retained.end(), [&](const std::string& id) {
+                return state.models.find(id) != state.models.end() && id != modelId && id != state.activeModelId;
+              })) {
             for (auto it = state.models.begin(); it != state.models.end();) {
-              if (it->first != modelId) {
+              if (it->first != modelId && std::find(retained.begin(), retained.end(), it->first) == retained.end()) {
                 dirsToCleanup.push_back(it->second.jobDir);
                 it = state.models.erase(it);
               } else {
@@ -306,8 +313,8 @@ int main() {
           auto params = pp::extractJsonNumberArray(line, "fillParams");
           auto blocked = pp::extractJsonUIntArray(line, "blockedFaces");
           auto model = state.models.find(modelId);
-          if (!job.cancelFlag || !params || params->size() != 2 || !blocked ||
-              model == state.models.end() || modelId != state.activeModelId) {
+          const bool coplanar = pp::extractJsonBool(line, "coplanar").value_or(false);
+          if (!job.cancelFlag || !params || params->size() != 2 || !blocked || model == state.models.end()) {
             throw std::runtime_error("The fill model or options are unavailable.");
           }
           const double seed = (*params)[0];
@@ -321,7 +328,7 @@ int main() {
             state.topology.build(model->second, *job.cancelFlag);
           const std::string filePath = ready
             ? state.topology.writeConnectedFill(model->second, jobId, static_cast<uint32_t>(seed),
-                                                angle, *blocked, *job.cancelFlag)
+                                                angle, *blocked, coplanar, *job.cancelFlag)
             : "";
           if (filePath.empty()) {
             emitLine("{\"type\":\"fill_canceled" + prefix + "}");

@@ -1,3 +1,4 @@
+import type { KitState } from './kit';
 import type { GuideCallout } from './paintingGuide';
 import type { ModelOrientation, ModelSummary } from './workerProtocol';
 import type { PaintRecipe } from '../renderer/palette/types';
@@ -33,6 +34,7 @@ export interface ProjectState {
   snapshots: ProjectSnapshot[];
   activeSnapshotId: string;
   guideCallouts?: GuideCallout[];
+  kit?: KitState;
 }
 
 export interface ProjectManifest extends ProjectState {
@@ -51,8 +53,10 @@ export interface ProjectContents {
 
 export interface ProjectSaveRequest extends ProjectContents {
   modelId: string;
+  kitModelIds?: string[];
 }
 
 export interface OpenedProject extends ProjectContents {
   model: ModelSummary;
+  kitModels?: ModelSummary[];
 }

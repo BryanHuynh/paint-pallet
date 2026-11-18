@@ -605,3 +605,17 @@ body,
 @media (max-width: 640px) {
   .guide-dialog__views { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+.joint-steps {
+  color: #95a69a;
+  padding-left: 1.25rem;
+  margin: 0.7rem 0;
+  font-size: 0.85rem;
+}
+
+.joint-steps li { padding: 0.16rem 0; }
+.joint-steps li[data-complete="true"] { color: #c4e0ce; }
+.joint-steps li[aria-current="step"] { color: #eef7ef; font-weight: 700; }
+
+.joint-manual-grid { display: grid; gap: 0.4rem; margin: 0.6rem 0; }
+.joint-axis { display: grid; grid-template-columns: 1rem repeat(4, minmax(0, 1fr)); gap: 0.3rem; align-items: center; }

@@ -227,10 +227,11 @@ export class WorkerClient {
     }
   }
 
-  async commitModel(modelId: string): Promise<{ committed: boolean }> {
+  async commitModel(modelId: string, kitModelIds: string[] = []): Promise<{ committed: boolean }> {
     return this.sendRequest<{ committed: boolean }>({
       cmd: 'commit_model',
       modelId,
+      kitModelIds: kitModelIds.join(','),
     });
   }
 
@@ -285,6 +286,7 @@ export class WorkerClient {
       jobId: request.jobId,
       fillParams: [request.faceId, request.maxCreaseDegrees],
       blockedFaces: request.blockedFaces,
+      coplanar: request.coplanar,
     });
     return new Uint32Array(await this.readAnalysisResult(filePath, `fill-${request.jobId}.bin`, 12));
   }

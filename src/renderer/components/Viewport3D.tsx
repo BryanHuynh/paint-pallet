@@ -16,7 +16,7 @@ import type { ShadowCoverage, SurfaceFace } from '../paint/shadowPaint';
 import { SurfaceBrush } from '../paint/surfaceBrush';
 import { SurfaceBrushPreview } from '../paint/surfaceBrushPreview';
 
-export type CameraPreset = 'reset' | 'front' | 'top' | 'right';
+export type CameraPreset = 'reset' | 'front' | 'back' | 'top' | 'bottom' | 'right' | 'left';
 
 export interface PickGenerationToken {
   modelId: string;
@@ -32,6 +32,7 @@ export interface Viewport3DProps {
   focusPose?: PartPose;
   fitBounds?: Bounds3;
   hideFocused?: boolean;
+  ghostModelId?: string;
   orientation: ModelOrientation;
   cameraPresetRequest: { preset: CameraPreset; seq: number } | null;
   onSurfacePick: (
@@ -276,6 +277,7 @@ export function Viewport3D({
   focusPose = IDENTITY_PART_POSE,
   fitBounds,
   hideFocused = false,
+  ghostModelId,
   orientation,
   cameraPresetRequest,
   onSurfacePick,
@@ -936,10 +938,10 @@ export function Viewport3D({
           refs.companions.set(id, layer);
           refs.modelGroup.add(layer);
         }
-        layer.visible = !part.hidden && id !== model?.modelId;
+        layer.visible = !part.hidden && (id !== model?.modelId || id === ghostModelId);
         layer.position.fromArray(part.pose.translation);
         layer.quaternion.fromArray(part.pose.rotation);
-        const material = part.staged ? refs.stagedMaterial : refs.companionMaterial;
+        const material = part.staged || id === ghostModelId ? refs.stagedMaterial : refs.companionMaterial;
         for (const child of layer.children) (child as THREE.Mesh).material = material;
         if (!layer.visible || layer.userData.complete) continue;
         const files = part.model.previewFilePath ? [part.model.previewFilePath] : part.model.batches.map((batch) => batch.filePath);
@@ -960,7 +962,7 @@ export function Viewport3D({
     }
     void loadCompanions();
     return () => { canceled = true; };
-  }, [api, model?.modelId, companionParts]);
+  }, [api, model?.modelId, companionParts, ghostModelId]);
 
   useEffect(() => {
     const refs = sceneRefs.current;
@@ -1021,8 +1023,17 @@ export function Viewport3D({
       case 'front':
         refs.camera.position.set(0, targetY, r * 2.4);
         break;
+      case 'back':
+        refs.camera.position.set(0, targetY, -r * 2.4);
+        break;
       case 'top':
         refs.camera.position.set(0, targetY + r * 2.4, 0.01);
+        break;
+      case 'bottom':
+        refs.camera.position.set(0, targetY - r * 2.4, 0.01);
+        break;
+      case 'left':
+        refs.camera.position.set(-r * 2.4, targetY, 0);
         break;
       case 'right':
         refs.camera.position.set(r * 2.4, targetY, 0);

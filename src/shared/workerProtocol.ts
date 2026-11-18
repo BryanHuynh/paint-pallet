@@ -74,6 +74,7 @@ export interface ConnectedFillRequest {
   faceId: number;
   maxCreaseDegrees: number;
   blockedFaces: number[];
+  coplanar?: boolean;
 }
 
 export interface RidgeBandRequest {
