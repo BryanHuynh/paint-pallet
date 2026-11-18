@@ -28,7 +28,7 @@ Save one versioned ZIP64 .paintproject archive containing the original model, re
 
 - Start with large-mesh import and picking on the supplied STL. Verify all 8,766,580 faces remain addressable, brush and bucket work after camera movement, and fills and shadows cross partition boundaries. Verify edited masks appear in the PDF.
 - Exercise a generated binary STL just under 2 GiB on 32 GB Windows hardware. Measure import time, UI responsiveness, peak process memory and disk use, mask generation, and PDF export. Verify cancellation cleans temporary data and the app stays responsive.
-- For GPU lighting, compare committed masks on overhang and partition-boundary fixtures, the supplied STL, and the near-2 GiB fixture. Time initial setup and repeat light changes, including upload and readback. Record peak video memory use and adapter details. Verify CPU fallback for unsupported devices and insufficient GPU memory. GPU capabilities and timings on the user's PC are unverified.
+- For GPU lighting, compare committed masks on overhang and partition-boundary fixtures, the supplied STL, and the near-2 GiB fixture. Time initial setup and repeat light changes, including upload and readback. Record peak video memory use and adapter details. Verify CPU fallback for unsupported devices and insufficient GPU memory. The reference PC has an NVIDIA GeForce RTX 4080 with DirectX Raytracing 1.1 support or newer, verified using the installed driver. Full-model benchmark timings are pending.
 - Test the packaged app offline, reopen a moved project after clearing its cache, and inspect both PDF paper sizes. Deliver an unsigned local installer unless signing credentials are available.
 
 ## Ticket impact
