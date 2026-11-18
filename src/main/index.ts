@@ -1,13 +1,27 @@
 import { app, BrowserWindow, dialog, ipcMain } from 'electron';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { WorkerClient, readBatchBinary } from './workerClient';
-import type { Vec3 } from '../shared/workerProtocol';
+import type { ModelSummary, Vec3 } from '../shared/workerProtocol';
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 declare const MAIN_WINDOW_VITE_NAME: string;
 
 let mainWindow: BrowserWindow | null = null;
 let workerClient: WorkerClient | null = null;
+let activeImportJobId: string | null = null;
+const authorizedImportPaths = new Set<string>();
+const authorizedBatchPaths = new Set<string>();
+
+function registerAuthorizedBatches(summary: ModelSummary): void {
+  authorizedBatchPaths.clear();
+  if (summary.previewFilePath) {
+    authorizedBatchPaths.add(path.resolve(summary.previewFilePath));
+  }
+  for (const b of summary.batches) {
+    authorizedBatchPaths.add(path.resolve(b.filePath));
+  }
+}
 
 function getWorkerClient(): WorkerClient {
   if (!workerClient) {
@@ -58,15 +72,40 @@ app.whenReady().then(() => {
     if (result.canceled || result.filePaths.length === 0) {
       return null;
     }
-    return result.filePaths[0];
+    const resolved = path.resolve(result.filePaths[0]);
+    authorizedImportPaths.add(resolved);
+    return resolved;
   });
 
-  ipcMain.handle('worker:import-stl', async (_event, filePath: string, jobId: string) => {
-    return getWorkerClient().importStl(filePath, jobId);
+  ipcMain.handle('worker:import-stl', async (_event, filePath: string) => {
+    if (typeof filePath !== 'string') {
+      throw new Error('Unauthorized or invalid STL path');
+    }
+    const resolved = path.resolve(filePath);
+    if (!authorizedImportPaths.has(resolved)) {
+      throw new Error('STL path must be selected through the file dialog');
+    }
+    if (activeImportJobId) {
+      throw new Error('An STL import is already in progress');
+    }
+    const jobId = crypto.randomUUID().replace(/-/g, '');
+    activeImportJobId = jobId;
+    try {
+      const summary = await getWorkerClient().importStl(resolved, jobId);
+      registerAuthorizedBatches(summary);
+      return summary;
+    } finally {
+      if (activeImportJobId === jobId) {
+        activeImportJobId = null;
+      }
+    }
   });
 
-  ipcMain.handle('worker:cancel-import', async (_event, jobId: string) => {
-    return getWorkerClient().cancelImport(jobId);
+  ipcMain.handle('worker:cancel-import', async () => {
+    if (!activeImportJobId) {
+      return { canceled: false };
+    }
+    return getWorkerClient().cancelImport(activeImportJobId);
   });
 
   ipcMain.handle('worker:get-active-model', async () => {
@@ -74,7 +113,14 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle('worker:read-batch', async (_event, filePath: string) => {
-    return readBatchBinary(filePath);
+    if (typeof filePath !== 'string') {
+      throw new Error('Invalid batch path');
+    }
+    const resolved = path.resolve(filePath);
+    if (!authorizedBatchPaths.has(resolved)) {
+      throw new Error('Unauthorized batch file path');
+    }
+    return readBatchBinary(resolved);
   });
 
   ipcMain.handle(

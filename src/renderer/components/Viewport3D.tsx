@@ -224,7 +224,32 @@ export function Viewport3D({
         refs.previewGroup.add(new THREE.Mesh(geo, mat));
       }
 
-      for (const batch of model.batches) {
+      // Bound renderer detail memory to at most MAX_DETAIL_BATCHES simultaneously.
+      // Dense models (>16 batches) use the LOD preview for global orbit and load
+      // bounded detail batches around the model center without exhausting GPU/JS RAM.
+      const MAX_DETAIL_BATCHES = 16;
+      const modelCenter = new THREE.Vector3(
+        (model.bounds.min[0] + model.bounds.max[0]) * 0.5,
+        (model.bounds.min[1] + model.bounds.max[1]) * 0.5,
+        (model.bounds.min[2] + model.bounds.max[2]) * 0.5,
+      );
+      const sortedBatches = [...model.batches]
+        .sort((a, b) => {
+          const ac = new THREE.Vector3(
+            (a.bounds.min[0] + a.bounds.max[0]) * 0.5,
+            (a.bounds.min[1] + a.bounds.max[1]) * 0.5,
+            (a.bounds.min[2] + a.bounds.max[2]) * 0.5,
+          );
+          const bc = new THREE.Vector3(
+            (b.bounds.min[0] + b.bounds.max[0]) * 0.5,
+            (b.bounds.min[1] + b.bounds.max[1]) * 0.5,
+            (b.bounds.min[2] + b.bounds.max[2]) * 0.5,
+          );
+          return ac.distanceToSquared(modelCenter) - bc.distanceToSquared(modelCenter);
+        })
+        .slice(0, MAX_DETAIL_BATCHES);
+
+      for (const batch of sortedBatches) {
         const bin = await api.readBatch(batch.filePath);
         if (cancelled) return;
         const geo = new THREE.BufferGeometry();
@@ -233,8 +258,13 @@ export function Viewport3D({
         refs.detailGroup.add(new THREE.Mesh(geo, mat));
       }
 
-      refs.previewGroup.visible = false;
-      refs.detailGroup.visible = true;
+      if (model.batches.length <= MAX_DETAIL_BATCHES || !model.previewFilePath) {
+        refs.previewGroup.visible = false;
+        refs.detailGroup.visible = true;
+      } else {
+        refs.previewGroup.visible = true;
+        refs.detailGroup.visible = false;
+      }
     };
 
     void loadBatches();

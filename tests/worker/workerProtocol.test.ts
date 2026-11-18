@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { writeBinaryStl, writeGridBinaryStl } from '../fixtures/stlFixture';
 import { WorkerClient, readBatchBinary } from '../../src/main/workerClient';
+import { assertWorkerBinaryPresent } from '../../forge.config';
 
 describe('Worker import/batch/pick protocol', () => {
   let tempDir: string;
@@ -156,5 +157,93 @@ describe('Worker import/batch/pick protocol', () => {
       }
     }
     expect(seenIds.size).toBe(220000);
+  });
+
+  it('rejects unsafe jobIds and returns canceled:false for late-cancel after completion', async () => {
+    const stlPath = path.join(tempDir, 'single.stl');
+    writeBinaryStl(stlPath, [{ v1: [0, 0, 0], v2: [1, 0, 0], v3: [0, 1, 0] }]);
+
+    await expect(client.importStl(stlPath, '../escape')).rejects.toThrow(/Invalid jobId/i);
+
+    const summary = await client.importStl(stlPath, 'job_late_done');
+    expect(summary.triangleCount).toBe(1);
+
+    // Late cancel after completion must return canceled: false
+    const lateAck = await client.cancelImport('job_late_done');
+    expect(lateAck.canceled).toBe(false);
+
+    const active = await client.getActiveModel();
+    expect(active?.modelId).toBe(summary.modelId);
+  });
+
+  it('cancels cleanly during finalization, closes all Windows handles, and cleans up job dir', async () => {
+    const basePath = path.join(tempDir, 'base_fin.stl');
+    writeBinaryStl(basePath, [{ v1: [0, 0, 0], v2: [1, 0, 0], v3: [0, 1, 0] }]);
+    const baseModel = await client.importStl(basePath, 'job_fin_base');
+
+    const gridPath = path.join(tempDir, 'fin_grid.stl');
+    writeGridBinaryStl(gridPath, 180000);
+
+    let cancelSent = false;
+    const unsub = client.onProgress((evt) => {
+      if (evt.jobId === 'job_fin_cancel' && evt.phase === 'finalizing' && !cancelSent) {
+        cancelSent = true;
+        void client.cancelImport('job_fin_cancel');
+      }
+    });
+
+    await expect(client.importStl(gridPath, 'job_fin_cancel')).rejects.toThrow(/canceled/i);
+    unsub();
+
+    expect(cancelSent).toBe(true);
+    expect(fs.existsSync(path.join(tempDir, 'cache', 'job_job_fin_cancel'))).toBe(false);
+    const active = await client.getActiveModel();
+    expect(active?.modelId).toBe(baseModel.modelId);
+  });
+
+  it('bounds spatial sub-batches for extremely skewed inputs and retains all face IDs', async () => {
+    const skewedPath = path.join(tempDir, 'skewed.stl');
+    const triCount = 150000;
+    const buf = Buffer.alloc(84 + triCount * 50);
+    buf.write('Skewed Fixture', 0, 'ascii');
+    buf.writeUInt32LE(triCount, 80);
+
+    // Put 149,999 triangles inside a tiny corner [0, 0.001] and 1 triangle at [100, 100, 0]
+    for (let i = 0; i < triCount; i++) {
+      const off = 84 + i * 50;
+      const base = i === triCount - 1 ? 100.0 : 0.0;
+      const z = (i % 100) * 0.00001;
+      buf.writeFloatLE(0, off);
+      buf.writeFloatLE(0, off + 4);
+      buf.writeFloatLE(1, off + 8);
+      buf.writeFloatLE(base, off + 12);
+      buf.writeFloatLE(base, off + 16);
+      buf.writeFloatLE(z, off + 20);
+      buf.writeFloatLE(base + 0.001, off + 24);
+      buf.writeFloatLE(base, off + 28);
+      buf.writeFloatLE(z, off + 32);
+      buf.writeFloatLE(base, off + 36);
+      buf.writeFloatLE(base + 0.001, off + 40);
+      buf.writeFloatLE(z, off + 44);
+    }
+    fs.writeFileSync(skewedPath, buf);
+
+    const summary = await client.importStl(skewedPath, 'job_skewed');
+    expect(summary.triangleCount).toBe(triCount);
+    expect(summary.batches.length).toBeGreaterThanOrEqual(3);
+    for (const b of summary.batches) {
+      expect(b.triangleCount).toBeLessThanOrEqual(65536);
+    }
+
+    const pick = await client.pickFace(summary.modelId, [100.0002, 100.0002, 5], [0, 0, -1]);
+    expect(pick.hit).toBe(true);
+    expect(pick.originalFaceId).toBe(triCount - 1);
+  });
+
+  it('requires the x64 native worker binary during packaging and fails if missing', () => {
+    expect(() => assertWorkerBinaryPresent()).not.toThrow();
+    expect(() => assertWorkerBinaryPresent(path.join(tempDir, 'missing_worker.exe'))).toThrow(
+      /Missing required x64 native worker binary/i,
+    );
   });
 });

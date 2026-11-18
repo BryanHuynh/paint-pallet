@@ -2,6 +2,7 @@
 #include "stl_importer.hpp"
 
 #include <atomic>
+#include <cctype>
 #include <condition_variable>
 #include <iostream>
 #include <memory>
@@ -18,6 +19,14 @@ std::mutex g_outMutex;
 void emitLine(const std::string& line) {
   std::lock_guard<std::mutex> lock(g_outMutex);
   std::cout << line << '\n' << std::flush;
+}
+
+bool isValidJobId(const std::string& jobId) {
+  if (jobId.empty() || jobId.size() > 64) return false;
+  for (unsigned char c : jobId) {
+    if (!std::isalnum(c) && c != '_' && c != '-') return false;
+  }
+  return true;
 }
 
 std::string formatVec3(const float* v) {
@@ -56,11 +65,17 @@ std::string formatModelJson(const pp::ModelRecord& m) {
   return s;
 }
 
+struct QueuedJob {
+  std::string line;
+  std::shared_ptr<std::atomic<bool>> cancelFlag;
+};
+
 struct WorkerState {
   std::mutex jobsMutex;
-  std::unordered_map<std::string, std::shared_ptr<std::atomic<bool>>> activeCancelFlags;
+  std::unordered_map<std::string, std::shared_ptr<std::atomic<bool>>> pendingOrRunningJobs;
   std::unordered_map<std::string, pp::ModelRecord> models;
   std::string activeModelId;
+  pp::PickBatchCache pickCache{16};
 };
 
 }  // namespace
@@ -72,57 +87,67 @@ int main() {
   WorkerState state;
   std::mutex queueMutex;
   std::condition_variable queueCv;
-  std::queue<std::string> jobQueue;
+  std::queue<QueuedJob> jobQueue;
   bool shuttingDown = false;
 
   std::thread workerThread([&]() {
     while (true) {
-      std::string line;
+      QueuedJob job;
       {
         std::unique_lock<std::mutex> lock(queueMutex);
         queueCv.wait(lock, [&]() { return shuttingDown || !jobQueue.empty(); });
         if (shuttingDown && jobQueue.empty()) break;
-        line = std::move(jobQueue.front());
+        job = std::move(jobQueue.front());
         jobQueue.pop();
       }
 
+      const std::string& line = job.line;
       auto cmdOpt = pp::extractJsonString(line, "cmd");
       if (!cmdOpt) continue;
       const std::string& cmd = *cmdOpt;
       const std::string reqId = pp::extractJsonString(line, "reqId").value_or("");
 
       if (cmd == "import") {
-        const std::string jobId = pp::extractJsonString(line, "jobId").value_or("default");
+        const std::string jobId = pp::extractJsonString(line, "jobId").value_or("");
         const std::string filePath = pp::extractJsonString(line, "filePath").value_or("");
         const std::string cacheDir = pp::extractJsonString(line, "cacheDir").value_or(".");
 
-        std::shared_ptr<std::atomic<bool>> cancelFlag;
-        {
+        if (!isValidJobId(jobId)) {
           std::lock_guard<std::mutex> lock(state.jobsMutex);
-          auto it = state.activeCancelFlags.find(jobId);
-          if (it != state.activeCancelFlags.end()) {
-            cancelFlag = it->second;
-          } else {
-            cancelFlag = std::make_shared<std::atomic<bool>>(false);
-            state.activeCancelFlags[jobId] = cancelFlag;
-          }
+          state.pendingOrRunningJobs.erase(jobId);
+          emitLine("{\"type\":\"import_error\",\"reqId\":\"" + pp::jsonEscape(reqId) +
+                   "\",\"jobId\":\"" + pp::jsonEscape(jobId) +
+                   "\",\"error\":\"Invalid jobId\"}");
+          continue;
         }
 
-        auto outcome = pp::importBinaryStl(filePath, cacheDir, jobId, *cancelFlag, [&](const pp::ImportProgress& p) {
-          emitLine("{\"type\":\"progress\",\"jobId\":\"" + pp::jsonEscape(jobId) +
-                   "\",\"phase\":\"" + pp::jsonEscape(p.phase) +
-                   "\",\"bytesRead\":" + std::to_string(p.bytesRead) +
-                   ",\"totalBytes\":" + std::to_string(p.totalBytes) +
-                   ",\"trianglesRead\":" + std::to_string(p.trianglesRead) +
-                   ",\"totalTriangles\":" + std::to_string(p.totalTriangles) + "}");
-        });
+        auto cancelFlag = job.cancelFlag;
+        if (!cancelFlag) {
+          cancelFlag = std::make_shared<std::atomic<bool>>(false);
+        }
+
+        pp::ImportOutcome outcome;
+        if (cancelFlag->load(std::memory_order_relaxed)) {
+          outcome.ok = false;
+          outcome.canceled = true;
+        } else {
+          outcome = pp::importBinaryStl(filePath, cacheDir, jobId, *cancelFlag, [&](const pp::ImportProgress& p) {
+            emitLine("{\"type\":\"progress\",\"jobId\":\"" + pp::jsonEscape(jobId) +
+                     "\",\"phase\":\"" + pp::jsonEscape(p.phase) +
+                     "\",\"bytesRead\":" + std::to_string(p.bytesRead) +
+                     ",\"totalBytes\":" + std::to_string(p.totalBytes) +
+                     ",\"trianglesRead\":" + std::to_string(p.trianglesRead) +
+                     ",\"totalTriangles\":" + std::to_string(p.totalTriangles) + "}");
+          });
+        }
 
         {
           std::lock_guard<std::mutex> lock(state.jobsMutex);
-          state.activeCancelFlags.erase(jobId);
+          state.pendingOrRunningJobs.erase(jobId);
           if (outcome.ok) {
             state.models[outcome.model.modelId] = outcome.model;
             state.activeModelId = outcome.model.modelId;
+            state.pickCache.clear();
           }
         }
 
@@ -171,7 +196,7 @@ int main() {
             static_cast<float>((*dirOpt)[2]),
         };
 
-        auto res = pp::pickModelFace(modelCopy, orig, dir);
+        auto res = pp::pickModelFace(modelCopy, orig, dir, state.pickCache);
         if (!res.hit) {
           emitLine("{\"type\":\"pick_result\",\"reqId\":\"" + pp::jsonEscape(reqId) +
                    "\",\"hit\":false,\"partId\":null,\"originalFaceId\":null,\"distance\":null,\"point\":null,\"normal\":null}");
@@ -209,14 +234,9 @@ int main() {
       bool canceled = false;
       {
         std::lock_guard<std::mutex> lock(state.jobsMutex);
-        auto it = state.activeCancelFlags.find(jobId);
-        if (it != state.activeCancelFlags.end()) {
+        auto it = state.pendingOrRunningJobs.find(jobId);
+        if (it != state.pendingOrRunningJobs.end()) {
           it->second->store(true, std::memory_order_relaxed);
-          canceled = true;
-        } else {
-          // Pre-register canceled flag in case cancel races ahead of import start
-          auto flag = std::make_shared<std::atomic<bool>>(true);
-          state.activeCancelFlags[jobId] = flag;
           canceled = true;
         }
       }
@@ -224,9 +244,20 @@ int main() {
                "\",\"canceled\":" + (canceled ? "true" : "false") + "}");
       continue;
     }
+
+    std::shared_ptr<std::atomic<bool>> flag;
+    if (*cmdOpt == "import") {
+      const std::string jobId = pp::extractJsonString(line, "jobId").value_or("");
+      if (isValidJobId(jobId)) {
+        std::lock_guard<std::mutex> lock(state.jobsMutex);
+        flag = std::make_shared<std::atomic<bool>>(false);
+        state.pendingOrRunningJobs[jobId] = flag;
+      }
+    }
+
     {
       std::lock_guard<std::mutex> lock(queueMutex);
-      jobQueue.push(std::move(line));
+      jobQueue.push(QueuedJob{std::move(line), std::move(flag)});
     }
     queueCv.notify_one();
   }
@@ -238,7 +269,7 @@ int main() {
   queueCv.notify_all();
   workerThread.join();
 
-  // Clean up any leftover job directories on worker exit
+  state.pickCache.clear();
   {
     std::lock_guard<std::mutex> lock(state.jobsMutex);
     for (const auto& kv : state.models) {

@@ -5,12 +5,29 @@ import { VitePlugin } from '@electron-forge/plugin-vite';
 import path from 'node:path';
 import fs from 'node:fs';
 
-const workerBinaryPath = path.resolve(__dirname, 'native/build/paint_pallet_worker.exe');
+export const WORKER_BINARY_PATH = path.resolve(
+  __dirname,
+  'native/build/paint_pallet_worker.exe',
+);
+
+export function assertWorkerBinaryPresent(workerPath = WORKER_BINARY_PATH): string {
+  if (!fs.existsSync(workerPath)) {
+    throw new Error(
+      `Missing required x64 native worker binary at ${workerPath}. Run "npm run build:worker" before packaging.`,
+    );
+  }
+  return workerPath;
+}
 
 const config: ForgeConfig = {
   packagerConfig: {
     asar: true,
-    extraResource: fs.existsSync(workerBinaryPath) ? [workerBinaryPath] : [],
+    extraResource: [WORKER_BINARY_PATH],
+  },
+  hooks: {
+    prePackage: async () => {
+      assertWorkerBinaryPresent();
+    },
   },
   rebuildConfig: {},
   makers: [

@@ -6,8 +6,8 @@
   "main": ".vite/build/index.cjs",
   "scripts": {
     "start": "electron-forge start",
-    "package": "electron-forge package",
-    "make": "electron-forge make",
+    "package": "npm run build:worker && electron-forge package",
+    "make": "npm run build:worker && electron-forge make",
     "build:worker": "powershell -ExecutionPolicy Bypass -File scripts/build-worker.ps1",
     "build:renderer": "vite build --config vite.renderer.config.ts",
     "test": "vitest run",

@@ -7,9 +7,9 @@ import type {
 
 const api: PaintPalletApi = {
   selectStlFile: () => ipcRenderer.invoke('dialog:select-stl'),
-  importStl: (filePath: string, jobId: string) =>
-    ipcRenderer.invoke('worker:import-stl', filePath, jobId),
-  cancelImport: (jobId: string) => ipcRenderer.invoke('worker:cancel-import', jobId),
+  importStl: (filePath: string) =>
+    ipcRenderer.invoke('worker:import-stl', filePath),
+  cancelImport: () => ipcRenderer.invoke('worker:cancel-import'),
   getActiveModel: () => ipcRenderer.invoke('worker:get-active-model'),
   readBatch: (filePath: string) => ipcRenderer.invoke('worker:read-batch', filePath),
   pickFace: (modelId: string, origin: Vec3, direction: Vec3) =>

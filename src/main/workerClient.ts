@@ -1,4 +1,5 @@
 import { ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -22,6 +23,10 @@ interface PendingRequest<T> {
 }
 
 const BATCH_MAGIC = 0x31425050; // 'PPB1'
+const STL_HEADER_BYTES = 84;
+const STL_RECORD_BYTES = 50;
+const MAX_STL_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
+const SAFE_JOB_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 
 export function resolveDefaultWorkerPath(): string {
   const resourcesPath = (process as unknown as { resourcesPath?: string }).resourcesPath;
@@ -32,6 +37,45 @@ export function resolveDefaultWorkerPath(): string {
     }
   }
   return path.resolve(process.cwd(), 'native/build/paint_pallet_worker.exe');
+}
+
+export async function validateBinaryStlFile(filePath: string): Promise<void> {
+  let st: fs.Stats;
+  try {
+    st = await fs.promises.stat(filePath);
+  } catch {
+    throw new Error(`Could not open STL file: ${filePath}`);
+  }
+  if (!st.isFile()) {
+    throw new Error(`STL path is not a regular file: ${filePath}`);
+  }
+  if (st.size < STL_HEADER_BYTES) {
+    throw new Error('Malformed STL: file is smaller than 84-byte binary STL header');
+  }
+  if (st.size > MAX_STL_BYTES) {
+    throw new Error('STL file exceeds 2 GiB limit');
+  }
+
+  const fh = await fs.promises.open(filePath, 'r');
+  try {
+    const header = Buffer.alloc(STL_HEADER_BYTES);
+    const { bytesRead } = await fh.read(header, 0, STL_HEADER_BYTES, 0);
+    if (bytesRead < STL_HEADER_BYTES) {
+      throw new Error('Malformed STL: failed to read 84-byte header');
+    }
+    const triangleCount = header.readUInt32LE(80);
+    if (triangleCount === 0) {
+      throw new Error('Malformed STL: triangle count is 0');
+    }
+    const expectedSize = STL_HEADER_BYTES + triangleCount * STL_RECORD_BYTES;
+    if (st.size !== expectedSize) {
+      throw new Error(
+        `Truncated or malformed binary STL: expected ${expectedSize} bytes for ${triangleCount} triangles, got ${st.size} bytes`,
+      );
+    }
+  } finally {
+    await fh.close();
+  }
 }
 
 export async function readBatchBinary(filePath: string): Promise<BatchBinaryData> {
@@ -168,16 +212,24 @@ export class WorkerClient {
     };
   }
 
-  async importStl(filePath: string, jobId: string): Promise<ModelSummary> {
+  async importStl(filePath: string, jobId?: string): Promise<ModelSummary> {
+    const safeJobId = jobId ?? crypto.randomUUID().replace(/-/g, '');
+    if (!SAFE_JOB_ID_RE.test(safeJobId)) {
+      throw new Error(`Invalid jobId: ${safeJobId}`);
+    }
+    await validateBinaryStlFile(filePath);
     return this.sendRequest<ModelSummary>({
       cmd: 'import',
-      jobId,
+      jobId: safeJobId,
       filePath,
       cacheDir: this.cacheDir,
     });
   }
 
   async cancelImport(jobId: string): Promise<{ canceled: boolean }> {
+    if (!SAFE_JOB_ID_RE.test(jobId)) {
+      return { canceled: false };
+    }
     return this.sendRequest<{ canceled: boolean }>({
       cmd: 'cancel',
       jobId,

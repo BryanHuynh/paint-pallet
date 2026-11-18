@@ -57,7 +57,7 @@ describe('UI import-orbit-orientation actions', () => {
 
     await waitFor(() => {
       expect(api.selectStlFile).toHaveBeenCalledTimes(1);
-      expect(api.importStl).toHaveBeenCalledWith('C:/models/test_mini.stl', expect.any(String));
+      expect(api.importStl).toHaveBeenCalledWith('C:/models/test_mini.stl');
     });
 
     expect(await screen.findByText('test_mini.stl')).toBeInTheDocument();

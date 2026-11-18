@@ -26,7 +26,7 @@ export interface ModelSummary {
 export interface ImportProgressEvent {
   type: 'progress';
   jobId: string;
-  phase: 'reading' | 'batching' | 'indexing';
+  phase: 'reading' | 'batching' | 'finalizing' | 'indexing';
   bytesRead: number;
   totalBytes: number;
   trianglesRead: number;
@@ -58,8 +58,8 @@ export interface BatchBinaryData {
 
 export interface PaintPalletApi {
   selectStlFile: () => Promise<string | null>;
-  importStl: (filePath: string, jobId: string) => Promise<ModelSummary>;
-  cancelImport: (jobId: string) => Promise<{ canceled: boolean }>;
+  importStl: (filePath: string) => Promise<ModelSummary>;
+  cancelImport: () => Promise<{ canceled: boolean }>;
   getActiveModel: () => Promise<ModelSummary | null>;
   readBatch: (filePath: string) => Promise<BatchBinaryData>;
   pickFace: (modelId: string, origin: Vec3, direction: Vec3) => Promise<PickResult>;

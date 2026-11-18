@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import type {
   AxisDirection,
   ImportProgressEvent,
@@ -51,13 +51,12 @@ export default function App({
   });
   const [pickResult, setPickResult] = useState<PickResult | null>(null);
   const [progress, setProgress] = useState<ImportProgressEvent | null>(null);
-  const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const [isImporting, setIsImporting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [cameraPresetRequest, setCameraPresetRequest] = useState<{
     preset: CameraPreset;
     seq: number;
   } | null>(null);
-  const jobCounterRef = useRef(0);
 
   useEffect(() => {
     if (!api) return;
@@ -98,11 +97,10 @@ export default function App({
     const selectedPath = await api.selectStlFile();
     if (!selectedPath) return;
 
-    const jobId = `ui_${++jobCounterRef.current}`;
-    setActiveJobId(jobId);
+    setIsImporting(true);
     setProgress({
       type: 'progress',
-      jobId,
+      jobId: 'active',
       phase: 'reading',
       bytesRead: 0,
       totalBytes: 1,
@@ -111,7 +109,7 @@ export default function App({
     });
 
     try {
-      const summary = await api.importStl(selectedPath, jobId);
+      const summary = await api.importStl(selectedPath);
       setModel(summary);
       setPickResult(null);
     } catch (err) {
@@ -120,14 +118,14 @@ export default function App({
         setErrorMsg(msg);
       }
     } finally {
-      setActiveJobId(null);
+      setIsImporting(false);
       setProgress(null);
     }
   };
 
   const handleCancelImport = async () => {
-    if (!api || !activeJobId) return;
-    await api.cancelImport(activeJobId);
+    if (!api || !isImporting) return;
+    await api.cancelImport();
   };
 
   const handleSurfacePick = useCallback(
@@ -186,7 +184,7 @@ export default function App({
         </nav>
 
         <div className="header-actions">
-          {activeJobId ? (
+          {isImporting ? (
             <button
               type="button"
               className="btn btn--secondary"
@@ -199,7 +197,7 @@ export default function App({
             type="button"
             className="btn btn--primary"
             onClick={handleOpenStl}
-            disabled={Boolean(activeJobId)}
+            disabled={isImporting}
           >
             Open STL
           </button>
@@ -226,7 +224,7 @@ export default function App({
               disableWebGL={disableWebGL}
             />
 
-            {!model && !activeJobId ? (
+            {!model && !isImporting ? (
               <div className="viewport-empty">
                 <div className="viewport-empty__card">
                   <h2>Binary STL surface inspector</h2>

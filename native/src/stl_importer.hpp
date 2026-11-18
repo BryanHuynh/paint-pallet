@@ -4,12 +4,16 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <list>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace pp {
+
+constexpr uint32_t kMaxTrianglesPerBatch = 65536;
 
 struct Bounds3 {
   float min[3];
@@ -59,6 +63,26 @@ struct PickResult {
   std::array<float, 3> normal{0.0f, 0.0f, 0.0f};
 };
 
+struct CachedBatchData {
+  std::vector<float> positions;
+  std::vector<uint32_t> faceIds;
+  std::vector<Bounds3> chunkBounds;  // 1 AABB per 512 triangles
+};
+
+class PickBatchCache {
+ public:
+  explicit PickBatchCache(size_t maxEntries = 16) : maxEntries_(maxEntries) {}
+
+  std::shared_ptr<const CachedBatchData> getOrLoad(const std::string& filePath);
+  void clear();
+
+ private:
+  size_t maxEntries_;
+  std::mutex mutex_;
+  std::list<std::string> lruOrder_;
+  std::unordered_map<std::string, std::pair<std::shared_ptr<const CachedBatchData>, std::list<std::string>::iterator>> map_;
+};
+
 ImportOutcome importBinaryStl(
     const std::string& filePathUtf8,
     const std::string& cacheDirUtf8,
@@ -69,8 +93,9 @@ ImportOutcome importBinaryStl(
 PickResult pickModelFace(
     const ModelRecord& model,
     const std::array<float, 3>& origin,
-    const std::array<float, 3>& direction);
+    const std::array<float, 3>& direction,
+    PickBatchCache& cache);
 
-void cleanupJobDir(const std::string& jobDirUtf8);
+bool cleanupJobDir(const std::string& jobDirUtf8, std::string* outError = nullptr);
 
 }  // namespace pp
