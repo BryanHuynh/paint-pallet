@@ -21,6 +21,13 @@ class SurfaceTopology {
       double maxCreaseDegrees,
       const std::vector<uint32_t>& blockedFaces,
       const std::atomic<bool>& canceled) const;
+  std::string writeRidgeBand(
+      const ModelRecord& model,
+      const std::string& jobId,
+      double crease,
+      double widthPercent,
+      const std::string& regionPath,
+      const std::atomic<bool>& canceled) const;
   void clear();
 
  private:
@@ -29,8 +36,13 @@ class SurfaceTopology {
     uint32_t triangleIndex;
     uint32_t neighbors[3];
     std::array<float, 3> normal;
+    std::array<float, 3> center;
+    std::array<float, 3> edgeDistance;
+    std::array<uint8_t, 3> convexAngle;
   };
 
+  std::string writeHits(const ModelRecord& model, std::string name,
+      const std::vector<uint32_t>& hits, const std::atomic<bool>& canceled) const;
   std::string modelId_;
   std::vector<Face> faces_;
 };

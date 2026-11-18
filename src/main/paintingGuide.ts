@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { GUIDE_PASSES, GUIDE_VIEWS, type GuideExport } from '../shared/paintingGuide';
+import { GUIDE_PASSES, GUIDE_VIEWS, type GuideExport, type GuidePass } from '../shared/paintingGuide';
 
 function escapeText(value: string) {
   return value.replace(/[&<>"']/g, (character) => (
@@ -12,20 +12,22 @@ function escapeText(value: string) {
 }
 
 const validHex = /^#[a-f0-9]{6}$/i;
-const label = (pass: string) => pass[0].toUpperCase() + pass.slice(1);
+const label = (pass: GuidePass) => pass === 'edge' ? 'Edge highlight' : pass[0].toUpperCase() + pass.slice(1);
 
 export function renderGuideDocument(guide: GuideExport) {
+  const passes: GuidePass[] = [...GUIDE_PASSES];
+  if (guide.images?.edge) passes.push('edge');
   if ((guide.paper !== 'Letter' && guide.paper !== 'A4') ||
       typeof guide.modelName !== 'string' || typeof guide.snapshot !== 'string' ||
       !Array.isArray(guide.rows) || !Array.isArray(guide.callouts) ||
-      !GUIDE_PASSES.every((pass) => guide.images[pass]?.length === GUIDE_VIEWS.length &&
-        guide.images[pass].every((image) => /^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(image)))) {
+      !passes.every((pass) => guide.images?.[pass]?.length === GUIDE_VIEWS.length &&
+        guide.images[pass]!.every((image) => /^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(image)))) {
     throw new Error('The painting guide is missing printable views.');
   }
 
   const swatches = guide.rows.map((row, index) => {
-    const cells = GUIDE_PASSES.map((pass) => {
-      const swatch = row.swatches?.[pass];
+    const cells = passes.map((pass) => {
+      const swatch = pass === 'edge' ? row.edgeSwatch : row.swatches?.[pass];
       if (!swatch || !validHex.test(swatch.hex)) return '<td>Missing swatch</td>';
       const paint = [swatch.brand, swatch.bottleName].filter(Boolean).join(' ');
       return '<td><div class="hex"><span class="chip" style="background:' + swatch.hex + '"></span>' +
@@ -38,12 +40,12 @@ export function renderGuideDocument(guide: GuideExport) {
 
   const description = '<p class="subtitle">' + escapeText(guide.modelName) + ' · ' +
     escapeText(guide.snapshot) + '</p>';
-  const heads = GUIDE_PASSES.map((pass) => '<th scope="col">' + label(pass) + '</th>');
+  const heads = passes.map((pass) => '<th scope="col">' + label(pass) + '</th>');
   const reference = '<section><h1>Painting guide</h1>' + description +
     '<h2>Paint recipes by region</h2><table><thead><tr><th scope="col">Region</th>' + heads.join('') +
     '</tr></thead><tbody>' + swatches.join('') + '</tbody></table></section>';
 
-  const sheets = GUIDE_PASSES.map((pass) => {
+  const sheets = passes.map((pass) => {
     const views = GUIDE_VIEWS.map((view, index) => {
       const pins = guide.callouts.flatMap((callout) => {
         const row = guide.rows.findIndex((item) => item.id === callout.regionId);
@@ -53,7 +55,7 @@ export function renderGuideDocument(guide: GuideExport) {
           '%">' + (row + 1) + '</span>';
       });
       return '<figure><figcaption>' + view + '</figcaption><div class="view"><img src="' +
-        guide.images[pass][index] + '" alt="">' + pins.join('') + '</div></figure>';
+        guide.images[pass]![index] + '" alt="">' + pins.join('') + '</div></figure>';
     });
     return '<section class="pass"><h1>' + label(pass) + '</h1>' + description +
       '<p class="legend">Gray shows surfaces outside this pass. Callout numbers match the recipe table.</p>' +

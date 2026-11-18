@@ -163,6 +163,7 @@ export function useSurfaceLighting(
       }],
     });
     selectSnapshot(id);
+    return id;
   }
 
   function currentHistory() {

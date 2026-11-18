@@ -27,6 +27,7 @@ const api: PaintPalletApi = {
   pickFace: (modelId: string, origin: Vec3, direction: Vec3, batchIndices?: number[]) =>
     ipcRenderer.invoke('worker:pick-face', modelId, origin, direction, batchIndices),
   previewConnectedFill: (request: ConnectedFillRequest) => ipcRenderer.invoke('worker:connected-fill', request),
+  previewRidgeBand: (request) => ipcRenderer.invoke('worker:ridge-band', request),
   cancelConnectedFill: (jobId: string) => ipcRenderer.invoke('worker:cancel-fill', jobId),
   computeLightExposure: (request: ExposureRequest) => ipcRenderer.invoke('worker:light-exposure', request),
   cancelLightExposure: (jobId: string) => ipcRenderer.invoke('worker:cancel-light', jobId),

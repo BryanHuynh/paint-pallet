@@ -2,6 +2,7 @@ import type { SwatchEntry, ToneSlot } from '../renderer/palette/types';
 
 export const GUIDE_VIEWS = ['Front', 'Back', 'Left', 'Right'] as const;
 export const GUIDE_PASSES = ['shadow', 'midtone', 'highlight'] as const;
+export type GuidePass = ToneSlot | 'edge';
 export type GuideView = typeof GUIDE_VIEWS[number];
 export type GuidePaper = 'Letter' | 'A4';
 
@@ -16,6 +17,7 @@ export interface GuideRow {
   id: string;
   name: string;
   swatches: Record<ToneSlot, SwatchEntry> | null;
+  edgeSwatch?: SwatchEntry;
 }
 
 export interface GuideExport {
@@ -24,5 +26,5 @@ export interface GuideExport {
   snapshot: string;
   rows: GuideRow[];
   callouts: GuideCallout[];
-  images: Record<ToneSlot, string[]>;
+  images: Record<ToneSlot, string[]> & { edge?: string[] };
 }

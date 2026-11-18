@@ -1,8 +1,7 @@
 import * as THREE from 'three';
-import { GUIDE_PASSES, type GuideExport } from '../../shared/paintingGuide';
+import { GUIDE_PASSES, type GuideExport, type GuidePass } from '../../shared/paintingGuide';
 import type { ModelOrientation, ModelSummary, PaintPalletApi } from '../../shared/workerProtocol';
 import { computeOrientationQuaternion } from '../orientation';
-import type { ToneSlot } from '../palette/types';
 import type { ToneMask } from '../paint/lightingState';
 import type { ShadowCoverage } from '../paint/shadowPaint';
 
@@ -47,14 +46,16 @@ interface GuideRenderOptions {
   orientation: ModelOrientation;
   coverage: ShadowCoverage;
   tones: ToneMask;
+  edges?: ShadowCoverage;
   rows: GuideExport['rows'];
   preview: boolean;
   signal: AbortSignal;
 }
 
-export async function renderGuideViews({ readBatch, model, orientation, coverage, tones, rows, preview, signal }: GuideRenderOptions) {
+export async function renderGuideViews({ readBatch, model, orientation, coverage, tones, edges, rows, preview, signal }: GuideRenderOptions) {
   const side = preview ? 384 : 1000;
-  const passes = preview ? GUIDE_PASSES.slice(0, 1) : GUIDE_PASSES;
+  const passes: GuidePass[] = preview ? ['shadow'] : [...GUIDE_PASSES];
+  if (edges?.size && !preview) passes.push('edge');
   const images: GuideExport['images'] = { shadow: [], midtone: [], highlight: [] };
   const rotation = computeOrientationQuaternion(orientation.upright, orientation.front);
   const cameras = createCameras(model, rotation);
@@ -74,11 +75,14 @@ export async function renderGuideViews({ readBatch, model, orientation, coverage
   }));
   renderer.setClearColor(0xffffff, 1);
   renderer.autoClear = false;
-  const swatches = new Map(rows.filter((row) => row.swatches).map(({ id, swatches }) => [
-    id, new Map(GUIDE_PASSES.map((pass) => [pass, new THREE.Color(swatches![pass].hex)])),
-  ]));
+  const swatches = new Map(rows.map(({ id, swatches, edgeSwatch }) => {
+    const palette = new Map<GuidePass, THREE.Color>();
+    if (swatches) for (const pass of GUIDE_PASSES) palette.set(pass, new THREE.Color(swatches[pass].hex));
+    if (edgeSwatch) palette.set('edge', new THREE.Color(edgeSwatch.hex));
+    return [id, palette];
+  }));
   const neutral = new THREE.Color(0xd6dbd7);
-  const colors = new Map<ToneSlot, THREE.Color>();
+  const missingEdgeSwatch = new THREE.Color(0x48a887);
   try {
     for (const target of targets.flat()) {
       renderer.setRenderTarget(target);
@@ -95,22 +99,21 @@ export async function renderGuideViews({ readBatch, model, orientation, coverage
       const faceColors = passes.map(() => new Float32Array(data.positions.length));
       const faces = coverage.get(batch.batchIndex);
       const shades = tones.get(batch.batchIndex);
+      const band = edges?.get(batch.batchIndex);
       for (let i = 0; i < data.faceIds.length; i++) {
         const id = data.faceIds[i];
         const hit = faces?.get(id);
         const shade = shades?.get(id);
         const palette = hit && swatches.get(hit.regionId);
-        colors.clear();
-        for (const pass of passes) {
-          const covered = hit && (pass === 'shadow' || shade?.regionId === hit.regionId &&
-            (pass === 'midtone' || shade?.tone === 'highlight'));
-          colors.set(pass, covered && palette && palette.get(pass) || neutral);
-        }
         const offset = i * 9;
         // A restrained grayscale normal response gives uncovered shapes readable contours.
         const relief = 0.8 + 0.2 * Math.abs(data.normals[offset + 1] * 0.6 + data.normals[offset + 2] * 0.8);
-        passes.forEach((pass, index) => {
-          const color = colors.get(pass)!;
+        for (let index = 0; index < passes.length; index++) {
+          const pass = passes[index];
+          const covered = hit && (pass === 'edge' ? band?.get(id)?.regionId === hit.regionId
+            : pass === 'shadow' || shade?.regionId === hit.regionId &&
+              (pass === 'midtone' || shade?.tone === 'highlight'));
+          const color = covered ? palette?.get(pass) ?? (pass === 'edge' ? missingEdgeSwatch : neutral) : neutral;
           const strength = color === neutral ? relief : 1;
           const array = faceColors[index];
           for (let vertex = offset; vertex < offset + 9; vertex += 3) {
@@ -118,7 +121,7 @@ export async function renderGuideViews({ readBatch, model, orientation, coverage
             array[vertex + 1] = color.g * strength;
             array[vertex + 2] = color.b * strength;
           }
-        });
+        }
       }
       const colorAttribute = new THREE.BufferAttribute(new Float32Array(data.positions.length), 3).setUsage(THREE.DynamicDrawUsage);
       geometry.setAttribute('color', colorAttribute);

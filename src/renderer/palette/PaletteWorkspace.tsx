@@ -109,7 +109,7 @@ export default function PaletteWorkspace({
 
   const [activeRecipeId, setActiveRecipeId] = useState<string | null>('recipe-1');
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
-  const [activeTone, setActiveTone] = useState<ToneSlot>('shadow');
+  const [activeTone, setActiveTone] = useState<ToneSlot | 'edge'>('shadow');
   const [toolMode, setToolMode] = useState<'eyedropper' | 'select' | 'smart'>('eyedropper');
   const [smartSeeds, setSmartSeeds] = useState<{ image: ImageData; seeds: number[] } | null>(null);
   const [tolerance, setTolerance] = useState(20);
@@ -569,13 +569,22 @@ export default function PaletteWorkspace({
     return rgbToHex(data[0], data[1], data[2]);
   }
 
+  function updateEdgeSwatch(patch: Partial<SwatchEntry> | null) {
+    if (!patch && activeTone === 'edge') setActiveTone('shadow');
+    setRecipes((previous) => previous.map((recipe) => recipe.id === activeRecipe?.id ? {
+      ...recipe,
+      edgeSwatch: patch ? { ...(recipe.edgeSwatch ?? { hex: '#F4E8C3', brand: '', bottleName: '', mixNotes: '' }), ...patch } : undefined,
+    } : recipe));
+  }
+
   function samplePixelAt(x: number, y: number) {
     const canvas = canvasRef.current;
     if (!canvas || !activeRecipe) {
       return;
     }
     const hex = readPixelHex(canvas, x, y);
-    updateActiveSwatch(activeTone, { hex });
+    if (activeTone === 'edge') updateEdgeSwatch({ hex });
+    else updateActiveSwatch(activeTone, { hex });
   }
 
   function handleCanvasPointerDown(event: React.PointerEvent<HTMLCanvasElement>) {
@@ -1257,7 +1266,15 @@ export default function PaletteWorkspace({
                     onChangeSwatch={updateActiveSwatch}
                   />
                 ))}
+                {activeRecipe.edgeSwatch && (
+                  <ToneSwatchCard slot="edge" label="Edge highlight" swatch={activeRecipe.edgeSwatch} isSelected={activeTone === 'edge'}
+                    onSelectTone={setActiveTone} onChangeSwatch={(_slot, patch) => updateEdgeSwatch(patch)} />
+                )}
               </div>
+              <button type="button" className={`${styles.btn} ${styles.btnSecondary}`}
+                onClick={() => updateEdgeSwatch(activeRecipe.edgeSwatch ? null : {})}>
+                {activeRecipe.edgeSwatch ? 'Remove edge swatch' : 'Add edge swatch'}
+              </button>
             </>
           ) : (
             <div className={styles.emptyState}>

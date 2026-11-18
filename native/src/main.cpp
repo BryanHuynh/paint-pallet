@@ -269,6 +269,35 @@ int main() {
         }
         emitLine("{\"type\":\"discard_ack\",\"reqId\":\"" + pp::jsonEscape(reqId) +
                  "\",\"discarded\":" + (discarded ? "true" : "false") + "}");
+      } else if (cmd == "ridge_band") {
+        const std::string jobId = pp::extractJsonString(line, "jobId").value_or("");
+        const std::string modelId = pp::extractJsonString(line, "modelId").value_or("");
+        const std::string prefix = "\",\"reqId\":\"" + pp::jsonEscape(reqId) + "\"";
+        try {
+          const auto params = pp::extractJsonNumberArray(line, "ridgeParams");
+          const auto regionPath = pp::extractJsonString(line, "regionPath");
+          const auto model = state.models.find(modelId);
+          if (!job.cancelFlag || !params || params->size() != 2 || !regionPath ||
+              model == state.models.end() || modelId != state.activeModelId ||
+              !((*params)[0] >= 1 && (*params)[0] <= 180) || !((*params)[1] > 0 && (*params)[1] <= 100)) {
+            throw std::runtime_error("The ridge model or options are unavailable.");
+          }
+          const bool ready = state.topology.matches(model->second) ||
+            state.topology.build(model->second, *job.cancelFlag);
+          const auto filePath = ready ? state.topology.writeRidgeBand(model->second, jobId,
+              (*params)[0], (*params)[1], *regionPath, *job.cancelFlag) : "";
+          if (filePath.empty()) {
+            emitLine("{\"type\":\"fill_canceled" + prefix + "}");
+          } else {
+            emitLine("{\"type\":\"fill_complete" + prefix + ",\"filePath\":\"" + pp::jsonEscape(filePath) + "\"}");
+          }
+        } catch (const std::exception& error) {
+          emitLine("{\"type\":\"fill_error" + prefix + ",\"error\":\"" + pp::jsonEscape(error.what()) + "\"}");
+        }
+        {
+          std::lock_guard<std::mutex> lock(state.jobsMutex);
+          state.pendingOrRunningJobs.erase(jobId);
+        }
       } else if (cmd == "connected_fill") {
         const std::string jobId = pp::extractJsonString(line, "jobId").value_or("");
         const std::string modelId = pp::extractJsonString(line, "modelId").value_or("");
@@ -425,7 +454,7 @@ int main() {
     }
 
     std::shared_ptr<std::atomic<bool>> flag;
-    if (*cmdOpt == "import" || *cmdOpt == "connected_fill" || *cmdOpt == "light_exposure") {
+    if (*cmdOpt == "import" || *cmdOpt == "connected_fill" || *cmdOpt == "ridge_band" || *cmdOpt == "light_exposure") {
       const std::string jobId = pp::extractJsonString(line, "jobId").value_or("");
       if (isValidJobId(jobId)) {
         std::lock_guard<std::mutex> lock(state.jobsMutex);

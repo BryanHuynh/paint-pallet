@@ -11,6 +11,7 @@ export interface PaintRecipe {
   id: string;
   name: string;
   swatches: Record<ToneSlot, SwatchEntry>;
+  edgeSwatch?: SwatchEntry;
 }
 
 export interface ReferenceImage {

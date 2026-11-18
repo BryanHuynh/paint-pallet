@@ -1,25 +1,25 @@
 import React, { useEffect, useId, useState } from 'react';
 import { normalizeHex } from './colorMath';
 import styles from './PaletteWorkspace.module.css';
-import type { SwatchEntry, ToneSlot } from './types';
+import type { SwatchEntry } from './types';
 
-interface ToneSwatchCardProps {
-  slot: ToneSlot;
+interface ToneSwatchCardProps<Slot extends string> {
+  slot: Slot;
   label: string;
   swatch: SwatchEntry;
   isSelected: boolean;
-  onSelectTone: (slot: ToneSlot) => void;
-  onChangeSwatch: (slot: ToneSlot, patch: Partial<SwatchEntry>) => void;
+  onSelectTone: (slot: Slot) => void;
+  onChangeSwatch: (slot: Slot, patch: Partial<SwatchEntry>) => void;
 }
 
-export function ToneSwatchCard({
+export function ToneSwatchCard<Slot extends string>({
   slot,
   label,
   swatch,
   isSelected,
   onSelectTone,
   onChangeSwatch,
-}: ToneSwatchCardProps): React.ReactElement {
+}: ToneSwatchCardProps<Slot>): React.ReactElement {
   const baseId = useId();
   const [hexDraft, setHexDraft] = useState(swatch.hex);
   const [hexError, setHexError] = useState<string | null>(null);

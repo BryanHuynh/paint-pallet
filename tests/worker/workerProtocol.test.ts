@@ -194,6 +194,37 @@ describe('Worker import/batch/pick protocol', () => {
     expect(batches.size).toBe(model.batches.length);
   });
 
+  it('finds convex ridges across mesh batches and widens the band without crossing region boundaries', async () => {
+    const source = path.join(tempDir, 'ridge-and-seam.stl');
+    const triangles: Parameters<typeof writeBinaryStl>[1] = [
+      { v1: [0, 0, 0], v2: [1, 0, 0], v3: [1, 1, 0] },
+      { v1: [0, 0, 0], v2: [1, 1, 0], v3: [0, 1, 0] },
+      { v1: [1, 1, 0], v2: [1, 0, 0], v3: [1, 0, -1] },
+      { v1: [0, 2, 0], v2: [1, 2, 0], v3: [1, 3, 0] },
+      { v1: [1, 3, 0], v2: [1, 2, 0], v3: [1, 2, 1] },
+    ];
+    for (let i = 0; i < 2050; i++) {
+      const x = 1.5 + i % 50 * 0.012;
+      const y = Math.floor(i / 50) * 0.08;
+      triangles.push({ v1: [x, y, 0], v2: [x + 0.005, y, 0], v3: [x, y + 0.005, 0] });
+    }
+    writeBinaryStl(source, triangles);
+    const model = await client.importStl(source, 'ridge-model');
+    const suggest = (widthPercent: number, region: number[], crease = 60) => client.previewRidgeBand({
+      modelId: model.modelId, jobId: 'ridge-preview', crease, widthPercent, regionFaces: Uint32Array.from(region),
+    });
+    const faceIds = (hits: Uint32Array) => Array.from(hits).filter((_, i) => i % 3 === 0).sort((a, b) => a - b);
+    const region = [0, 1, 2, 3, 4];
+
+    const narrow = await suggest(0.05, region);
+    expect(faceIds(narrow)).toEqual([0, 2]);
+    expect(narrow[1]).not.toBe(narrow[4]);
+    expect(faceIds(await suggest(60, region))).toEqual([0, 1, 2]);
+    expect(faceIds(await suggest(60, [0, 1, 3, 4]))).toEqual([]);
+    expect(faceIds(await suggest(60, region, 100))).toEqual([]);
+    expect(fs.readdirSync(path.join(tempDir, 'cache')).some((name) => name.endsWith('-region.bin'))).toBe(false);
+  });
+
   it('traces full-resolution shadows across spatial partitions with Embree', async () => {
     const stlPath = path.join(tempDir, 'lighting-overhang.stl');
     const triangles: Parameters<typeof writeBinaryStl>[1] = [

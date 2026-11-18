@@ -16,6 +16,8 @@ import type { OpenedProject } from '../shared/paintProject';
 import type { PaletteProjectHandle, PreparedPaletteProject } from './palette/paletteProject';
 import type { PaintRecipe } from './palette/types';
 import { createEmptyRecipe } from './palette/recipes';
+import { EdgePanel } from './paint/EdgePanel';
+import { EDGE_PREVIEW, applyEdgesOver, clipEdgeCoverage, edgeColorKey, useEdgeHighlight } from './paint/useEdgeHighlight';
 import { ShadowPanel } from './paint/ShadowPanel';
 import { useShadowPainting } from './paint/useShadowPainting';
 import { LightingPanel } from './paint/LightingPanel';
@@ -66,8 +68,11 @@ export default function App({
   const [guideOpen, setGuideOpen] = useState(false);
   const [guideCallouts, setGuideCallouts] = useState<GuideCallout[]>([]);
   const guideRows = useMemo<GuideRow[]>(() => {
-    const palette = new Map(recipes.map((recipe) => [recipe.id, recipe.swatches]));
-    return shadow.regions.map((region) => ({ id: region.id, name: region.name, swatches: palette.get(region.recipeId) ?? null }));
+    const palette = new Map(recipes.map((recipe) => [recipe.id, recipe]));
+    return shadow.regions.map((region) => {
+      const recipe = palette.get(region.recipeId);
+      return { id: region.id, name: region.name.trim() || 'Untitled region', swatches: recipe?.swatches ?? null, edgeSwatch: recipe?.edgeSwatch };
+    });
   }, [recipes, shadow.regions]);
   const [projectAction, setProjectAction] = useState<'open' | 'save' | null>(null);
   const [activeTab, setActiveTab] = useState<'model' | 'palette'>('model');
@@ -79,16 +84,21 @@ export default function App({
     front: '+Z',
   });
   const lighting = useSurfaceLighting(api, model?.modelId, orientation, shadow.committedCoverage);
-  const coverage = useMemo(
-    () => renderToneMask(fill.previewCoverage ?? shadow.coverage, lighting.mask),
-    [fill.previewCoverage, shadow.coverage, lighting.mask],
-  );
+  const edge = useEdgeHighlight(api, model?.modelId, lighting.snapshot.id, shadow.region?.id, shadow.committedCoverage);
+  const guideEdges = useMemo(() => clipEdgeCoverage(edge.committed, shadow.committedCoverage), [edge.committed, shadow.committedCoverage]);
+  const coverage = useMemo(() => {
+    const tones = renderToneMask(fill.previewCoverage ?? shadow.coverage, lighting.mask);
+    const withEdges = applyEdgesOver(tones, edge.coverage, shadow.coverage);
+    return edge.preview ? applyEdgesOver(withEdges, edge.preview, shadow.committedCoverage, true) : withEdges;
+  }, [fill.previewCoverage, shadow.coverage, shadow.committedCoverage, lighting.mask, edge.coverage, edge.preview]);
   const shadowColors = useMemo(() => {
     const colors = new Map(shadow.colors);
     if (fill.previewCoverage) colors.set(FILL_PREVIEW_REGION, '#76d9ac');
+    colors.set(EDGE_PREVIEW, '#72dfae');
     const byId = new Map(recipes.map((recipe) => [recipe.id, recipe]));
     for (const region of shadow.regions) {
       const recipe = byId.get(region.recipeId);
+      colors.set(edgeColorKey(region.id), recipe?.edgeSwatch?.hex ?? '#48a887');
       if (!recipe) continue;
       colors.set(toneColorKey(region.id, 'midtone'), recipe.swatches.midtone.hex);
       colors.set(toneColorKey(region.id, 'highlight'), recipe.swatches.highlight.hex);
@@ -249,6 +259,7 @@ export default function App({
     try {
       const paint = shadow.exportProject();
       const snapshots = lighting.exportProject(paint.regions);
+      const edgeSnapshots = edge.exportProject(snapshots.snapshots.map((snapshot) => snapshot.id), paint.regions);
       const palette = await paletteProject.current.exportProject();
       await api.saveProject({
         modelId: model.modelId,
@@ -258,13 +269,14 @@ export default function App({
           ...palette.state,
           regions: paint.regions,
           activeRegionId: paint.activeRegionId,
-          snapshots: snapshots.snapshots,
+          snapshots: snapshots.snapshots.map((snapshot, index) => ({ ...snapshot, edgeManualRegions: edgeSnapshots[index].manual })),
           activeSnapshotId: snapshots.activeSnapshotId,
           guideCallouts,
         },
         referenceBytes: palette.referenceBytes,
         paint: paint.paint,
         tones: snapshots.tones,
+        edges: edgeSnapshots.map(({ packed }) => packed),
       });
     } catch (error) {
       setStatusMsg(error instanceof Error ? error.message : 'Unable to save the paint project.');
@@ -359,17 +371,19 @@ export default function App({
         const opened = takePendingProject(committed.modelId);
         fill.cancel();
         if (opened) {
-          const { state, paint, tones } = opened.project;
+          const { state, paint, tones, edges } = opened.project;
           setOrientation(state.orientation);
           setRecipes(state.recipes);
           setGuideCallouts(state.guideCallouts ?? []);
           shadow.restoreProject(state, paint);
           lighting.restoreProject(state, tones);
+          edge.restore(state.snapshots, edges, state.regions);
           opened.palette.apply();
         } else {
           setGuideCallouts([]);
           shadow.reset();
           lighting.reset();
+          edge.reset();
         }
         setModel(committed);
         setPendingModel(null);
@@ -571,14 +585,14 @@ export default function App({
             cameraPresetRequest={cameraPresetRequest}
             onSurfacePick={handleSurfacePick}
             shadowPaint={{
-              enabled: Boolean(model && !isBusy && (lighting.brushTool ||
+              enabled: Boolean(model && !isBusy && (edge.tool || lighting.brushTool ||
                 (shadow.tool && shadow.tool !== 'fill' && shadow.recipe))),
               coverage,
               colors: shadowColors,
               diameter: shadow.brushSize,
-              onFaces: lighting.brushTool ? lighting.paintFaces : shadow.paintFaces,
-              onStart: lighting.brushTool ? lighting.beginBrush : shadow.beginStroke,
-              onEnd: lighting.brushTool ? lighting.endBrush : shadow.endStroke,
+              onFaces: edge.tool ? edge.paintFaces : lighting.brushTool ? lighting.paintFaces : shadow.paintFaces,
+              onStart: edge.tool ? edge.beginBrush : lighting.brushTool ? lighting.beginBrush : shadow.beginStroke,
+              onEnd: edge.tool ? edge.endBrush : lighting.brushTool ? lighting.endBrush : shadow.endStroke,
             }}
             onPickNeedsDetail={handlePickNeedsDetail}
             onViewChange={handleViewChange}
@@ -670,8 +684,10 @@ export default function App({
               paint={shadow}
               fill={fill}
               recipes={recipes}
-              busy={isBusy || lighting.brushPending}
+              busy={isBusy || lighting.brushPending || edge.stroke}
               onToolChange={(tool) => {
+                edge.cancel();
+                edge.setTool(null);
                 lighting.setBrushTool(null);
                 shadow.setTool(tool);
               }}
@@ -684,15 +700,53 @@ export default function App({
           {model && lighting.available && (
             <LightingPanel
               lighting={lighting}
-              busy={isBusy || shadow.strokePending || lighting.brushPending}
+              busy={isBusy || shadow.strokePending || lighting.brushPending || edge.stroke}
+              onSelectSnapshot={(id) => {
+                edge.cancel();
+                edge.setTool(null);
+                lighting.selectSnapshot(id);
+              }}
+              onAddSnapshot={(duplicate) => {
+                edge.cancel();
+                edge.setTool(null);
+                const id = lighting.addSnapshot(duplicate);
+                if (id && duplicate) edge.duplicate(id);
+              }}
+              onPreview={() => {
+                edge.cancel();
+                edge.setTool(null);
+                lighting.start();
+              }}
               brushSize={shadow.brushSize}
               onBrushSize={shadow.setBrushSize}
               onChooseBrush={(tool) => {
                 if (tool) {
+                  edge.cancel();
+                  edge.setTool(null);
                   fill.cancel();
                   shadow.setTool(null);
                 }
                 lighting.setBrushTool(tool);
+              }}
+            />
+          )}
+
+          {model && edge.available && (
+            <EdgePanel edge={edge} busy={isBusy || shadow.strokePending || lighting.brushPending || edge.stroke}
+              brushSize={shadow.brushSize} setBrushSize={shadow.setBrushSize}
+              beginPreview={() => {
+                lighting.cancel();
+                lighting.setBrushTool(null);
+                fill.cancel();
+                shadow.setTool(null);
+                edge.start();
+              }}
+              chooseTool={(tool) => {
+                lighting.cancel();
+                lighting.setBrushTool(null);
+                fill.cancel();
+                shadow.setTool(null);
+                edge.setTool(tool);
               }}
             />
           )}
@@ -821,7 +875,7 @@ export default function App({
       {guideOpen && api && model && (
         <PaintingGuideDialog
           api={api} model={model} orientation={orientation} coverage={shadow.committedCoverage}
-          tones={lighting.committedMask} snapshot={lighting.snapshot.name.trim() || 'Untitled snapshot'}
+          edges={guideEdges} tones={lighting.committedMask} snapshot={lighting.snapshot.name.trim() || 'Untitled snapshot'}
           rows={guideRows} callouts={guideCallouts} setCallouts={setGuideCallouts}
           unapplied={lighting.unapplied} close={() => setGuideOpen(false)}
         />

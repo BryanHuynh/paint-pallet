@@ -7,7 +7,7 @@ import type { OpenedProject, ProjectContents, ProjectSaveRequest } from '../shar
 import { openProjectArchive, writeProjectArchive } from './projectArchive';
 import path from 'node:path';
 import { WorkerClient, readBatchBinary } from './workerClient';
-import type { ConnectedFillRequest, ExposureRequest, ModelSummary, Vec3 } from '../shared/workerProtocol';
+import type { ConnectedFillRequest, ExposureRequest, RidgeBandRequest, ModelSummary, Vec3 } from '../shared/workerProtocol';
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 declare const MAIN_WINDOW_VITE_NAME: string;
@@ -85,14 +85,16 @@ async function releaseOriginalSource(id: string) {
 async function validateProjectFaces(model: ModelSummary, contents: ProjectContents) {
   const batchMap = new Map(model.batches.map((batch) => [batch.batchIndex, batch]));
   const checked = new Map<number, { faceId: number; ordinal: number }[]>();
-  for (let i = 0; i < contents.paint.length; i += 4) {
-    const [faceId, batchIndex, ordinal, regionIndex] = contents.paint.subarray(i, i + 4);
-    const batch = batchMap.get(batchIndex);
-    if (!batch || faceId >= model.triangleCount || ordinal >= batch.triangleCount ||
-      regionIndex >= contents.state.regions.length) throw new Error('Project paint refers to an invalid original face.');
-    const list = checked.get(batchIndex) ?? [];
-    list.push({ faceId, ordinal });
-    checked.set(batchIndex, list);
+  for (const mask of [contents.paint, ...(contents.edges ?? [])]) {
+    for (let i = 0; i < mask.length; i += 4) {
+      const [faceId, batchIndex, ordinal, regionIndex] = mask.subarray(i, i + 4);
+      const batch = batchMap.get(batchIndex);
+      if (!batch || faceId >= model.triangleCount || ordinal >= batch.triangleCount ||
+        regionIndex >= contents.state.regions.length) throw new Error('Project paint refers to an invalid original face.');
+      const list = checked.get(batchIndex) ?? [];
+      list.push({ faceId, ordinal });
+      checked.set(batchIndex, list);
+    }
   }
   for (const [batchIndex, list] of checked) {
     const batch = batchMap.get(batchIndex)!;
@@ -279,6 +281,21 @@ app.whenReady().then(() => {
     activeFillJobs.add(request.jobId);
     try {
       return await getWorkerClient().previewConnectedFill(request);
+    } finally {
+      activeFillJobs.delete(request.jobId);
+    }
+  });
+
+  ipcMain.handle('worker:ridge-band', async (_event, request: RidgeBandRequest) => {
+    if (!request || request.modelId !== loadedModelId ||
+      typeof request.jobId !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(request.jobId) ||
+      !(request.crease >= 1 && request.crease <= 180) || !(request.widthPercent > 0 && request.widthPercent <= 100) ||
+      !(request.regionFaces instanceof Uint32Array) || activeFillJobs.has(request.jobId)) {
+      throw new Error('Invalid edge highlight request.');
+    }
+    activeFillJobs.add(request.jobId);
+    try {
+      return await getWorkerClient().previewRidgeBand(request);
     } finally {
       activeFillJobs.delete(request.jobId);
     }

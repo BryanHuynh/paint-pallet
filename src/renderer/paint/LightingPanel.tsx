@@ -23,13 +23,16 @@ function Slider({
 }
 
 export function LightingPanel({
-  lighting, busy, brushSize, onBrushSize, onChooseBrush,
+  lighting, busy, brushSize, onBrushSize, onChooseBrush, onSelectSnapshot, onAddSnapshot, onPreview,
 }: {
   lighting: ReturnType<typeof useSurfaceLighting>;
   busy: boolean;
   brushSize: number;
   onBrushSize: (size: number) => void;
   onChooseBrush: (tool: MaskBrushTool | null) => void;
+  onSelectSnapshot?: (id: string) => void;
+  onAddSnapshot?: (duplicate: boolean) => void;
+  onPreview?: () => void;
 }) {
   return (
     <section className="inspector-section" aria-label="Lighting">
@@ -37,7 +40,7 @@ export function LightingPanel({
       <div className="field-row">
         <label htmlFor="lighting-snapshot">Snapshot</label>
         <select id="lighting-snapshot" className="select-input" value={lighting.snapshot.id}
-          disabled={busy} onChange={(event) => lighting.selectSnapshot(event.target.value)}>
+          disabled={busy} onChange={(event) => (onSelectSnapshot ?? lighting.selectSnapshot)(event.target.value)}>
           {lighting.snapshots.map((snapshot) => (
             <option key={snapshot.id} value={snapshot.id}>{snapshot.name.trim() || 'Untitled snapshot'}</option>
           ))}
@@ -50,9 +53,9 @@ export function LightingPanel({
       </div>
       <div className="shadow-tools">
         <button type="button" className="btn btn--secondary btn--small"
-          disabled={busy} onClick={() => lighting.addSnapshot(false)}>New snapshot</button>
+          disabled={busy} onClick={() => (onAddSnapshot ?? lighting.addSnapshot)(false)}>New snapshot</button>
         <button type="button" className="btn btn--secondary btn--small"
-          disabled={busy} onClick={() => lighting.addSnapshot(true)}>Duplicate snapshot</button>
+          disabled={busy} onClick={() => (onAddSnapshot ?? lighting.addSnapshot)(true)}>Duplicate snapshot</button>
       </div>
       {lighting.hasShadow ? (
         <>
@@ -90,7 +93,7 @@ export function LightingPanel({
               </>
             ) : (
               <button type="button" className="btn btn--secondary btn--small"
-                disabled={busy} onClick={lighting.start}>Preview lighting</button>
+                disabled={busy} onClick={onPreview ?? lighting.start}>Preview lighting</button>
             )}
           </div>
           {lighting.applied && (

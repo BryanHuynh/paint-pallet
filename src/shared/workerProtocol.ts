@@ -70,6 +70,14 @@ export interface ConnectedFillRequest {
   blockedFaces: number[];
 }
 
+export interface RidgeBandRequest {
+  modelId: string;
+  jobId: string;
+  crease: number;
+  widthPercent: number;
+  regionFaces: Uint32Array;
+}
+
 export interface ExposureRequest {
   modelId: string;
   jobId: string;
@@ -93,6 +101,7 @@ export interface PaintPalletApi {
   ) => Promise<PickResult>;
   previewConnectedFill?: (request: ConnectedFillRequest) => Promise<Uint32Array>;
   cancelConnectedFill?: (jobId: string) => Promise<{ canceled: boolean }>;
+  previewRidgeBand?: (request: RidgeBandRequest) => Promise<Uint32Array>;
   computeLightExposure?: (request: ExposureRequest) => Promise<Float32Array>;
   cancelLightExposure?: (jobId: string) => Promise<{ canceled: boolean }>;
   saveProject?: (request: ProjectSaveRequest) => Promise<boolean>;

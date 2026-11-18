@@ -19,6 +19,7 @@ export interface ProjectSnapshot {
   applied: boolean;
   manual: boolean;
   appliedLightKey?: string;
+  edgeManualRegions?: string[];
 }
 
 export interface ProjectState {
@@ -45,6 +46,7 @@ export interface ProjectContents {
   referenceBytes: Uint8Array[];
   paint: Uint32Array;
   tones: Uint32Array[];
+  edges?: Uint32Array[];
 }
 
 export interface ProjectSaveRequest extends ProjectContents {

@@ -7,6 +7,7 @@ import readline from 'node:readline';
 import {
   BatchBinaryData,
   ConnectedFillRequest,
+  RidgeBandRequest,
   ExposureRequest,
   ImportProgressEvent,
   ModelSummary,
@@ -286,6 +287,31 @@ export class WorkerClient {
       blockedFaces: request.blockedFaces,
     });
     return new Uint32Array(await this.readAnalysisResult(filePath, `fill-${request.jobId}.bin`, 12));
+  }
+
+  async previewRidgeBand(request: RidgeBandRequest): Promise<Uint32Array> {
+    if (!SAFE_JOB_ID_RE.test(request.jobId)) throw new Error('Invalid ridge job ID');
+    await fs.promises.mkdir(this.cacheDir, { recursive: true });
+    const regionPath = path.join(this.cacheDir, `ridges-${request.jobId}-region.bin`);
+    const faces = request.regionFaces;
+    const region = await fs.promises.open(regionPath, 'wx');
+    try {
+      try {
+        await region.writeFile(Buffer.from(faces.buffer, faces.byteOffset, faces.byteLength));
+      } finally {
+        await region.close();
+      }
+      const filePath = await this.sendRequest<string>({
+        cmd: 'ridge_band',
+        modelId: request.modelId,
+        jobId: request.jobId,
+        ridgeParams: [request.crease, request.widthPercent],
+        regionPath,
+      });
+      return new Uint32Array(await this.readAnalysisResult(filePath, `ridges-${request.jobId}.bin`, 12));
+    } finally {
+      await fs.promises.unlink(regionPath).catch(() => {});
+    }
   }
 
   async computeLightExposure(request: ExposureRequest): Promise<Float32Array> {

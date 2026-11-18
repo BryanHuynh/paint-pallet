@@ -11,7 +11,7 @@ import type { ProjectContents, ProjectManifest, ProjectState } from '../shared/p
 
 const MANIFEST = 'manifest.json';
 const SHADOW = 'paint.bin';
-const PROJECT_ENTRY: RegExp = /^(manifest\.json|paint\.bin|model\.(stl|obj)|reference\/\d+|tone\/\d+)$/;
+const PROJECT_ENTRY: RegExp = /^(manifest\.json|paint\.bin|model\.(stl|obj)|reference\/\d+|tone\/\d+|edge\/\d+)$/;
 const MAX_MODEL_BYTES = 2 * 1024 * 1024 * 1024;
 const AXIS = /^[+-][XYZ]$/;
 
@@ -32,6 +32,11 @@ function validIdList<T extends { id: string }>(items: T[], active: unknown): boo
   return ids.size === items.length && (active === null || nonemptyId(active) && ids.has(active));
 }
 
+function validSwatch(entry: unknown) {
+  return isRecord(entry) && typeof entry.hex === 'string' && /^#[a-f0-9]{6}$/i.test(entry.hex) &&
+    [entry.brand, entry.bottleName, entry.mixNotes].every((field) => typeof field === 'string');
+}
+
 function validateState(value: unknown): asserts value is ProjectState {
   if (!isRecord(value) || !isRecord(value.orientation)) throw new Error('Invalid paint project settings.');
   const { upright, front } = value.orientation;
@@ -43,11 +48,9 @@ function validateState(value: unknown): asserts value is ProjectState {
   const { recipes, references, regions, snapshots } = value;
   if (!Array.isArray(recipes) || !recipes.every((recipe) => isRecord(recipe) && nonemptyId(recipe.id) &&
       typeof recipe.name === 'string' && isRecord(recipe.swatches) &&
-      ['shadow', 'midtone', 'highlight'].every((tone) => {
-        const entry = (recipe.swatches as Record<string, unknown>)[tone];
-        return isRecord(entry) && typeof entry.hex === 'string' && /^#[a-f0-9]{6}$/i.test(entry.hex) &&
-          [entry.brand, entry.bottleName, entry.mixNotes].every((field) => typeof field === 'string');
-      })) || !validIdList(recipes, value.activeRecipeId)) {
+      (recipe.edgeSwatch === undefined || validSwatch(recipe.edgeSwatch)) &&
+      ['shadow', 'midtone', 'highlight'].every((tone) =>
+        validSwatch((recipe.swatches as Record<string, unknown>)[tone]))) || !validIdList(recipes, value.activeRecipeId)) {
     throw new Error('Invalid paint project recipes.');
   }
   if (!Array.isArray(references) || !references.every((ref) => isRecord(ref) && nonemptyId(ref.id) &&
@@ -69,10 +72,15 @@ function validateState(value: unknown): asserts value is ProjectState {
       !nonemptyId(value.activeSnapshotId) || !validIdList(snapshots, value.activeSnapshotId)) {
     throw new Error('Invalid paint project lighting snapshots.');
   }
+  const regionIds = new Set(regions.map(({ id }) => id));
+  if (snapshots.some((snapshot) => snapshot.edgeManualRegions !== undefined &&
+      (!Array.isArray(snapshot.edgeManualRegions) || !snapshot.edgeManualRegions.every((id: unknown) => regionIds.has(id))))) {
+    throw new Error('Invalid manual edge regions.');
+  }
   if (value.guideCallouts !== undefined) {
-    const ids = new Set(regions.map(({ id }) => id));
+
     if (!Array.isArray(value.guideCallouts) || !value.guideCallouts.every((callout) =>
-      isRecord(callout) && ids.has(callout.regionId) && GUIDE_VIEWS.some((view) => view === callout.view) &&
+      isRecord(callout) && regionIds.has(callout.regionId) && GUIDE_VIEWS.some((view) => view === callout.view) &&
       inRange(callout.x, 0, 1) && inRange(callout.y, 0, 1))) {
       throw new Error('Invalid paint project guide callouts.');
     }
@@ -92,6 +100,11 @@ function parseManifest(raw: string): ProjectManifest {
 
 function validatePayload(contents: ProjectContents) {
   validateState(contents.state);
+  if (contents.state.snapshots.some((snapshot) => snapshot.edgeManualRegions !== undefined) !== Boolean(contents.edges) ||
+      (contents.edges && (!Array.isArray(contents.edges) || contents.edges.length !== contents.state.snapshots.length ||
+        !contents.edges.every((mask) => mask instanceof Uint32Array && mask.length % 4 === 0)))) {
+    throw new Error('Invalid edge highlight masks.');
+  }
   if (!Array.isArray(contents.referenceBytes) || contents.referenceBytes.length !== contents.state.references.length ||
       !contents.referenceBytes.every((reference) => ArrayBuffer.isView(reference) && reference.BYTES_PER_ELEMENT === 1) ||
       !(contents.paint instanceof Uint32Array) || contents.paint.length % 4 ||
@@ -131,6 +144,7 @@ export async function writeProjectArchive(
     contents.referenceBytes.forEach((bytes, index) => zip.addBuffer(asBuffer(bytes), `reference/${index}`, { compress: false }));
     zip.addBuffer(asBuffer(contents.paint), SHADOW);
     contents.tones.forEach((tones, index) => zip.addBuffer(asBuffer(tones), `tone/${index}`));
+    contents.edges?.forEach((mask, index) => zip.addBuffer(asBuffer(mask), `edge/${index}`));
     zip.end({ forceZip64Format: true, comment: '' });
 
     await pipeline(output, fs.createWriteStream(temp, { flags: 'wx' }));
@@ -222,10 +236,12 @@ export async function openProjectArchive(archive: string, cache: string) {
     const entries = await extractArchive(archive, root);
     const manifest = parseManifest(await fs.promises.readFile(path.join(root, MANIFEST), 'utf8'));
     const original = `model${manifest.sourceExtension}`;
+    const hasEdges = manifest.snapshots.some((snapshot) => snapshot.edgeManualRegions !== undefined);
     const expected = new Set([
       MANIFEST, SHADOW, original,
       ...manifest.references.map((_, index) => `reference/${index}`),
       ...manifest.snapshots.map((_, index) => `tone/${index}`),
+      ...(hasEdges ? manifest.snapshots.map((_, index) => `edge/${index}`) : []),
     ]);
 
     if (entries.size !== expected.size || [...expected].some((entry) => !entries.has(entry))) {
@@ -241,10 +257,16 @@ export async function openProjectArchive(archive: string, cache: string) {
     for (let i = 0; i < manifest.snapshots.length; i++) {
       tones.push(await readPackedFile(path.join(root, 'tone', String(i))));
     }
+    const edges = hasEdges ? [] as Uint32Array[] : undefined;
+    if (edges) {
+      for (let i = 0; i < manifest.snapshots.length; i++) {
+        edges.push(await readPackedFile(path.join(root, 'edge', String(i))));
+      }
+    }
     const paint = await readPackedFile(path.join(root, SHADOW));
     return {
       originalPath: path.join(root, original), sourceName: manifest.sourceName,
-      contents: { state: manifest, referenceBytes, paint, tones }, cleanup,
+      contents: { state: manifest, referenceBytes, paint, tones, edges }, cleanup,
     };
   } catch (error) {
     await cleanup();

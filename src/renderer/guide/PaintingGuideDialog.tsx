@@ -11,6 +11,7 @@ interface Props {
   orientation: ModelOrientation;
   coverage: ShadowCoverage;
   tones: ToneMask;
+  edges: ShadowCoverage;
   rows: GuideExport['rows'];
   snapshot: string;
   unapplied: boolean;
@@ -21,7 +22,7 @@ interface Props {
 
 const pinPosition = (value: number) => Math.min(0.96, Math.max(0.04, value));
 
-export default function PaintingGuideDialog({ api, model, orientation, coverage, tones, rows, snapshot, unapplied, callouts, setCallouts, close }: Props) {
+export default function PaintingGuideDialog({ api, model, orientation, coverage, tones, edges, rows, snapshot, unapplied, callouts, setCallouts, close }: Props) {
   const dialog = useRef<HTMLDialogElement>(null);
   const request = useRef<AbortController | null>(null);
   const [paper, setPaper] = useState<GuidePaper>('Letter');
@@ -32,7 +33,14 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
   const [message, setMessage] = useState<{ text: string; error: boolean } | null>(null);
   const numbers = useMemo(() => new Map(rows.map((row, index) => [row.id, index + 1])), [rows]);
   const missing = rows.filter((row) => !row.swatches || Object.values(row.swatches).some(({ hex }) => !/^#[a-f0-9]{6}$/i.test(hex)));
-  const warnings = unapplied || missing.length > 0;
+    const missingEdges = useMemo(() => {
+    const painted = new Set<string>();
+    for (const batch of edges.values()) {
+      for (const hit of batch.values()) painted.add(hit.regionId);
+    }
+    return rows.filter((row) => painted.has(row.id) && !row.edgeSwatch);
+  }, [edges, rows]);
+  const warnings = unapplied || missing.length > 0 || missingEdges.length > 0;
   const readBatch = api.readBatch;
 
   useEffect(() => {
@@ -64,7 +72,7 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
     setExporting(true);
     setMessage(null);
     try {
-      const images = await renderGuideViews({ readBatch, model, orientation, coverage, tones, rows, preview: false, signal: controller.signal });
+      const images = await renderGuideViews({ readBatch, model, orientation, coverage, tones, edges, rows, preview: false, signal: controller.signal });
       controller.signal.throwIfAborted();
       const saved = await api.exportPaintingGuide({ paper, modelName: model.fileName, snapshot, rows, callouts, images });
       if (!controller.signal.aborted && saved) setMessage({ text: 'Painting guide saved.', error: false });
@@ -137,6 +145,7 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
         <div className="guide-dialog__warnings">
           {unapplied && <p>Lighting changes are unapplied. The guide will use the committed masks.</p>}
           {missing.length > 0 && <p>Missing swatches for {missing.map((row) => row.name).join(', ')}.</p>}
+          {missingEdges.length > 0 && <p>Missing edge swatches for {missingEdges.map((row) => row.name).join(', ')}.</p>}
           <label><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)} disabled={exporting} /> Export with these warnings</label>
         </div>
       )}
