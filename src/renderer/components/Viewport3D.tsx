@@ -34,6 +34,7 @@ export interface Viewport3DProps {
   hideFocused?: boolean;
   ghostModelId?: string;
   jointMarker?: Vec3;
+  highlightPickFace?: boolean;
   orientation: ModelOrientation;
   cameraPresetRequest: { preset: CameraPreset; seq: number } | null;
   onSurfacePick: (
@@ -281,6 +282,7 @@ export function Viewport3D({
   hideFocused = false,
   ghostModelId,
   jointMarker,
+  highlightPickFace = false,
   orientation,
   cameraPresetRequest,
   onSurfacePick,
@@ -292,6 +294,8 @@ export function Viewport3D({
   disableWebGL = false,
 }: Viewport3DProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const previewPickRef = useRef(highlightPickFace);
+  previewPickRef.current = highlightPickFace;
   const onPickRef = useRef(onSurfacePick);
   onPickRef.current = onSurfacePick;
   const shadowPaintRef = useRef(shadowPaint);
@@ -595,15 +599,15 @@ export function Viewport3D({
       radius: 1,
     };
 
-    const pickAt = (e: PointerEvent) => {
+    const pickRay = (x: number, y: number) => {
       const currentModel = activeModelRef.current;
       if (!currentModel || !surfaceGroup.visible) return;
 
       const rect = renderer.domElement.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return;
       const ndc = new THREE.Vector2(
-        ((e.clientX - rect.left) / rect.width) * 2 - 1,
-        -((e.clientY - rect.top) / rect.height) * 2 + 1,
+        ((x - rect.left) / rect.width) * 2 - 1,
+        -((y - rect.top) / rect.height) * 2 + 1,
       );
       camera.updateMatrixWorld(true);
       const raycaster = new THREE.Raycaster();
@@ -616,7 +620,14 @@ export function Viewport3D({
 
       const orig: Vec3 = [localRay.origin.x, localRay.origin.y, localRay.origin.z];
       const dir: Vec3 = [localRay.direction.x, localRay.direction.y, localRay.direction.z];
-      const rayBatches = findRayIntersectingBatchIndices(currentModel.batches, orig, dir);
+      return { currentModel, orig, dir, rayBatches: findRayIntersectingBatchIndices(currentModel.batches, orig, dir) };
+    };
+
+    const pickAt = (e: PointerEvent) => {
+      const ray = pickRay(e.clientX, e.clientY);
+      if (!ray) return;
+      const { currentModel, orig, dir, rayBatches } = ray;
+
 
       const resolution = resolveClickAgainstVisibleDetail(
         detailGroup.visible,
@@ -663,7 +674,63 @@ export function Viewport3D({
     const canvas = renderer.domElement;
     const brush = new SurfaceBrush();
 
+    const faceOutlineGeometry = new THREE.BufferGeometry();
+    const faceOutlinePositions = new THREE.BufferAttribute(new Float32Array(9), 3);
+    faceOutlineGeometry.setAttribute('position', faceOutlinePositions);
+    const faceOutlineMaterial = new THREE.LineBasicMaterial({ color: '#fff0ad', depthWrite: false });
+    const faceOutline = new THREE.LineLoop(faceOutlineGeometry, faceOutlineMaterial);
+    faceOutline.frustumCulled = false;
+    faceOutline.renderOrder = 10;
+    faceOutline.visible = false;
+    surfaceGroup.add(faceOutline);
+    let hoverInFlight = false;
+    let nextHoverAt = 0;
+    let lastHoverKey = '';
     let hoverPoint: { x: number; y: number } | null = null;
+    const previewHoveredFace = () => {
+      if (!previewPickRef.current || !hoverPoint || !detailGroup.visible) {
+        faceOutline.visible = false;
+        lastHoverKey = '';
+        return;
+      }
+      const view = viewGenRef.current;
+      const modelGen = modelGenRef.current;
+      const point = hoverPoint;
+      const key = [view, modelGen, point.x, point.y].join(':');
+      const now = performance.now();
+      if (hoverInFlight || key === lastHoverKey || now < nextHoverAt) return;
+      const ray = pickRay(point.x, point.y);
+      const currentApi = apiRef.current;
+      if (!ray || !currentApi) return;
+      const resolution = resolveClickAgainstVisibleDetail(true, new Set(detailCacheRef.current.keys()), ray.rayBatches);
+      if (resolution.kind !== 'pick') {
+        faceOutline.visible = false;
+        return;
+      }
+      hoverInFlight = true;
+      faceOutline.visible = false;
+      lastHoverKey = key;
+      nextHoverAt = now + 75;
+      void currentApi.pickFace(ray.currentModel.modelId, ray.orig, ray.dir, resolution.visibleBatchIds).then((hit) => {
+        if (view !== viewGenRef.current || modelGen !== modelGenRef.current || !previewPickRef.current ||
+          hoverPoint !== point || sceneRefs.current?.renderer !== renderer) return;
+        const entry = hit.batchIndex === undefined ? undefined : detailCacheRef.current.get(hit.batchIndex);
+        if (!hit.hit || !entry || hit.triangleIndex === undefined || !hit.normal) {
+          faceOutline.visible = false;
+          return;
+        }
+        const vertices = entry.mesh.geometry.getAttribute('position');
+        for (let i = 0; i < 3; i++) {
+          const vertex = hit.triangleIndex * 3 + i;
+          const lift = Math.max(1e-7, (hit.distance ?? 1) * 1e-5);
+          faceOutlinePositions.setXYZ(i, vertices.getX(vertex) - ray.dir[0] * lift,
+            vertices.getY(vertex) - ray.dir[1] * lift, vertices.getZ(vertex) - ray.dir[2] * lift);
+        }
+        faceOutlinePositions.needsUpdate = true;
+        faceOutline.visible = true;
+      }).catch(() => { faceOutline.visible = false; }).finally(() => { hoverInFlight = false; });
+    };
+
     const clearBrushHover = () => {
       hoverPoint = null;
     };
@@ -715,7 +782,7 @@ export function Viewport3D({
       }));
       const preview = previewGroup.visible ? [...previewGroup.children] : [];
       for (const layer of companions.values()) {
-        if (layer.visible) preview.push(...layer.children);
+        if (layer.visible && !layer.userData.ghost) preview.push(...layer.children);
       }
       if (!brush.capture(renderer, camera, canvas.getBoundingClientRect(), preview, details)) {
         endStroke(false);
@@ -789,6 +856,7 @@ export function Viewport3D({
       if (canvas.dataset.surfaceDetail !== surfaceDetail) canvas.dataset.surfaceDetail = surfaceDetail;
       const paint = shadowPaintRef.current;
       brushPreview.update(renderer, paint?.enabled && detailGroup.visible ? hoverPoint : null, paint?.diameter ?? 1);
+      previewHoveredFace();
       renderer.render(scene, camera);
     };
     animate();
@@ -806,6 +874,8 @@ export function Viewport3D({
       canvas.removeEventListener('wheel', onStrokeWheel, true);
       if (strokePointer !== null) endStroke(false);
       brush.dispose();
+      faceOutlineGeometry.dispose();
+      faceOutlineMaterial.dispose();
       disposeGroupMeshes(previewGroup);
       disposeGroupMeshes(detailGroup);
       detailCacheRef.current.clear();
@@ -961,7 +1031,8 @@ export function Viewport3D({
         layer.visible = !part.hidden && (id !== model?.modelId || id === ghostModelId);
         layer.position.fromArray(part.pose.translation);
         layer.quaternion.fromArray(part.pose.rotation);
-        const material = part.staged || id === ghostModelId ? refs.stagedMaterial : refs.companionMaterial;
+        layer.userData.ghost = part.staged || id === ghostModelId;
+        const material = layer.userData.ghost ? refs.stagedMaterial : refs.companionMaterial;
         for (const child of layer.children) (child as THREE.Mesh).material = material;
         if (!layer.visible || layer.userData.complete) continue;
         const files = part.model.previewFilePath ? [part.model.previewFilePath] : part.model.batches.map((batch) => batch.filePath);

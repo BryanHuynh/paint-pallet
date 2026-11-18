@@ -1,4 +1,4 @@
-import { Vector3 } from 'three';
+import { Ray, Vector3 } from 'three';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AxisDirection,
@@ -11,7 +11,7 @@ import type {
   Vec3,
 } from '../shared/workerProtocol';
 import { ALL_AXES, getOrthogonalFrontOptions } from './orientation';
-import { Viewport3D, type CameraPreset, type PickGenerationToken } from './components/Viewport3D';
+import { findRayIntersectingBatchIndices, Viewport3D, type CameraPreset, type PickGenerationToken } from './components/Viewport3D';
 import PaintingGuideDialog from './guide/PaintingGuideDialog';
 import type { GuideCallout, GuideRow } from '../shared/paintingGuide';
 import type { OpenedProject } from '../shared/paintProject';
@@ -606,6 +606,26 @@ export default function App({
       const sequence = ++pickSeqRef.current;
       const result = await api.pickFace(displayModel.modelId, origin, direction, batchIndices);
       if (sequence !== pickSeqRef.current || !isCurrent()) return;
+      if (result.hit && result.distance !== null && selectedPart &&
+          (assembly.draft || shadow.tool === 'fill')) {
+        const ray = new Ray(new Vector3(...origin), new Vector3(...direction)).applyMatrix4(poseMatrix(selectedPart.pose));
+        const occluders = (companionParts ?? []).flatMap((part) => {
+          if (part.id === selectedPart.id || part.hidden || part.staged || part.id === ghostPart?.id) return [];
+          const local = ray.clone().applyMatrix4(poseMatrix(part.pose).invert());
+          const start = local.origin.toArray();
+          const forward = local.direction.toArray();
+          const batches = findRayIntersectingBatchIndices(part.model.batches, start, forward);
+          return batches.length ? [{ model: part.model, start, forward, batches }] : [];
+        });
+        const hits = await Promise.all(occluders.map(({ model, start, forward, batches }) =>
+          api.pickFace(model.modelId, start, forward, batches)));
+        if (sequence !== pickSeqRef.current || !isCurrent()) return;
+        const distance = result.distance;
+        if (hits.some((hit) => hit.hit && hit.distance !== null && hit.distance < distance - 1e-5)) {
+          setStatusMsg('The selected surface is behind another part. Hide that part or isolate the target.');
+          return;
+        }
+      }
       if (assembly.draft && selectedPart) {
         void assembly.capture(selectedPart, result);
         setPickResult(result);
@@ -750,6 +770,7 @@ export default function App({
             pendingModel={pendingModel}
             orientation={orientation}
             cameraPresetRequest={cameraPresetRequest}
+            highlightPickFace={assembly.draft?.method === 'six-face' && assembly.expectedId === focusId}
             onSurfacePick={handleSurfacePick}
             shadowPaint={{
               enabled: Boolean(model && canPaintPart && !assembly.draft && !isBusy && (edge.tool || lighting.brushTool ||
