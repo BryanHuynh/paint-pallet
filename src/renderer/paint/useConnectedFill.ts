@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { ANCHOR_ADDRESS, type PartAddress } from '../../shared/kit';
 import type { PaintPalletApi } from '../../shared/workerProtocol';
 import { paintShadowFaces, startShadowStroke, type ShadowCoverage, type SurfaceFace } from './shadowPaint';
 
@@ -10,9 +11,9 @@ interface FillSeed {
   faceId: number;
 }
 
-export function* unpackFillFaces(packed: Uint32Array): Iterable<SurfaceFace> {
+export function* unpackFillFaces(packed: Uint32Array, address: PartAddress = ANCHOR_ADDRESS): Iterable<SurfaceFace> {
   for (let i = 0; i < packed.length; i += 3) {
-    yield { faceId: packed[i], batchIndex: packed[i + 1], triangleIndex: packed[i + 2] };
+    yield { faceId: packed[i] + address.faceOffset, batchIndex: packed[i + 1] + address.batchOffset, triangleIndex: packed[i + 2] };
   }
 }
 
@@ -22,13 +23,14 @@ export function useConnectedFill(
   modelId: string | undefined,
   regionId: string | undefined,
   coverage: ShadowCoverage,
+  part?: PartAddress & { faceCount: number },
 ) {
   const [seed, setSeed] = useState<FillSeed | null>(null);
   const [creaseDegrees, setCreaseDegrees] = useState(35);
   const query = useMemo(() => {
     if (!enabled || !seed || seed.modelId !== modelId || seed.regionId !== regionId) return null;
-    return { seed, creaseDegrees, coverage };
-  }, [enabled, seed, modelId, regionId, creaseDegrees, coverage]);
+    return { seed, creaseDegrees, coverage, part };
+  }, [enabled, seed, modelId, regionId, creaseDegrees, coverage, part]);
   const [result, setResult] = useState<{
     query: NonNullable<typeof query>;
     packed?: Uint32Array;
@@ -48,7 +50,8 @@ export function useConnectedFill(
       const blockedFaces: number[] = [];
       for (const batch of query.coverage.values()) {
         for (const hit of batch.values()) {
-          if (hit.regionId !== query.seed.regionId) blockedFaces.push(hit.faceId);
+          const local = hit.faceId - (query.part?.faceOffset ?? 0);
+          if (hit.regionId !== query.seed.regionId && (!query.part || (local >= 0 && local < query.part.faceCount))) blockedFaces.push(local);
         }
       }
 
@@ -62,7 +65,7 @@ export function useConnectedFill(
         });
         if (!active) return;
         const draft = startShadowStroke(query.coverage, FILL_PREVIEW_REGION, 'brush');
-        paintShadowFaces(draft, unpackFillFaces(packed));
+        paintShadowFaces(draft, unpackFillFaces(packed, query.part));
         setResult({ query, packed, coverage: draft.coverage, added: draft.edit.added.length });
       } catch (error) {
         if (active) {

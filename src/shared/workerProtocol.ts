@@ -1,5 +1,6 @@
 import type { OpenedProject, ProjectSaveRequest } from './paintProject';
 
+import type { PartPose } from './kit';
 import type { GuideExport } from './paintingGuide';
 
 export type Vec3 = [number, number, number];
@@ -85,10 +86,17 @@ export interface RidgeBandRequest {
   regionFaces: Uint32Array;
 }
 
+export interface ExposurePart {
+  modelId: string;
+  faceOffset: number;
+  pose: PartPose;
+}
+
 export interface ExposureRequest {
   modelId: string;
   jobId: string;
   direction: Vec3;
+  parts?: ExposurePart[];
 }
 
 export interface PaintPalletApi {

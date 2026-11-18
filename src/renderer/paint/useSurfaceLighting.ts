@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Vector3 } from 'three';
 import type { ProjectState } from '../../shared/paintProject';
-import type { ModelOrientation, PaintPalletApi, Vec3 } from '../../shared/workerProtocol';
+import type { ExposurePart, ModelOrientation, PaintPalletApi, Vec3 } from '../../shared/workerProtocol';
 import { computeOrientationQuaternion } from '../orientation';
 import { generateToneMask, paintToneFaces, type MaskBrushTool, type ToneMask } from './lightingState';
 import type { ShadowCoverage, ShadowRegion, SurfaceFace } from './shadowPaint';
@@ -52,8 +52,8 @@ const initialSnapshots = (): SnapshotState => ({
   items: [{ id: 'snapshot-1', name: 'Snapshot 1', settings: initialSettings(), history: emptyHistory() }],
 });
 
-function appliedLightKey(settings: LightSettings, orientation: ModelOrientation) {
-  return JSON.stringify([settings.azimuth, settings.elevation, settings.midtone, settings.highlight, orientation.upright, orientation.front]);
+function appliedLightKey(settings: LightSettings, orientation: ModelOrientation, layoutKey?: string) {
+  return JSON.stringify([settings.azimuth, settings.elevation, settings.midtone, settings.highlight, orientation.upright, orientation.front, ...(layoutKey ? [layoutKey] : [])]);
 }
 
 function localLightDirection(azimuth: number, elevation: number, orientation: ModelOrientation): Vec3 {
@@ -69,6 +69,8 @@ export function useSurfaceLighting(
   modelId: string | undefined,
   orientation: ModelOrientation,
   shadow: ShadowCoverage,
+  parts?: ExposurePart[],
+  layoutKey?: string,
 ) {
   const [snapshots, setSnapshots] = useState(initialSnapshots);
   const snapshotsRef = useRef(snapshots);
@@ -86,8 +88,10 @@ export function useSurfaceLighting(
   const direction = useMemo(() => localLightDirection(azimuth, elevation, orientation), [
     azimuth, elevation, orientation,
   ]);
-  const key = JSON.stringify([modelId, direction]);
-  const lightKey = appliedLightKey(snapshot.settings, orientation);
+  const partsRef = useRef(parts);
+  partsRef.current = parts;
+  const key = JSON.stringify([modelId, direction, layoutKey]);
+  const lightKey = appliedLightKey(snapshot.settings, orientation, layoutKey);
   const ready = result?.key === key ? result : null;
   const hasShadow = shadow.size !== 0;
 
@@ -100,7 +104,7 @@ export function useSurfaceLighting(
     const timer = window.setTimeout(async () => {
       started = true;
       try {
-        const scores = await compute({ modelId, jobId, direction });
+        const scores = await compute({ modelId, jobId, direction, parts: partsRef.current });
         if (active) setResult({ key, scores });
       } catch (error) {
         if (active) setResult({ key, error: error instanceof Error ? error.message : 'Lighting preview failed.' });

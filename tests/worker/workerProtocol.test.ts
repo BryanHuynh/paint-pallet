@@ -141,6 +141,25 @@ describe('Worker import/batch/pick protocol', () => {
     expect(fs.readdirSync(path.join(tempDir, 'cache')).some((name) => name.startsWith('source-'))).toBe(false);
   });
 
+  it('casts shadows between independent kit meshes and invalidates cached light after changing a joint pose', async () => {
+    const surfacePath = path.join(tempDir, 'surface.stl');
+    const blockerPath = path.join(tempDir, 'blocker.stl');
+    writeBinaryStl(surfacePath, [{ v1: [0, 0, 0], v2: [2, 0, 0], v3: [0, 2, 0] }]);
+    writeBinaryStl(blockerPath, [{ v1: [-1, -1, 0], v2: [5, -1, 0], v3: [-1, 5, 0] }]);
+    const surface = await client.importStl(surfacePath, 'assembly-anchor');
+    const blocker = await client.importStl(blockerPath, 'assembly-blocker', { staged: true });
+    const compute = (offset: number, jobId: string) => client.computeLightExposure({
+      modelId: surface.modelId, direction: [0, 0, 1], jobId,
+      parts: [
+        { modelId: surface.modelId, faceOffset: 0, pose: { translation: [0, 0, 0], rotation: [0, 0, 0, 1] } },
+        { modelId: blocker.modelId, faceOffset: 3, pose: { translation: [offset, 0, 2], rotation: [0, 0, 0, 1] } },
+      ],
+    });
+    expect([...(await compute(0, 'assembly-covered'))]).toEqual([0, 0, 0, 1]);
+    expect([...(await compute(10, 'assembly-uncovered'))]).toEqual([1, 0, 0, 1]);
+    expect([...(await compute(0, 'assembly-restored'))]).toEqual([0, 0, 0, 1]);
+  });
+
   it('grows a fill only across shared edges allowed by crease and ownership', async () => {
     const stlPath = path.join(tempDir, 'fill-hinge.stl');
     writeBinaryStl(stlPath, [

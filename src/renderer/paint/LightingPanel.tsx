@@ -68,6 +68,9 @@ export function LightingPanel({
           <Slider id="light-highlight" label="Highlight cutoff" min={0} max={100} value={lighting.highlight}
             unit="%" onChange={lighting.setHighlight} />
           {lighting.error && <p className="hint-text" role="alert">{lighting.error}</p>}
+          {lighting.applied && lighting.unapplied && !lighting.previewing && (
+            <p className="hint-text" role="status">Lighting has changed. Review the current masks or regenerate them.</p>
+          )}
           {lighting.loading && <p className="hint-text" role="status">Tracing light on original faces…</p>}
           {lighting.draft && (
             <p className="hint-text" role="status">

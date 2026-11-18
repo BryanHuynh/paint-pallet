@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { savePaintingGuide } from './paintingGuide';
 import type { GuideExport } from '../shared/paintingGuide';
+import { ANCHOR_ADDRESS, restoreKitAddresses } from '../shared/kit';
 import type { OpenedProject, ProjectContents, ProjectSaveRequest } from '../shared/paintProject';
 import { openProjectArchive, writeProjectArchive } from './projectArchive';
 import path from 'node:path';
@@ -86,14 +87,29 @@ async function releaseOriginalSource(id: string) {
   await source?.cleanup?.().catch(() => {});
 }
 
-async function validateProjectFaces(model: ModelSummary, contents: ProjectContents) {
-  const batchMap = new Map(model.batches.map((batch) => [batch.batchIndex, batch]));
+async function validateProjectFaces(model: ModelSummary, contents: ProjectContents, kitModels: ModelSummary[]) {
+  const geometry = contents.state.kit ? restoreKitAddresses([model, ...kitModels], contents.state.kit)
+    : [{ model, ...ANCHOR_ADDRESS, staged: false }];
+  const batchMap = new Map<number, ModelSummary['batches'][number] & { faceOffset: number; faceEnd: number }>();
+  const ends = geometry.map((part) => [part.faceOffset, part.faceOffset + part.model.triangleCount]).sort(([a], [b]) => a - b);
+  if (ends.some(([start, end], index) => end > 0xffffffff || (index > 0 && ends[index - 1][1] > start))) {
+    throw new Error('Paint project part face addresses overlap.');
+  }
+  const lookedUp = new Set<number>();
+  for (const part of geometry) {
+    for (const batch of part.model.batches) {
+      const index = batch.batchIndex + part.batchOffset;
+      if (index > 0xffffffff || lookedUp.has(index)) throw new Error('Paint project part batch addresses overlap.');
+      lookedUp.add(index);
+      if (!part.staged) batchMap.set(index, { ...batch, faceOffset: part.faceOffset, faceEnd: part.faceOffset + part.model.triangleCount });
+    }
+  }
   const checked = new Map<number, { faceId: number; ordinal: number }[]>();
   for (const mask of [contents.paint, ...(contents.edges ?? [])]) {
     for (let i = 0; i < mask.length; i += 4) {
       const [faceId, batchIndex, ordinal, regionIndex] = mask.subarray(i, i + 4);
       const batch = batchMap.get(batchIndex);
-      if (!batch || faceId >= model.triangleCount || ordinal >= batch.triangleCount ||
+      if (!batch || faceId < batch.faceOffset || faceId >= batch.faceEnd || ordinal >= batch.triangleCount ||
         regionIndex >= contents.state.regions.length) throw new Error('Project paint refers to an invalid original face.');
       const list = checked.get(batchIndex) ?? [];
       list.push({ faceId, ordinal });
@@ -107,7 +123,7 @@ async function validateProjectFaces(model: ModelSummary, contents: ProjectConten
       const offset = 16 + batch.triangleCount * 72;
       const ids = Buffer.alloc(batch.triangleCount * 4);
       const { bytesRead } = await file.read(ids, 0, ids.length, offset);
-      if (bytesRead !== ids.length || list.some(({ faceId, ordinal }) => ids.readUInt32LE(ordinal * 4) !== faceId)) {
+      if (bytesRead !== ids.length || list.some(({ faceId, ordinal }) => ids.readUInt32LE(ordinal * 4) + batch.faceOffset !== faceId)) {
         throw new Error('Project paint does not match the rebuilt model.');
       }
     } finally {
@@ -116,7 +132,8 @@ async function validateProjectFaces(model: ModelSummary, contents: ProjectConten
   }
   for (const tone of contents.tones) {
     for (let i = 0; i < tone.length; i += 4) {
-      if (tone[i] >= model.triangleCount || !batchMap.has(tone[i + 1]) ||
+      const batch = batchMap.get(tone[i + 1]);
+      if (!batch || tone[i] < batch.faceOffset || tone[i] >= batch.faceEnd ||
           tone[i + 2] >= contents.state.regions.length || (tone[i + 3] !== 1 && tone[i + 3] !== 2)) {
         throw new Error('Project lighting refers to an invalid original face.');
       }
@@ -376,7 +393,7 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle('worker:ridge-band', async (_event, request: RidgeBandRequest) => {
-    if (!request || request.modelId !== loadedModelId ||
+    if (!request || (request.modelId !== loadedModelId && !kitModels.has(request.modelId)) ||
       typeof request.jobId !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(request.jobId) ||
       !(request.crease >= 1 && request.crease <= 180) || !(request.widthPercent > 0 && request.widthPercent <= 100) ||
       !(request.regionFaces instanceof Uint32Array) || activeFillJobs.has(request.jobId)) {
@@ -396,12 +413,22 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle('worker:light-exposure', async (_event, request: ExposureRequest) => {
-    if (!request || typeof request.modelId !== 'string' ||
-      (request.modelId !== loadedModelId && !kitModels.has(request.modelId)) ||
+    if (!request || request.modelId !== loadedModelId ||
       typeof request.jobId !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(request.jobId) ||
       !Array.isArray(request.direction) || request.direction.length !== 3 ||
       !request.direction.every(Number.isFinite) || activeLightingJobs.has(request.jobId)) {
       throw new Error('Invalid lighting request.');
+    }
+    const parts = request.parts;
+    if (parts !== undefined && (!Array.isArray(parts) || !parts.length || parts[0]?.modelId !== loadedModelId ||
+      new Set(parts.map((part) => part?.modelId)).size !== parts.length ||
+      !parts.every((part, index) => part && (index === 0 || kitModels.has(part.modelId)) &&
+        Number.isSafeInteger(part.faceOffset) && part.faceOffset >= 0 && part.pose &&
+        Array.isArray(part.pose.translation) && part.pose.translation.length === 3 &&
+        part.pose.translation.every((axis: number) => Number.isFinite(Math.fround(axis))) &&
+        Array.isArray(part.pose.rotation) && part.pose.rotation.length === 4 &&
+        part.pose.rotation.every(Number.isFinite) && Math.abs(1 - Math.hypot(...part.pose.rotation)) < 1e-5))) {
+      throw new Error('Invalid assembled lighting parts.');
     }
     activeLightingJobs.add(request.jobId);
     try {
@@ -455,10 +482,11 @@ app.whenReady().then(() => {
     const kitParts: ModelSummary[] = [];
     try {
       model = await importStl(archive.originalPath, { name: archive.sourceName, cleanup: archive.cleanup });
-      await validateProjectFaces(model, archive.contents);
+
       for (const part of archive.kitParts) {
         kitParts.push(await importStl(part.originalPath, { name: part.sourceName }));
       }
+      await validateProjectFaces(model, archive.contents, kitParts);
       if (kitParts.length) stagedKitsByAnchor.set(model.modelId, kitParts);
       return { model, kitModels: kitParts, ...archive.contents };
     } catch (error) {

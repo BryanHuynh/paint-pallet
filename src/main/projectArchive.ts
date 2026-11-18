@@ -46,6 +46,8 @@ function validateKit(value: unknown): asserts value is KitState {
   if (!isRecord(value) || !Array.isArray(value.parts) || !value.parts.length || !Array.isArray(value.joints) ||
     !value.parts.every((part) => isRecord(part) && nonemptyId(part.id) && typeof part.name === 'string' &&
       nonemptyId(part.sourceName) && typeof part.staged === 'boolean' && typeof part.hidden === 'boolean' &&
+      [part.faceOffset, part.batchOffset].every((offset) => offset === undefined ||
+        (typeof offset === 'number' && Number.isSafeInteger(offset) && offset >= 0 && offset <= 0xffffffff)) &&
       isRecord(part.pose) && finiteTuple(part.pose.translation, 3) && finiteTuple(part.pose.rotation, 4) &&
       Math.abs(1 - Math.hypot(...part.pose.rotation)) < 1e-5)) {
     throw new Error('Invalid kit part metadata.');
@@ -53,6 +55,7 @@ function validateKit(value: unknown): asserts value is KitState {
   const parts = new Map(value.parts.map((part) => [part.id, part]));
   const anchor = value.parts[0];
   if (parts.size !== value.parts.length || anchor.staged ||
+    (anchor.faceOffset ?? 0) !== 0 || (anchor.batchOffset ?? 0) !== 0 ||
     anchor.pose.translation.some((axis: number) => axis !== 0) ||
     anchor.pose.rotation.some((axis: number, index: number) => axis !== (index === 3 ? 1 : 0))) {
     throw new Error('Invalid kit anchor or part IDs.');
@@ -117,8 +120,15 @@ function validateState(value: unknown): asserts value is ProjectState {
     throw new Error('Invalid paint project lighting snapshots.');
   }
   const regionIds = new Set(regions.map(({ id }) => id));
+  const kitPartIds = new Set((value.kit as KitState | undefined)?.parts.map((part) => part.id));
+  function validManualRegion(value: unknown) {
+    if (typeof value !== 'string') return false;
+    if (regionIds.has(value)) return true;
+    const [partId, regionId, extra] = value.split('/');
+    return extra === undefined && kitPartIds.has(partId) && regionIds.has(regionId);
+  }
   if (snapshots.some((snapshot) => snapshot.edgeManualRegions !== undefined &&
-      (!Array.isArray(snapshot.edgeManualRegions) || !snapshot.edgeManualRegions.every((id: unknown) => regionIds.has(id))))) {
+      (!Array.isArray(snapshot.edgeManualRegions) || !snapshot.edgeManualRegions.every(validManualRegion)))) {
     throw new Error('Invalid manual edge regions.');
   }
   if (value.guideCallouts !== undefined) {

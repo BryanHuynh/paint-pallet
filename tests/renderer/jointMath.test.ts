@@ -39,7 +39,7 @@ describe('kit joints', () => {
 
   it('keeps the anchor fixed, moves all descendants and rejects attachment cycles', () => {
     const part = (id: string, x: number): KitPart => ({
-      id, name: id, model: {} as ModelSummary, pose: { ...IDENTITY_PART_POSE, translation: [x, 0, 0] }, hidden: false, staged: false,
+      id, name: id, faceOffset: 0, batchOffset: 0, model: {} as ModelSummary, pose: { ...IDENTITY_PART_POSE, translation: [x, 0, 0] }, hidden: false, staged: false,
     });
     const parts = [part('anchor', 0), part('body', 1), part('coat', 2), part('trim', 4)];
     const joint = (parentId: string, childId: string): KitJoint => ({ parentId, childId, point: [0, 0, 0], method: 'authored' });

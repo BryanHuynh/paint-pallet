@@ -1,6 +1,6 @@
 import type { KitPart } from '../../shared/kit';
 
-export function KitPanel({ parts, selected, busy, choose, add, rename, remove }: {
+export function KitPanel({ parts, selected, busy, choose, add, rename, remove, isolated, toggleIsolation, toggleVisibility }: {
   parts: KitPart[];
   selected: KitPart | undefined;
   busy: boolean;
@@ -8,6 +8,9 @@ export function KitPanel({ parts, selected, busy, choose, add, rename, remove }:
   add: () => void;
   rename: (name: string) => void;
   remove: (part: KitPart) => void;
+  isolated: boolean;
+  toggleIsolation: () => void;
+  toggleVisibility: () => void;
 }) {
   const bytes = parts.reduce((total, part) => total + part.model.fileSizeBytes, 0);
   return (
@@ -34,6 +37,16 @@ export function KitPanel({ parts, selected, busy, choose, add, rename, remove }:
       )}
       <div className="shadow-tools">
         <button type="button" className="btn btn--secondary btn--small" disabled={busy} onClick={add}>Add kit parts</button>
+        {selected && parts.length > 1 && (
+          <>
+            <button type="button" className="btn btn--secondary btn--small" disabled={busy} onClick={toggleIsolation}>
+              {isolated ? 'Show assembly' : 'Isolate part'}
+            </button>
+            <button type="button" className="btn btn--secondary btn--small" disabled={busy} onClick={toggleVisibility}>
+              {selected.hidden ? 'Show part' : 'Hide part'}
+            </button>
+          </>
+        )}
         {selected?.staged && (
           <button type="button" className="btn btn--secondary btn--small" disabled={busy} onClick={() => remove(selected)}>
             Remove staged part

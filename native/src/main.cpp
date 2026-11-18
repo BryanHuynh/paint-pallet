@@ -15,6 +15,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
@@ -285,7 +286,7 @@ int main() {
           const auto regionPath = pp::extractJsonString(line, "regionPath");
           const auto model = state.models.find(modelId);
           if (!job.cancelFlag || !params || params->size() != 2 || !regionPath ||
-              model == state.models.end() || modelId != state.activeModelId ||
+              model == state.models.end() ||
               !((*params)[0] >= 1 && (*params)[0] <= 180) || !((*params)[1] > 0 && (*params)[1] <= 100)) {
             throw std::runtime_error("The ridge model or options are unavailable.");
           }
@@ -357,7 +358,41 @@ int main() {
               static_cast<float>((*direction)[0]),
               static_cast<float>((*direction)[1]),
               static_cast<float>((*direction)[2])};
-          const std::string filePath = state.lighting.writeExposure(model->second, jobId, vector, *job.cancelFlag);
+          std::vector<pp::LightingPart> parts;
+          const auto encoded = pp::extractJsonString(line, "exposureModels");
+          if (encoded) {
+            const auto poses = pp::extractJsonNumberArray(line, "exposurePoses");
+            std::istringstream fields(*encoded);
+            std::vector<std::pair<uint32_t, uint32_t>> ranges;
+            std::unordered_set<std::string> seen;
+            for (std::string id; std::getline(fields, id, ',');) {
+              const size_t start = parts.size() * 8;
+              const auto part = state.models.find(id);
+              if (!poses || start + 8 > poses->size() || part == state.models.end() || !seen.insert(id).second) {
+                throw std::runtime_error("An assembled lighting part is unavailable.");
+              }
+              const auto offset = (*poses)[start];
+              if (offset < 0 || offset != std::floor(offset) || offset + part->second.triangleCount > 100000000) {
+                throw std::runtime_error("Invalid assembled face address.");
+              }
+              pp::LightingPart desc{&part->second, static_cast<uint32_t>(offset)};
+              for (size_t i = 0; i < desc.pose.size(); ++i) {
+                desc.pose[i] = static_cast<float>((*poses)[start + i + 1]);
+                if (!std::isfinite(desc.pose[i])) throw std::runtime_error("Invalid part pose.");
+              }
+              parts.push_back(desc);
+              ranges.emplace_back(desc.faceOffset, desc.faceOffset + part->second.triangleCount);
+            }
+            if (parts.empty() || parts[0].model != &model->second || parts[0].faceOffset != 0 ||
+                !poses || parts.size() * 8 != poses->size()) {
+              throw std::runtime_error("Invalid assembled lighting layout.");
+            }
+            std::sort(ranges.begin(), ranges.end());
+            for (size_t i = 1; i < ranges.size(); ++i) {
+              if (ranges[i - 1].second > ranges[i].first) throw std::runtime_error("Overlapping part face addresses.");
+            }
+          }
+          const std::string filePath = state.lighting.writeExposure(model->second, jobId, vector, *job.cancelFlag, parts);
           if (filePath.empty()) {
             emitLine("{\"type\":\"light_canceled" + prefix + "}");
           } else {

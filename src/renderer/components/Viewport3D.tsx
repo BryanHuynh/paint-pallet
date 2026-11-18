@@ -9,7 +9,7 @@ import type {
   PaintPalletApi,
   Vec3,
 } from '../../shared/workerProtocol';
-import { IDENTITY_PART_POSE, type KitPart, type PartPose } from '../../shared/kit';
+import { ANCHOR_ADDRESS, IDENTITY_PART_POSE, type PartAddress, type KitPart, type PartPose } from '../../shared/kit';
 import { computeOrientationQuaternion } from '../orientation';
 import { disposeDetailMesh, setShadowOverlay } from '../paint/shadowOverlay';
 import type { ShadowCoverage, SurfaceFace } from '../paint/shadowPaint';
@@ -45,6 +45,7 @@ export interface Viewport3DProps {
     enabled: boolean;
     coverage: ShadowCoverage;
     colors: ReadonlyMap<string, string>;
+    address?: PartAddress;
     diameter: number;
     onFaces: (faces: SurfaceFace[]) => void;
     onStart: () => boolean;
@@ -338,7 +339,8 @@ export function Viewport3D({
     if (material && paint) {
       setShadowOverlay(mesh, faceIds, {
         material,
-        hits: paint.coverage.get(batchIndex),
+        hits: paint.coverage.get(batchIndex + (paint.address ?? ANCHOR_ADDRESS).batchOffset),
+        faceOffset: (paint.address ?? ANCHOR_ADDRESS).faceOffset,
         colors: paint.colors,
       });
     }
@@ -348,7 +350,7 @@ export function Viewport3D({
     for (const [index, entry] of detailCacheRef.current) {
       applyShadow(entry.mesh, index, entry.faceIds);
     }
-  }, [shadowPaint?.coverage, shadowPaint?.colors]);
+  }, [shadowPaint?.coverage, shadowPaint?.colors, shadowPaint?.address]);
 
   const updateSettledLayerVisibility = (
     refs: NonNullable<typeof sceneRefs.current>,
@@ -674,7 +676,11 @@ export function Viewport3D({
         endStroke(false);
         return;
       }
-      paint.onFaces(brush.sample(renderer, lastSample, next, paint.diameter));
+      const hits = brush.sample(renderer, lastSample, next, paint.diameter);
+      const address = paint.address ?? ANCHOR_ADDRESS;
+      paint.onFaces(address.faceOffset || address.batchOffset ? hits.map((hit) => ({
+        ...hit, faceId: hit.faceId + address.faceOffset, batchIndex: hit.batchIndex + address.batchOffset,
+      })) : hits);
       lastSample = next;
     };
     const onPointerDown = (e: PointerEvent) => {
@@ -698,7 +704,10 @@ export function Viewport3D({
       const details = [...detailCacheRef.current.entries()].map(([index, entry]) => ({
         index, mesh: entry.mesh, faceIds: entry.faceIds,
       }));
-      const preview = previewGroup.visible ? previewGroup.children : [];
+      const preview = previewGroup.visible ? [...previewGroup.children] : [];
+      for (const layer of companions.values()) {
+        if (layer.visible) preview.push(...layer.children);
+      }
       if (!brush.capture(renderer, camera, canvas.getBoundingClientRect(), preview, details)) {
         endStroke(false);
         return;

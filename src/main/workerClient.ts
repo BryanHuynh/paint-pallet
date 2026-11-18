@@ -318,7 +318,14 @@ export class WorkerClient {
 
   async computeLightExposure(request: ExposureRequest): Promise<Float32Array> {
     if (!SAFE_JOB_ID_RE.test(request.jobId)) throw new Error('Invalid lighting job ID');
-    const filePath = await this.sendRequest<string>({ cmd: 'light_exposure', ...request });
+    const { parts, ...query } = request;
+    const filePath = await this.sendRequest<string>({
+      cmd: 'light_exposure', ...query,
+      ...(parts?.length ? {
+        exposureModels: parts.map((part) => part.modelId).join(','),
+        exposurePoses: parts.flatMap((part) => [part.faceOffset, ...part.pose.translation, ...part.pose.rotation]),
+      } : {}),
+    });
     return new Float32Array(await this.readAnalysisResult(filePath, `exposure-${request.jobId}.bin`, 4));
   }
 
