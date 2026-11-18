@@ -544,19 +544,10 @@ ImportOutcome importBinaryStl(
     return outcome;
   };
 
-  // Pass 1: stream chunks, compute global bounds, and build optional LOD preview
+  // Pass 1: stream chunks and compute global bounds
   Bounds3 globalBounds{};
   globalBounds.min[0] = globalBounds.min[1] = globalBounds.min[2] = std::numeric_limits<float>::infinity();
   globalBounds.max[0] = globalBounds.max[1] = globalBounds.max[2] = -std::numeric_limits<float>::infinity();
-
-  const uint32_t previewStride =
-      triangleCount > kPreviewMaxTriangles
-          ? std::max(1u, triangleCount / kPreviewMaxTriangles)
-          : 0u;
-  std::vector<PackedTri> previewTris;
-  if (previewStride > 0) {
-    previewTris.reserve(kPreviewMaxTriangles + 16);
-  }
 
   std::vector<uint8_t> chunkBuf(static_cast<size_t>(kChunkTriangles) * kStlRecordBytes);
   uint32_t triIndex = 0;
@@ -574,27 +565,12 @@ ImportOutcome importBinaryStl(
 
     for (uint32_t i = 0; i < countThisChunk; ++i) {
       const uint8_t* rec = chunkBuf.data() + static_cast<size_t>(i) * kStlRecordBytes;
-      float pos[9];
-      for (int v = 0; v < 9; ++v) {
-        pos[v] = readFloatLE(rec + 12 + v * 4);
-      }
-      for (int k = 0; k < 3; ++k) {
-        globalBounds.min[k] = std::min({globalBounds.min[k], pos[k], pos[3 + k], pos[6 + k]});
-        globalBounds.max[k] = std::max({globalBounds.max[k], pos[k], pos[3 + k], pos[6 + k]});
-      }
-
-      if (previewStride > 0 && (triIndex % previewStride == 0) && previewTris.size() < kPreviewMaxTriangles) {
-        PackedTri pt{};
-        std::memcpy(pt.pos, pos, sizeof(pos));
-        float fn[3];
-        computeFaceNormal(pos, fn);
+      for (int v = 0; v < 3; ++v) {
         for (int k = 0; k < 3; ++k) {
-          pt.norm[k] = fn[k];
-          pt.norm[3 + k] = fn[k];
-          pt.norm[6 + k] = fn[k];
+          float coord = readFloatLE(rec + 12 + (v * 3 + k) * 4);
+          globalBounds.min[k] = std::min(globalBounds.min[k], coord);
+          globalBounds.max[k] = std::max(globalBounds.max[k], coord);
         }
-        pt.faceId = triIndex;
-        previewTris.push_back(pt);
       }
       ++triIndex;
     }
@@ -634,6 +610,70 @@ ImportOutcome importBinaryStl(
   for (int k = 0; k < 3; ++k) {
     ext[k] = std::max(1e-6f, globalBounds.max[k] - globalBounds.min[k]);
   }
+
+  // Solid model-wide preview via streaming spatial vertex clustering when triangleCount > kPreviewMaxTriangles.
+  // Unlike sparse triangle striding, vertex clustering preserves connected solid surfaces across the entire model
+  // using O(occupied surface cells) memory.
+  const bool buildClusterPreview = triangleCount > kPreviewMaxTriangles;
+  constexpr uint32_t kPreviewGridMax = 128;
+  const float previewMaxExt = std::max({ext[0], ext[1], ext[2]});
+  const float previewCellSize = std::max(1e-6f, previewMaxExt / static_cast<float>(kPreviewGridMax));
+  const uint32_t previewGx = std::max(1u, static_cast<uint32_t>(std::ceil(ext[0] / previewCellSize)));
+  const uint32_t previewGy = std::max(1u, static_cast<uint32_t>(std::ceil(ext[1] / previewCellSize)));
+  const uint32_t previewGz = std::max(1u, static_cast<uint32_t>(std::ceil(ext[2] / previewCellSize)));
+
+  struct ClusterCell {
+    double sumX = 0.0;
+    double sumY = 0.0;
+    double sumZ = 0.0;
+    uint32_t count = 0;
+  };
+  struct ClusterTri {
+    uint32_t c0, c1, c2;
+  };
+  struct ClusterTriKey {
+    uint32_t a, b, c;
+    bool operator==(const ClusterTriKey& o) const {
+      return a == o.a && b == o.b && c == o.c;
+    }
+  };
+  struct ClusterTriKeyHash {
+    size_t operator()(const ClusterTriKey& k) const {
+      uint64_t h = static_cast<uint64_t>(k.a) * 0x9e3779b97f4a7c15ULL;
+      h ^= static_cast<uint64_t>(k.b) * 0xbf58476d1ce4e5b9ULL;
+      h ^= static_cast<uint64_t>(k.c) * 0x94d049bb133111ebULL;
+      return static_cast<size_t>(h ^ (h >> 30));
+    }
+  };
+
+  std::unordered_map<uint64_t, uint32_t> previewCellToId;
+  std::vector<ClusterCell> previewCells;
+  std::unordered_set<ClusterTriKey, ClusterTriKeyHash> previewTriKeys;
+  std::vector<ClusterTri> previewClusterTris;
+  if (buildClusterPreview) {
+    previewCellToId.reserve(65536);
+    previewCells.reserve(65536);
+    previewTriKeys.reserve(131072);
+    previewClusterTris.reserve(131072);
+  }
+
+  auto getOrAddPreviewCell = [&](float x, float y, float z) -> uint32_t {
+    uint32_t ix = std::min(previewGx - 1, static_cast<uint32_t>(std::max(0.0f, (x - globalBounds.min[0]) / previewCellSize)));
+    uint32_t iy = std::min(previewGy - 1, static_cast<uint32_t>(std::max(0.0f, (y - globalBounds.min[1]) / previewCellSize)));
+    uint32_t iz = std::min(previewGz - 1, static_cast<uint32_t>(std::max(0.0f, (z - globalBounds.min[2]) / previewCellSize)));
+    uint64_t key = (static_cast<uint64_t>(ix) << 32) | (static_cast<uint64_t>(iy) << 16) | static_cast<uint64_t>(iz);
+    auto [it, inserted] = previewCellToId.emplace(key, static_cast<uint32_t>(previewCells.size()));
+    if (inserted) {
+      previewCells.push_back(ClusterCell{x, y, z, 1});
+    } else {
+      ClusterCell& cell = previewCells[it->second];
+      cell.sumX += x;
+      cell.sumY += y;
+      cell.sumZ += z;
+      cell.count += 1;
+    }
+    return it->second;
+  };
 
   if (!reader.seek64(kStlHeaderBytes)) {
     return failOrCancel(false, "Failed to seek STL stream for spatial batching");
@@ -693,6 +733,21 @@ ImportOutcome importBinaryStl(
       if (!subBatches[sbIdx]->append(pt)) {
         return failOrCancel(false, "Failed writing spatial batch temp file");
       }
+
+      if (buildClusterPreview) {
+        uint32_t c0 = getOrAddPreviewCell(pt.pos[0], pt.pos[1], pt.pos[2]);
+        uint32_t c1 = getOrAddPreviewCell(pt.pos[3], pt.pos[4], pt.pos[5]);
+        uint32_t c2 = getOrAddPreviewCell(pt.pos[6], pt.pos[7], pt.pos[8]);
+        if (c0 != c1 && c1 != c2 && c0 != c2) {
+          uint32_t a = c0, b = c1, c = c2;
+          if (a > b) std::swap(a, b);
+          if (b > c) std::swap(b, c);
+          if (a > b) std::swap(a, b);
+          if (previewTriKeys.insert(ClusterTriKey{a, b, c}).second) {
+            previewClusterTris.push_back(ClusterTri{c0, c1, c2});
+          }
+        }
+      }
       ++triIndex;
     }
 
@@ -740,13 +795,48 @@ ImportOutcome importBinaryStl(
   }
 
   std::string previewPath;
-  if (!previewTris.empty()) {
+  if (buildClusterPreview && !previewClusterTris.empty()) {
     if (cancelFlag.load(std::memory_order_relaxed)) {
       return failOrCancel(true, "Import canceled");
     }
-    previewPath = pathToUtf8(jobDir / "preview.bin");
-    if (!writeBatchFileFromPacked(previewPath, previewTris)) {
-      return failOrCancel(false, "Failed writing preview batch");
+    std::vector<PackedTri> previewTris;
+    previewTris.reserve(previewClusterTris.size());
+    for (uint32_t pIdx = 0; pIdx < static_cast<uint32_t>(previewClusterTris.size()); ++pIdx) {
+      const ClusterTri& ct = previewClusterTris[pIdx];
+      const ClusterCell& v0 = previewCells[ct.c0];
+      const ClusterCell& v1 = previewCells[ct.c1];
+      const ClusterCell& v2 = previewCells[ct.c2];
+      PackedTri pt{};
+      pt.pos[0] = static_cast<float>(v0.sumX / v0.count);
+      pt.pos[1] = static_cast<float>(v0.sumY / v0.count);
+      pt.pos[2] = static_cast<float>(v0.sumZ / v0.count);
+      pt.pos[3] = static_cast<float>(v1.sumX / v1.count);
+      pt.pos[4] = static_cast<float>(v1.sumY / v1.count);
+      pt.pos[5] = static_cast<float>(v1.sumZ / v1.count);
+      pt.pos[6] = static_cast<float>(v2.sumX / v2.count);
+      pt.pos[7] = static_cast<float>(v2.sumY / v2.count);
+      pt.pos[8] = static_cast<float>(v2.sumZ / v2.count);
+      float fn[3];
+      computeFaceNormal(pt.pos, fn);
+      if (fn[0] == 0.0f && fn[1] == 0.0f && fn[2] == 0.0f) continue;
+      for (int k = 0; k < 3; ++k) {
+        pt.norm[k] = fn[k];
+        pt.norm[3 + k] = fn[k];
+        pt.norm[6 + k] = fn[k];
+      }
+      pt.faceId = pIdx;
+      previewTris.push_back(pt);
+    }
+    previewCellToId.clear();
+    previewCells.clear();
+    previewTriKeys.clear();
+    previewClusterTris.clear();
+
+    if (!previewTris.empty()) {
+      previewPath = pathToUtf8(jobDir / "preview.bin");
+      if (!writeBatchFileFromPacked(previewPath, previewTris)) {
+        return failOrCancel(false, "Failed writing preview batch");
+      }
     }
   }
 

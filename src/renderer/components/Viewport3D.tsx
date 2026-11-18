@@ -37,7 +37,10 @@ export interface Viewport3DProps {
   disableWebGL?: boolean;
 }
 
-export const MAX_DETAIL_BATCHES = 16;
+export const MAX_DETAIL_BATCHES = 256;
+export const MAX_DETAIL_TRIANGLES = 14_000_000;
+export const INITIAL_STAGE_BATCHES = 16;
+const DETAIL_STREAM_CONCURRENCY = 4;
 
 function distanceSqToBounds(p: THREE.Vector3, b: BatchDescriptor['bounds']): number {
   const dx = Math.max(b.min[0] - p.x, 0, p.x - b.max[0]);
@@ -269,7 +272,8 @@ export function Viewport3D({
   const apiRef = useRef<PaintPalletApi | undefined>(api);
   apiRef.current = api;
 
-  const detailCacheRef = useRef<Map<number, { mesh: THREE.Mesh; lastUsed: number }>>(new Map());
+  const detailCacheRef = useRef<Map<number, { mesh: THREE.Mesh; triangleCount: number; lastUsed: number }>>(new Map());
+  const detailTrianglesRef = useRef(0);
   const lruTickRef = useRef(0);
   const streamGenerationRef = useRef(0);
   const modelGenRef = useRef(0);
@@ -288,6 +292,18 @@ export function Viewport3D({
     radius: number;
   } | null>(null);
 
+  const updateSettledLayerVisibility = (
+    refs: NonNullable<typeof sceneRefs.current>,
+    targetModel: ModelSummary,
+  ) => {
+    const allBatchesLoaded =
+      targetModel.batches.length > 0 &&
+      detailCacheRef.current.size >= targetModel.batches.length;
+    refs.previewGroup.visible =
+      !allBatchesLoaded && refs.previewGroup.children.length > 0;
+    refs.detailGroup.visible = refs.detailGroup.children.length > 0;
+  };
+
   const ensureDetailBatchesLoaded = async (
     targetModel: ModelSummary,
     desiredIndices: number[],
@@ -299,6 +315,7 @@ export function Viewport3D({
 
     const batchByIndex = new Map(targetModel.batches.map((b) => [b.batchIndex, b]));
     const cache = detailCacheRef.current;
+    const desiredSet = new Set(desiredIndices);
 
     for (const idx of desiredIndices) {
       const existing = cache.get(idx);
@@ -307,37 +324,66 @@ export function Viewport3D({
       }
     }
 
-    for (const idx of desiredIndices) {
+    const missingIndices = desiredIndices.filter((idx) => !cache.has(idx) && batchByIndex.has(idx));
+    for (let offset = 0; offset < missingIndices.length; offset += DETAIL_STREAM_CONCURRENCY) {
       if (streamGenerationRef.current !== generation) return;
-      if (cache.has(idx)) continue;
-      const desc = batchByIndex.get(idx);
-      if (!desc) continue;
-
-      const bin = await currentApi.readBatch(desc.filePath);
+      const chunk = missingIndices.slice(offset, offset + DETAIL_STREAM_CONCURRENCY);
+      const results = await Promise.all(
+        chunk.map(async (idx) => {
+          const desc = batchByIndex.get(idx)!;
+          const bin = await currentApi.readBatch(desc.filePath);
+          return { idx, bin };
+        }),
+      );
       if (streamGenerationRef.current !== generation) return;
 
-      while (cache.size >= MAX_DETAIL_BATCHES) {
-        let victimKey: number | null = null;
-        let oldestTick = Infinity;
-        for (const [k, entry] of cache.entries()) {
-          if (entry.lastUsed < oldestTick) {
-            oldestTick = entry.lastUsed;
-            victimKey = k;
+      for (const { idx, bin } of results) {
+        if (streamGenerationRef.current !== generation) return;
+        if (cache.has(idx)) continue;
+
+        while (
+          cache.size >= MAX_DETAIL_BATCHES ||
+          (detailTrianglesRef.current + bin.triangleCount > MAX_DETAIL_TRIANGLES && cache.size > 0)
+        ) {
+          let victimKey: number | null = null;
+          let oldestTick = Infinity;
+          for (const [k, entry] of cache.entries()) {
+            if (desiredSet.has(k)) continue;
+            if (entry.lastUsed < oldestTick) {
+              oldestTick = entry.lastUsed;
+              victimKey = k;
+            }
           }
+          if (victimKey === null) {
+            for (const [k, entry] of cache.entries()) {
+              if (entry.lastUsed < oldestTick) {
+                oldestTick = entry.lastUsed;
+                victimKey = k;
+              }
+            }
+          }
+          if (victimKey === null) break;
+          const victim = cache.get(victimKey)!;
+          refs.detailGroup.remove(victim.mesh);
+          victim.mesh.geometry.dispose();
+          detailTrianglesRef.current = Math.max(0, detailTrianglesRef.current - victim.triangleCount);
+          cache.delete(victimKey);
         }
-        if (victimKey === null) break;
-        const victim = cache.get(victimKey)!;
-        refs.detailGroup.remove(victim.mesh);
-        victim.mesh.geometry.dispose();
-        cache.delete(victimKey);
+
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(bin.positions, 3));
+        geo.setAttribute('normal', new THREE.BufferAttribute(bin.normals, 3));
+        const mesh = new THREE.Mesh(geo, refs.material);
+        refs.detailGroup.add(mesh);
+        detailTrianglesRef.current += bin.triangleCount;
+        cache.set(idx, {
+          mesh,
+          triangleCount: bin.triangleCount,
+          lastUsed: ++lruTickRef.current,
+        });
       }
 
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.BufferAttribute(bin.positions, 3));
-      geo.setAttribute('normal', new THREE.BufferAttribute(bin.normals, 3));
-      const mesh = new THREE.Mesh(geo, refs.material);
-      refs.detailGroup.add(mesh);
-      cache.set(idx, { mesh, lastUsed: ++lruTickRef.current });
+      updateSettledLayerVisibility(refs, targetModel);
     }
   };
 
@@ -358,11 +404,7 @@ export function Viewport3D({
     );
     await ensureDetailBatchesLoaded(targetModel, desired, gen);
     if (streamGenerationRef.current === gen && refs.detailGroup.children.length > 0) {
-      // Keep whole-model overview available when model exceeds detail budget,
-      // and enable detailGroup for original-triangle picking.
-      refs.previewGroup.visible =
-        targetModel.batches.length > MAX_DETAIL_BATCHES && refs.previewGroup.children.length > 0;
-      refs.detailGroup.visible = true;
+      updateSettledLayerVisibility(refs, targetModel);
     }
   };
 
@@ -505,11 +547,8 @@ export function Viewport3D({
       if (resolution.kind === 'needs-detail') {
         const gen = ++streamGenerationRef.current;
         void ensureDetailBatchesLoaded(currentModel, resolution.targetBatches, gen).then(() => {
-          if (streamGenerationRef.current === gen) {
-            previewGroup.visible =
-              currentModel.batches.length > MAX_DETAIL_BATCHES &&
-              previewGroup.children.length > 0;
-            detailGroup.visible = true;
+          if (streamGenerationRef.current === gen && sceneRefs.current) {
+            updateSettledLayerVisibility(sceneRefs.current, currentModel);
           }
         });
         onPickNeedsDetailRef.current?.(
@@ -554,6 +593,7 @@ export function Viewport3D({
       disposeGroupMeshes(previewGroup);
       disposeGroupMeshes(detailGroup);
       detailCacheRef.current.clear();
+      detailTrianglesRef.current = 0;
       material.dispose();
       controls.dispose();
       renderer.dispose();
@@ -571,7 +611,7 @@ export function Viewport3D({
     let cancelled = false;
 
     const stagedPreviewGeos: THREE.BufferGeometry[] = [];
-    const stagedDetailEntries: { batchIndex: number; geo: THREE.BufferGeometry }[] = [];
+    const stagedDetailEntries: { batchIndex: number; triangleCount: number; geo: THREE.BufferGeometry }[] = [];
 
     const disposeStaged = () => {
       for (const g of stagedPreviewGeos) g.dispose();
@@ -601,7 +641,7 @@ export function Viewport3D({
           pendingModel.batches,
           [center[0], center[1], center[2] + 100],
           center,
-          MAX_DETAIL_BATCHES,
+          INITIAL_STAGE_BATCHES,
         );
         const batchByIndex = new Map(pendingModel.batches.map((b) => [b.batchIndex, b]));
 
@@ -616,7 +656,7 @@ export function Viewport3D({
           const geo = new THREE.BufferGeometry();
           geo.setAttribute('position', new THREE.BufferAttribute(bin.positions, 3));
           geo.setAttribute('normal', new THREE.BufferAttribute(bin.normals, 3));
-          stagedDetailEntries.push({ batchIndex: idx, geo });
+          stagedDetailEntries.push({ batchIndex: idx, triangleCount: bin.triangleCount, geo });
         }
 
         const committed = await onCommitRef.current(pendingModel);
@@ -632,6 +672,7 @@ export function Viewport3D({
           disposeGroupMeshes(refs.previewGroup);
           disposeGroupMeshes(refs.detailGroup);
           detailCacheRef.current.clear();
+          detailTrianglesRef.current = 0;
 
           for (const geo of stagedPreviewGeos) {
             refs.previewGroup.add(new THREE.Mesh(geo, refs.material));
@@ -639,16 +680,15 @@ export function Viewport3D({
           for (const entry of stagedDetailEntries) {
             const mesh = new THREE.Mesh(entry.geo, refs.material);
             refs.detailGroup.add(mesh);
+            detailTrianglesRef.current += entry.triangleCount;
             detailCacheRef.current.set(entry.batchIndex, {
               mesh,
+              triangleCount: entry.triangleCount,
               lastUsed: ++lruTickRef.current,
             });
           }
 
-          refs.previewGroup.visible =
-            pendingModel.batches.length > MAX_DETAIL_BATCHES &&
-            refs.previewGroup.children.length > 0;
-          refs.detailGroup.visible = true;
+          updateSettledLayerVisibility(refs, pendingModel);
         } else {
           disposeStaged();
         }
