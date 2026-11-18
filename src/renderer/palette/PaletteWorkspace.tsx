@@ -22,6 +22,12 @@ const TONE_SLOTS: { slot: ToneSlot; label: string }[] = [
   { slot: 'highlight', label: 'Highlight' },
 ];
 
+const ZOOM_LEVELS = [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8];
+const MAGNIFIER_RADIUS = 7;
+const MAGNIFIER_GRID = MAGNIFIER_RADIUS * 2 + 1;
+const MAGNIFIER_CELL_PX = 8;
+const MAGNIFIER_SIZE = MAGNIFIER_GRID * MAGNIFIER_CELL_PX;
+
 const ACCEPTED_MIME_TYPES = new Set([
   'image/png',
   'image/jpeg',
@@ -74,7 +80,16 @@ export default function PaletteWorkspace(): React.ReactElement {
   const recipeNameInputId = useId();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const magnifierCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const panStateRef = useRef<{
+    startX: number;
+    startY: number;
+    scrollLeft: number;
+    scrollTop: number;
+  } | null>(null);
   const nextRefId = useRef(1);
+  const nextRecipeNumberRef = useRef(2);
   const isMountedRef = useRef(true);
   const urlsToRevokeRef = useRef<string[]>([]);
 
@@ -85,12 +100,21 @@ export default function PaletteWorkspace(): React.ReactElement {
   const [recipes, setRecipes] = useState<PaintRecipe[]>(() => [
     createEmptyRecipe(1),
   ]);
-  const [activeRecipeId, setActiveRecipeId] = useState<string>('recipe-1');
+  const [activeRecipeId, setActiveRecipeId] = useState<string | null>('recipe-1');
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [activeTone, setActiveTone] = useState<ToneSlot>('shadow');
   const [toolMode, setToolMode] = useState<'eyedropper' | 'select'>('eyedropper');
+  const [zoom, setZoom] = useState<number | null>(null);
+  const [isPanning, setIsPanning] = useState(false);
   const [selection, setSelection] = useState<PixelRect | null>(null);
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
   const [cursor, setCursor] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [magnifier, setMagnifier] = useState<{
+    x: number;
+    y: number;
+    visible: boolean;
+    hex: string;
+  }>({ x: 0, y: 0, visible: false, hex: '#000000' });
   const [keyboardAnchor, setKeyboardAnchor] = useState<{
     x: number;
     y: number;
@@ -101,23 +125,26 @@ export default function PaletteWorkspace(): React.ReactElement {
   const activeReference =
     references.find((ref) => ref.id === activeRefId) ?? references[0] ?? null;
 
-  const activeRecipe =
-    recipes.find((recipe) => recipe.id === activeRecipeId) ?? recipes[0];
+  const activeRecipe = activeRecipeId
+    ? (recipes.find((recipe) => recipe.id === activeRecipeId) ?? recipes[0] ?? null)
+    : (recipes[0] ?? null);
 
   useEffect(() => {
-    if (!dragStart) {
+    if (!dragStart && !isPanning) {
       return;
     }
-    const endDrag = () => {
+    const endPointer = () => {
       setDragStart(null);
+      panStateRef.current = null;
+      setIsPanning(false);
     };
-    window.addEventListener('pointerup', endDrag);
-    window.addEventListener('pointercancel', endDrag);
+    window.addEventListener('pointerup', endPointer);
+    window.addEventListener('pointercancel', endPointer);
     return () => {
-      window.removeEventListener('pointerup', endDrag);
-      window.removeEventListener('pointercancel', endDrag);
+      window.removeEventListener('pointerup', endPointer);
+      window.removeEventListener('pointercancel', endPointer);
     };
-  }, [dragStart]);
+  }, [dragStart, isPanning]);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -144,6 +171,46 @@ export default function PaletteWorkspace(): React.ReactElement {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(activeReference.element, 0, 0);
   }, [activeReference]);
+
+  useEffect(() => {
+    if (!magnifier.visible || toolMode !== 'select' || !activeReference) {
+      return;
+    }
+    const sourceCanvas = canvasRef.current;
+    const magCanvas = magnifierCanvasRef.current;
+    if (!sourceCanvas || !magCanvas) {
+      return;
+    }
+    const magCtx = magCanvas.getContext('2d');
+    if (!magCtx) {
+      return;
+    }
+    magCtx.fillStyle = '#0f1f10';
+    magCtx.fillRect(0, 0, MAGNIFIER_SIZE, MAGNIFIER_SIZE);
+
+    const srcX = Math.max(0, magnifier.x - MAGNIFIER_RADIUS);
+    const srcY = Math.max(0, magnifier.y - MAGNIFIER_RADIUS);
+    const srcRight = Math.min(sourceCanvas.width, magnifier.x + MAGNIFIER_RADIUS + 1);
+    const srcBottom = Math.min(sourceCanvas.height, magnifier.y + MAGNIFIER_RADIUS + 1);
+    const srcW = srcRight - srcX;
+    const srcH = srcBottom - srcY;
+    if (srcW > 0 && srcH > 0) {
+      const dstX = (srcX - (magnifier.x - MAGNIFIER_RADIUS)) * MAGNIFIER_CELL_PX;
+      const dstY = (srcY - (magnifier.y - MAGNIFIER_RADIUS)) * MAGNIFIER_CELL_PX;
+      magCtx.imageSmoothingEnabled = false;
+      magCtx.drawImage(
+        sourceCanvas,
+        srcX,
+        srcY,
+        srcW,
+        srcH,
+        dstX,
+        dstY,
+        srcW * MAGNIFIER_CELL_PX,
+        srcH * MAGNIFIER_CELL_PX,
+      );
+    }
+  }, [magnifier.visible, magnifier.x, magnifier.y, toolMode, activeReference]);
 
   async function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
     const fileList = event.target.files;
@@ -218,13 +285,50 @@ export default function PaletteWorkspace(): React.ReactElement {
   }
 
   function handleCreateRecipe() {
-    const nextIndex = recipes.length + 1;
-    const next = createEmptyRecipe(nextIndex);
+    const nextNumber = nextRecipeNumberRef.current++;
+    const next = createEmptyRecipe(nextNumber);
     setRecipes((prev) => [...prev, next]);
     setActiveRecipeId(next.id);
+    setConfirmDeleteId(null);
+  }
+
+  function handleRequestDeleteRecipe() {
+    if (!activeRecipe) {
+      return;
+    }
+    setConfirmDeleteId(activeRecipe.id);
+  }
+
+  function handleCancelDeleteRecipe() {
+    setConfirmDeleteId(null);
+  }
+
+  function handleConfirmDeleteRecipe() {
+    if (!confirmDeleteId) {
+      return;
+    }
+    const deletedIndex = recipes.findIndex((recipe) => recipe.id === confirmDeleteId);
+    if (deletedIndex === -1) {
+      setConfirmDeleteId(null);
+      return;
+    }
+    const nextRecipes = recipes.filter((recipe) => recipe.id !== confirmDeleteId);
+    let nextActiveId: string | null = null;
+    if (nextRecipes.length > 0) {
+      nextActiveId =
+        deletedIndex < nextRecipes.length
+          ? nextRecipes[deletedIndex].id
+          : nextRecipes[deletedIndex - 1].id;
+    }
+    setRecipes(nextRecipes);
+    setActiveRecipeId(nextActiveId);
+    setConfirmDeleteId(null);
   }
 
   function handleRenameRecipe(name: string) {
+    if (!activeRecipe) {
+      return;
+    }
     setRecipes((prev) =>
       prev.map((recipe) =>
         recipe.id === activeRecipe.id ? { ...recipe, name } : recipe,
@@ -233,6 +337,9 @@ export default function PaletteWorkspace(): React.ReactElement {
   }
 
   function updateActiveSwatch(slot: ToneSlot, patch: Partial<SwatchEntry>) {
+    if (!activeRecipe) {
+      return;
+    }
     setRecipes((prev) =>
       prev.map((recipe) =>
         recipe.id === activeRecipe.id
@@ -246,6 +353,82 @@ export default function PaletteWorkspace(): React.ReactElement {
           : recipe,
       ),
     );
+  }
+
+  function getFitScale(): number {
+    const stage = stageRef.current;
+    if (
+      !stage ||
+      !activeReference ||
+      stage.clientWidth === 0 ||
+      stage.clientHeight === 0
+    ) {
+      return 1;
+    }
+    const availW = Math.max(1, stage.clientWidth - 24);
+    const availH = Math.max(1, stage.clientHeight - 24);
+    return Math.min(
+      1,
+      availW / activeReference.width,
+      availH / activeReference.height,
+    );
+  }
+
+  function handleZoomIn() {
+    const current = zoom ?? getFitScale();
+    const next =
+      ZOOM_LEVELS.find((level) => level > current + 0.01) ??
+      ZOOM_LEVELS[ZOOM_LEVELS.length - 1];
+    setZoom(next);
+  }
+
+  function handleZoomOut() {
+    const current = zoom ?? getFitScale();
+    const prevLevels = ZOOM_LEVELS.filter((level) => level < current - 0.01);
+    const next = prevLevels.length > 0 ? prevLevels[prevLevels.length - 1] : ZOOM_LEVELS[0];
+    setZoom(next);
+  }
+
+  function handleResetZoom() {
+    setZoom(null);
+    if (stageRef.current) {
+      stageRef.current.scrollLeft = 0;
+      stageRef.current.scrollTop = 0;
+    }
+  }
+
+  function handleStagePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    const stage = stageRef.current;
+    if (!stage) {
+      return;
+    }
+    if (event.button === 1 || (event.button === 0 && event.altKey)) {
+      event.preventDefault();
+      panStateRef.current = {
+        startX: event.clientX,
+        startY: event.clientY,
+        scrollLeft: stage.scrollLeft,
+        scrollTop: stage.scrollTop,
+      };
+      setIsPanning(true);
+    }
+  }
+
+  function handleStagePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    const stage = stageRef.current;
+    const pan = panStateRef.current;
+    if (!stage || !pan) {
+      return;
+    }
+    stage.scrollLeft = pan.scrollLeft - (event.clientX - pan.startX);
+    stage.scrollTop = pan.scrollTop - (event.clientY - pan.startY);
+  }
+
+  function handleStagePointerUp() {
+    if (panStateRef.current) {
+      panStateRef.current = null;
+      setIsPanning(false);
+    }
   }
 
   function clampToImage(x: number, y: number): { x: number; y: number } {
@@ -279,22 +462,29 @@ export default function PaletteWorkspace(): React.ReactElement {
     setSuggestionPreview(null);
   }
 
-  function samplePixelAt(x: number, y: number) {
-    const canvas = canvasRef.current;
-    if (!canvas) {
-      return;
-    }
+  function readPixelHex(canvas: HTMLCanvasElement, x: number, y: number): string {
     const ctx = canvas.getContext('2d');
     if (!ctx) {
-      return;
+      return '#000000';
     }
     const clamped = clampToImage(x, y);
     const data = ctx.getImageData(clamped.x, clamped.y, 1, 1).data;
-    const hex = rgbToHex(data[0], data[1], data[2]);
+    return rgbToHex(data[0], data[1], data[2]);
+  }
+
+  function samplePixelAt(x: number, y: number) {
+    const canvas = canvasRef.current;
+    if (!canvas || !activeRecipe) {
+      return;
+    }
+    const hex = readPixelHex(canvas, x, y);
     updateActiveSwatch(activeTone, { hex });
   }
 
   function handleCanvasPointerDown(event: React.PointerEvent<HTMLCanvasElement>) {
+    if (event.button === 1 || event.altKey) {
+      return;
+    }
     const canvas = canvasRef.current;
     if (!canvas) {
       return;
@@ -306,6 +496,12 @@ export default function PaletteWorkspace(): React.ReactElement {
       event.currentTarget.setPointerCapture?.(event.pointerId);
       setKeyboardAnchor(null);
       setDragStart({ x, y });
+      setMagnifier({
+        x,
+        y,
+        visible: true,
+        hex: readPixelHex(canvas, x, y),
+      });
       updateSelection({ x, y, width: 1, height: 1 });
       return;
     }
@@ -314,11 +510,23 @@ export default function PaletteWorkspace(): React.ReactElement {
   }
 
   function handleCanvasPointerMove(event: React.PointerEvent<HTMLCanvasElement>) {
+    if (panStateRef.current) {
+      return;
+    }
     const canvas = canvasRef.current;
-    if (!canvas || toolMode !== 'select' || !dragStart) {
+    if (!canvas || toolMode !== 'select') {
       return;
     }
     const { x, y } = mapClientToCanvasPixel(canvas, event.clientX, event.clientY);
+    setMagnifier({
+      x,
+      y,
+      visible: true,
+      hex: readPixelHex(canvas, x, y),
+    });
+    if (!dragStart) {
+      return;
+    }
     setCursor({ x, y });
     updateSelection(makeRectFromPoints(dragStart, { x, y }));
   }
@@ -332,6 +540,12 @@ export default function PaletteWorkspace(): React.ReactElement {
     }
     if (dragStart) {
       setDragStart(null);
+    }
+  }
+
+  function handleCanvasPointerLeave() {
+    if (!dragStart) {
+      setMagnifier((prev) => (prev.visible ? { ...prev, visible: false } : prev));
     }
   }
 
@@ -405,7 +619,7 @@ export default function PaletteWorkspace(): React.ReactElement {
   }
 
   function handleApplySuggestions() {
-    if (!suggestionPreview) {
+    if (!suggestionPreview || !activeRecipe) {
       return;
     }
     setRecipes((prev) =>
@@ -494,6 +708,14 @@ export default function PaletteWorkspace(): React.ReactElement {
                     setKeyboardAnchor(null);
                     setCursor({ x: 0, y: 0 });
                     setSuggestionPreview(null);
+                    setZoom(null);
+                    setMagnifier((prev) =>
+                      prev.visible ? { ...prev, visible: false } : prev,
+                    );
+                    if (stageRef.current) {
+                      stageRef.current.scrollLeft = 0;
+                      stageRef.current.scrollTop = 0;
+                    }
                   }}
                 >
                   <img className={styles.thumbImg} src={ref.url} alt="" />
@@ -510,7 +732,12 @@ export default function PaletteWorkspace(): React.ReactElement {
                   type="button"
                   className={`${styles.btn} ${styles.btnSecondary}`}
                   aria-pressed={toolMode === 'eyedropper'}
-                  onClick={() => setToolMode('eyedropper')}
+                  onClick={() => {
+                    setToolMode('eyedropper');
+                    setMagnifier((prev) =>
+                      prev.visible ? { ...prev, visible: false } : prev,
+                    );
+                  }}
                 >
                   Eyedropper
                 </button>
@@ -539,14 +766,64 @@ export default function PaletteWorkspace(): React.ReactElement {
                   </button>
                 )}
               </div>
-              <div className={styles.canvasStage}>
-                <div className={styles.canvasWrap}>
+              <div className={styles.zoomBar} role="group" aria-label="Zoom controls">
+                <button
+                  type="button"
+                  className={`${styles.btn} ${styles.btnSecondary}`}
+                  disabled={zoom !== null && zoom <= ZOOM_LEVELS[0]}
+                  onClick={handleZoomOut}
+                >
+                  Zoom out
+                </button>
+                <span className={styles.zoomReadout} data-testid="zoom-readout">
+                  {zoom === null ? 'Fit' : `${Math.round(zoom * 100)}%`}
+                </span>
+                <button
+                  type="button"
+                  className={`${styles.btn} ${styles.btnSecondary}`}
+                  disabled={zoom !== null && zoom >= ZOOM_LEVELS[ZOOM_LEVELS.length - 1]}
+                  onClick={handleZoomIn}
+                >
+                  Zoom in
+                </button>
+                <button
+                  type="button"
+                  className={`${styles.btn} ${styles.btnSecondary}`}
+                  disabled={zoom === null}
+                  onClick={handleResetZoom}
+                >
+                  Fit / Reset
+                </button>
+              </div>
+              <div
+                ref={stageRef}
+                data-testid="canvas-stage"
+                className={`${styles.canvasStage} ${isPanning ? styles.canvasStagePanning : ''}`}
+                onPointerDown={handleStagePointerDown}
+                onPointerMove={handleStagePointerMove}
+                onPointerUp={handleStagePointerUp}
+                onPointerCancel={handleStagePointerUp}
+              >
+                <div
+                  className={`${styles.canvasWrap} ${zoom !== null ? styles.canvasWrapZoomed : ''}`}
+                >
                   <canvas
                     ref={canvasRef}
                     data-testid="reference-canvas"
                     className={styles.canvas}
                     width={activeReference.width}
                     height={activeReference.height}
+                    style={
+                      zoom !== null
+                        ? {
+                            width: `${Math.round(activeReference.width * zoom)}px`,
+                            height: `${Math.round(activeReference.height * zoom)}px`,
+                            maxWidth: 'none',
+                            maxHeight: 'none',
+                            imageRendering: zoom >= 2 ? 'pixelated' : 'auto',
+                          }
+                        : undefined
+                    }
                     tabIndex={0}
                     aria-label={`Reference canvas for ${activeReference.name}. Use arrow keys to move cursor and Enter or Space to ${toolMode === 'eyedropper' ? 'sample pixel' : 'set selection corner'}.`}
                     onKeyDown={handleCanvasKeyDown}
@@ -554,6 +831,7 @@ export default function PaletteWorkspace(): React.ReactElement {
                     onPointerMove={handleCanvasPointerMove}
                     onPointerUp={handleCanvasPointerUp}
                     onPointerCancel={handleCanvasPointerUp}
+                    onPointerLeave={handleCanvasPointerLeave}
                   />
                   <div
                     className={styles.cursorMarker}
@@ -574,6 +852,48 @@ export default function PaletteWorkspace(): React.ReactElement {
                         height: `${(selection.height / activeReference.height) * 100}%`,
                       }}
                     />
+                  )}
+                  {toolMode === 'select' && magnifier.visible && (
+                    <div
+                      data-testid="region-magnifier"
+                      className={styles.magnifier}
+                      aria-hidden="true"
+                      style={{
+                        left:
+                          magnifier.x / activeReference.width > 0.68
+                            ? `calc(${((magnifier.x + 0.5) / activeReference.width) * 100}% - 150px)`
+                            : `calc(${((magnifier.x + 0.5) / activeReference.width) * 100}% + 16px)`,
+                        top:
+                          magnifier.y / activeReference.height > 0.68
+                            ? `calc(${((magnifier.y + 0.5) / activeReference.height) * 100}% - 160px)`
+                            : `calc(${((magnifier.y + 0.5) / activeReference.height) * 100}% + 16px)`,
+                      }}
+                    >
+                      <div className={styles.magnifierViewport}>
+                        <canvas
+                          ref={magnifierCanvasRef}
+                          data-testid="region-magnifier-canvas"
+                          className={styles.magnifierCanvas}
+                          width={MAGNIFIER_SIZE}
+                          height={MAGNIFIER_SIZE}
+                        />
+                        <div
+                          data-testid="magnifier-crosshair"
+                          className={styles.magnifierCrosshair}
+                        />
+                        <div className={styles.magnifierCenterBox} />
+                      </div>
+                      <div className={styles.magnifierMeta}>
+                        <span>
+                          {magnifier.x}, {magnifier.y}
+                        </span>
+                        <span
+                          className={styles.magnifierSwatch}
+                          style={{ backgroundColor: magnifier.hex }}
+                        />
+                        <span>{magnifier.hex}</span>
+                      </div>
+                    </div>
                   )}
                 </div>
               </div>
@@ -672,6 +992,7 @@ export default function PaletteWorkspace(): React.ReactElement {
                     <button
                       type="button"
                       className={`${styles.btn} ${styles.btnPrimary}`}
+                      disabled={!activeRecipe}
                       onClick={handleApplySuggestions}
                     >
                       Apply suggestions
@@ -697,55 +1018,102 @@ export default function PaletteWorkspace(): React.ReactElement {
         <section className={styles.panel} aria-label="Recipe editor">
           <div className={styles.panelHeader}>
             <h2 className={styles.panelTitle}>Recipes</h2>
-            <button
-              type="button"
-              className={`${styles.btn} ${styles.btnSecondary}`}
-              onClick={handleCreateRecipe}
-            >
-              Add recipe
-            </button>
-          </div>
-
-          <div className={styles.recipeList} role="group" aria-label="Saved recipes">
-            {recipes.map((recipe) => (
+            <div className={styles.recipeActions}>
               <button
-                key={recipe.id}
                 type="button"
-                className={styles.recipeTab}
-                aria-pressed={recipe.id === activeRecipe.id}
-                onClick={() => setActiveRecipeId(recipe.id)}
+                className={`${styles.btn} ${styles.btnSecondary}`}
+                onClick={handleCreateRecipe}
               >
-                {recipe.name || 'Untitled recipe'}
+                Add recipe
               </button>
-            ))}
+              <button
+                type="button"
+                className={`${styles.btn} ${styles.btnDanger}`}
+                disabled={!activeRecipe}
+                onClick={handleRequestDeleteRecipe}
+              >
+                Delete recipe
+              </button>
+            </div>
           </div>
 
-          <div className={styles.field}>
-            <label className={styles.label} htmlFor={recipeNameInputId}>
-              Recipe name
-            </label>
-            <input
-              id={recipeNameInputId}
-              className={styles.input}
-              type="text"
-              value={activeRecipe.name}
-              onChange={(event) => handleRenameRecipe(event.target.value)}
-            />
-          </div>
+          {confirmDeleteId && activeRecipe && confirmDeleteId === activeRecipe.id && (
+            <div className={styles.confirmBox} role="alertdialog" aria-label="Confirm delete recipe">
+              <span>
+                Delete &ldquo;{activeRecipe.name || 'Untitled recipe'}&rdquo;?
+              </span>
+              <div className={styles.confirmActions}>
+                <button
+                  type="button"
+                  className={`${styles.btn} ${styles.btnDanger}`}
+                  onClick={handleConfirmDeleteRecipe}
+                >
+                  Confirm delete
+                </button>
+                <button
+                  type="button"
+                  className={`${styles.btn} ${styles.btnSecondary}`}
+                  onClick={handleCancelDeleteRecipe}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
 
-          <div className={styles.toneGrid}>
-            {TONE_SLOTS.map(({ slot, label }) => (
-              <ToneSwatchCard
-                key={`${activeRecipe.id}-${slot}`}
-                slot={slot}
-                label={label}
-                swatch={activeRecipe.swatches[slot]}
-                isSelected={activeTone === slot}
-                onSelectTone={setActiveTone}
-                onChangeSwatch={updateActiveSwatch}
-              />
-            ))}
-          </div>
+          {recipes.length > 0 && (
+            <div className={styles.recipeList} role="group" aria-label="Saved recipes">
+              {recipes.map((recipe) => (
+                <button
+                  key={recipe.id}
+                  type="button"
+                  className={styles.recipeTab}
+                  aria-pressed={recipe.id === activeRecipe?.id}
+                  onClick={() => {
+                    setActiveRecipeId(recipe.id);
+                    setConfirmDeleteId(null);
+                  }}
+                >
+                  {recipe.name || 'Untitled recipe'}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {activeRecipe ? (
+            <>
+              <div className={styles.field}>
+                <label className={styles.label} htmlFor={recipeNameInputId}>
+                  Recipe name
+                </label>
+                <input
+                  id={recipeNameInputId}
+                  className={styles.input}
+                  type="text"
+                  value={activeRecipe.name}
+                  onChange={(event) => handleRenameRecipe(event.target.value)}
+                />
+              </div>
+
+              <div className={styles.toneGrid}>
+                {TONE_SLOTS.map(({ slot, label }) => (
+                  <ToneSwatchCard
+                    key={`${activeRecipe.id}-${slot}`}
+                    slot={slot}
+                    label={label}
+                    swatch={activeRecipe.swatches[slot]}
+                    isSelected={activeTone === slot}
+                    onSelectTone={setActiveTone}
+                    onChangeSwatch={updateActiveSwatch}
+                  />
+                ))}
+              </div>
+            </>
+          ) : (
+            <div className={styles.emptyState}>
+              No recipes yet. Add a recipe to start saving shadow, midtone, and highlight swatches.
+            </div>
+          )}
         </section>
       </div>
     </section>

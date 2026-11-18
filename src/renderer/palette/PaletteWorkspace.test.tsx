@@ -114,8 +114,46 @@ function installCanvasAndImageHarness() {
   ) {
     if (contextId !== '2d') return null;
     const canvas = this;
+    let fillStyle = '#000000';
     return {
-      clearRect: () => {},
+      imageSmoothingEnabled: true,
+      get fillStyle() {
+        return fillStyle;
+      },
+      set fillStyle(value: string) {
+        fillStyle = value;
+      },
+      clearRect: () => {
+        canvasBuffers.delete(canvas);
+      },
+      fillRect: (rx: number, ry: number, rw: number, rh: number) => {
+        const existing = canvasBuffers.get(canvas);
+        const out = existing
+          ? new Uint8ClampedArray(existing.data)
+          : new Uint8ClampedArray(canvas.width * canvas.height * 4);
+        const hex = fillStyle.startsWith('#') && fillStyle.length === 7 ? fillStyle : '#000000';
+        const r = parseInt(hex.slice(1, 3), 16);
+        const g = parseInt(hex.slice(3, 5), 16);
+        const b = parseInt(hex.slice(5, 7), 16);
+        const x0 = Math.max(0, Math.floor(rx));
+        const y0 = Math.max(0, Math.floor(ry));
+        const x1 = Math.min(canvas.width, Math.ceil(rx + rw));
+        const y1 = Math.min(canvas.height, Math.ceil(ry + rh));
+        for (let y = y0; y < y1; y++) {
+          for (let x = x0; x < x1; x++) {
+            const idx = (y * canvas.width + x) * 4;
+            out[idx] = r;
+            out[idx + 1] = g;
+            out[idx + 2] = b;
+            out[idx + 3] = 255;
+          }
+        }
+        canvasBuffers.set(canvas, {
+          width: canvas.width,
+          height: canvas.height,
+          data: out,
+        });
+      },
       drawImage: (
         imgOrCanvas: unknown,
         sx?: number,
@@ -138,7 +176,10 @@ function installCanvasAndImageHarness() {
           const dstH = dh ?? srcH;
           const dstX = dx ?? 0;
           const dstY = dy ?? 0;
-          const out = new Uint8ClampedArray(canvas.width * canvas.height * 4);
+          const existing = canvasBuffers.get(canvas);
+          const out = existing
+            ? new Uint8ClampedArray(existing.data)
+            : new Uint8ClampedArray(canvas.width * canvas.height * 4);
           for (let y = 0; y < dstH; y++) {
             for (let x = 0; x < dstW; x++) {
               const sampleX = Math.min(
@@ -151,10 +192,12 @@ function installCanvasAndImageHarness() {
               );
               const srcIdx = (sampleY * srcBuf.width + sampleX) * 4;
               const dstIdx = ((dstY + y) * canvas.width + (dstX + x)) * 4;
-              out[dstIdx] = srcBuf.data[srcIdx];
-              out[dstIdx + 1] = srcBuf.data[srcIdx + 1];
-              out[dstIdx + 2] = srcBuf.data[srcIdx + 2];
-              out[dstIdx + 3] = srcBuf.data[srcIdx + 3];
+              if (dstIdx >= 0 && dstIdx + 3 < out.length) {
+                out[dstIdx] = srcBuf.data[srcIdx];
+                out[dstIdx + 1] = srcBuf.data[srcIdx + 1];
+                out[dstIdx + 2] = srcBuf.data[srcIdx + 2];
+                out[dstIdx + 3] = srcBuf.data[srcIdx + 3];
+              }
             }
           }
           canvasBuffers.set(canvas, {
@@ -739,5 +782,259 @@ describe('PaletteWorkspace', () => {
     expect(
       screen.queryByRole('region', { name: /tone suggestion preview/i }),
     ).not.toBeInTheDocument();
+  });
+
+  it('deletes active and last recipes with confirmation, selects sensible neighbors, handles zero-recipe state, and keeps IDs noncolliding', async () => {
+    const user = userEvent.setup();
+    render(<PaletteWorkspace />);
+
+    // Import a reference image to verify it stays intact across recipe deletions
+    const img = createBitmapFixture(
+      'keep-ref.png',
+      'image/png',
+      16,
+      16,
+      () => [40, 80, 120],
+      registry,
+    );
+    fireEvent.change(screen.getByLabelText(/import reference images/i), {
+      target: { files: [img] },
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('reference-canvas')).toBeInTheDocument();
+    });
+
+    // Customize Recipe 1
+    const shadowHex1 = screen.getByLabelText(/shadow hex/i);
+    await user.clear(shadowHex1);
+    await user.type(shadowHex1, '112233');
+    await user.tab();
+
+    // Add Recipe 2 and Recipe 3
+    await user.click(screen.getByRole('button', { name: /add recipe/i }));
+    await user.click(screen.getByRole('button', { name: /add recipe/i }));
+    const shadowHex3 = screen.getByLabelText(/shadow hex/i);
+    await user.clear(shadowHex3);
+    await user.type(shadowHex3, '445566');
+    await user.tab();
+
+    // Select middle recipe (Recipe 2), open Delete confirmation, then cancel
+    await user.click(screen.getByRole('button', { name: /Recipe 2/i }));
+    await user.click(screen.getByRole('button', { name: /delete recipe/i }));
+    expect(
+      screen.getByRole('button', { name: /confirm delete/i }),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /cancel/i }));
+    expect(screen.getByLabelText(/recipe name/i)).toHaveValue('Recipe 2');
+
+    // Confirm delete of middle recipe -> next neighbor (Recipe 3) becomes active
+    await user.click(screen.getByRole('button', { name: /delete recipe/i }));
+    await user.click(screen.getByRole('button', { name: /confirm delete/i }));
+    expect(
+      screen.queryByRole('button', { name: /^Recipe 2$/i }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/recipe name/i)).toHaveValue('Recipe 3');
+    expect(screen.getByLabelText(/shadow hex/i)).toHaveValue('#445566');
+
+    // Delete last recipe (Recipe 3) -> previous neighbor (Recipe 1) becomes active
+    await user.click(screen.getByRole('button', { name: /delete recipe/i }));
+    await user.click(screen.getByRole('button', { name: /confirm delete/i }));
+    expect(
+      screen.queryByRole('button', { name: /^Recipe 3$/i }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/recipe name/i)).toHaveValue('Recipe 1');
+    expect(screen.getByLabelText(/shadow hex/i)).toHaveValue('#112233');
+
+    // Delete final remaining recipe -> graceful zero-recipe state, reference intact
+    await user.click(screen.getByRole('button', { name: /delete recipe/i }));
+    await user.click(screen.getByRole('button', { name: /confirm delete/i }));
+    expect(screen.queryByLabelText(/recipe name/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/no recipes yet/i)).toBeInTheDocument();
+    expect(screen.getByTestId('reference-canvas')).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /keep-ref\.png/i }),
+    ).toBeInTheDocument();
+
+    // Add recipe afterward -> noncolliding ID/name (Recipe 4)
+    await user.click(screen.getByRole('button', { name: /add recipe/i }));
+    expect(screen.getByLabelText(/recipe name/i)).toHaveValue('Recipe 4');
+    expect(screen.getByLabelText(/shadow hex/i)).toHaveValue('#2B303A');
+  });
+
+  it('supports zoom in/out, fit/reset, and source pixel-accurate eyedropper and selection under zoom and scroll', async () => {
+    const user = userEvent.setup();
+    render(<PaletteWorkspace />);
+
+    const img = createBitmapFixture(
+      'zoom-ref.png',
+      'image/png',
+      40,
+      40,
+      (x, y) => {
+        if (x === 25 && y === 10) return [18, 52, 86];
+        if (x >= 20 && y >= 20) {
+          if (y < 27) return [30, 15, 15];
+          if (y < 34) return [140, 40, 40];
+          return [240, 180, 180];
+        }
+        return [200, 200, 200];
+      },
+      registry,
+    );
+
+    fireEvent.change(screen.getByLabelText(/import reference images/i), {
+      target: { files: [img] },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('reference-canvas')).toBeInTheDocument();
+    });
+
+    const canvas = screen.getByTestId('reference-canvas') as HTMLCanvasElement;
+    const stage = screen.getByTestId('canvas-stage') as HTMLDivElement;
+
+    const zoomInBtn = screen.getByRole('button', { name: /zoom in/i });
+    const zoomOutBtn = screen.getByRole('button', { name: /zoom out/i });
+    const fitResetBtn = screen.getByRole('button', { name: /fit \/ reset/i });
+
+    expect(screen.getByTestId('zoom-readout')).toHaveTextContent(/fit/i);
+
+    // Zoom in twice (1.5x -> 2x) and verify scaled canvas dimensions
+    await user.click(zoomInBtn);
+    expect(screen.getByTestId('zoom-readout')).toHaveTextContent('150%');
+    expect(canvas.style.width).toBe('60px');
+
+    await user.click(zoomInBtn);
+    await user.click(zoomInBtn);
+    await user.click(zoomInBtn);
+    expect(screen.getByTestId('zoom-readout')).toHaveTextContent('400%');
+    expect(canvas.style.width).toBe('160px');
+    expect(canvas.style.height).toBe('160px');
+
+    // Simulate scrolled stage + zoomed bounding rect (40x40 at 400% = 160x160, scrolled by 50, 40)
+    stage.scrollLeft = 50;
+    stage.scrollTop = 40;
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+      left: -50,
+      top: -40,
+      width: 160,
+      height: 160,
+      right: 110,
+      bottom: 120,
+      x: -50,
+      y: -40,
+      toJSON: () => {},
+    });
+
+    // Target pixel (25, 10): (25.5 * 4 - 50) = 52, (10.5 * 4 - 40) = 2 -> #123456
+    fireEvent.pointerDown(canvas, { clientX: 52, clientY: 2 });
+    fireEvent.pointerUp(canvas, { clientX: 52, clientY: 2 });
+    expect(screen.getByLabelText(/shadow hex/i)).toHaveValue('#123456');
+
+    // Rectangle selection at zoom + scroll over bottom-right quadrant (20..39, 20..39)
+    // In viewport coords: (20*4 - 50) = 30, (20*4 - 40) = 40 to (39*4 - 50) = 106, (39*4 - 40) = 116
+    await user.click(screen.getByRole('button', { name: /select region/i }));
+    fireEvent.pointerDown(canvas, { clientX: 30, clientY: 40 });
+    fireEvent.pointerMove(canvas, { clientX: 106, clientY: 116 });
+    fireEvent.pointerUp(canvas, { clientX: 106, clientY: 116 });
+
+    await user.click(screen.getByRole('button', { name: /suggest tones/i }));
+    const preview = screen.getByRole('region', {
+      name: /tone suggestion preview/i,
+    });
+    expect(preview).toHaveTextContent('#1E0F0F');
+    expect(preview).toHaveTextContent('#8C2828');
+    expect(preview).toHaveTextContent('#F0B4B4');
+
+    // Zoom out and Fit / Reset restores Fit state and resets scroll
+    await user.click(zoomOutBtn);
+    expect(screen.getByTestId('zoom-readout')).toHaveTextContent('300%');
+
+    await user.click(fitResetBtn);
+    expect(screen.getByTestId('zoom-readout')).toHaveTextContent(/fit/i);
+    expect(canvas.style.width).toBe('');
+    expect(stage.scrollLeft).toBe(0);
+    expect(stage.scrollTop).toBe(0);
+  });
+
+  it('shows a live cursor magnifier with crosshair and source pixels during region selection, works at edges, and clears when leaving/switching tools', async () => {
+    const user = userEvent.setup();
+    render(<PaletteWorkspace />);
+
+    const img = createBitmapFixture(
+      'magnifier-ref.png',
+      'image/png',
+      20,
+      20,
+      (x, y) => {
+        if (x === 0 && y === 0) return [255, 0, 0];
+        if (x === 10 && y === 10) return [0, 255, 0];
+        return [30, 60, 90];
+      },
+      registry,
+    );
+
+    fireEvent.change(screen.getByLabelText(/import reference images/i), {
+      target: { files: [img] },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('reference-canvas')).toBeInTheDocument();
+    });
+
+    const canvas = screen.getByTestId('reference-canvas') as HTMLCanvasElement;
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 200,
+      height: 200,
+      right: 200,
+      bottom: 200,
+      x: 0,
+      y: 0,
+      toJSON: () => {},
+    });
+
+    // Not shown in Eyedropper mode
+    fireEvent.pointerMove(canvas, { clientX: 105, clientY: 105 });
+    expect(screen.queryByTestId('region-magnifier')).not.toBeInTheDocument();
+
+    // Switch to Select region -> moving pointer shows magnifier with crosshair and center pixel #00FF00
+    await user.click(screen.getByRole('button', { name: /select region/i }));
+    fireEvent.pointerMove(canvas, { clientX: 105, clientY: 105 });
+
+    const magnifier = screen.getByTestId('region-magnifier');
+    expect(magnifier).toBeInTheDocument();
+    expect(screen.getByTestId('magnifier-crosshair')).toBeInTheDocument();
+    expect(magnifier).toHaveTextContent('10, 10');
+    expect(magnifier).toHaveTextContent('#00FF00');
+
+    const magCanvas = screen.getByTestId(
+      'region-magnifier-canvas',
+    ) as HTMLCanvasElement;
+    const magCtx = magCanvas.getContext('2d')!;
+    const centerX = Math.floor(magCanvas.width / 2);
+    const centerY = Math.floor(magCanvas.height / 2);
+    const centerPixel = magCtx.getImageData(centerX, centerY, 1, 1).data;
+    expect([centerPixel[0], centerPixel[1], centerPixel[2]]).toEqual([0, 255, 0]);
+
+    // Edge usability at (0, 0): center pixel is #FF0000, top-left out-of-bounds is background #0F1F10
+    fireEvent.pointerMove(canvas, { clientX: 2, clientY: 2 });
+    expect(magnifier).toHaveTextContent('0, 0');
+    expect(magnifier).toHaveTextContent('#FF0000');
+    const edgeCenter = magCtx.getImageData(centerX, centerY, 1, 1).data;
+    expect([edgeCenter[0], edgeCenter[1], edgeCenter[2]]).toEqual([255, 0, 0]);
+    const oobPixel = magCtx.getImageData(0, 0, 1, 1).data;
+    expect([oobPixel[0], oobPixel[1], oobPixel[2]]).toEqual([15, 31, 16]);
+
+    // Does not intercept pointer drag selection
+    fireEvent.pointerDown(canvas, { clientX: 5, clientY: 5 });
+    fireEvent.pointerMove(canvas, { clientX: 105, clientY: 105 });
+    fireEvent.pointerUp(canvas, { clientX: 105, clientY: 105 });
+    expect(screen.getByRole('button', { name: /clear selection/i })).toBeInTheDocument();
+
+    // Switching back to Eyedropper clears magnifier
+    await user.click(screen.getByRole('button', { name: /eyedropper/i }));
+    expect(screen.queryByTestId('region-magnifier')).not.toBeInTheDocument();
   });
 });
