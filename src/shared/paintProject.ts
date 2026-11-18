@@ -1,3 +1,4 @@
+import type { GuideCallout } from './paintingGuide';
 import type { ModelOrientation, ModelSummary } from './workerProtocol';
 import type { PaintRecipe } from '../renderer/palette/types';
 import type { ShadowRegion } from '../renderer/paint/shadowPaint';
@@ -17,6 +18,7 @@ export interface ProjectSnapshot {
   highlight: number;
   applied: boolean;
   manual: boolean;
+  appliedLightKey?: string;
 }
 
 export interface ProjectState {
@@ -29,6 +31,7 @@ export interface ProjectState {
   activeRegionId: string | null;
   snapshots: ProjectSnapshot[];
   activeSnapshotId: string;
+  guideCallouts?: GuideCallout[];
 }
 
 export interface ProjectManifest extends ProjectState {

@@ -6,6 +6,7 @@ import { pipeline } from 'node:stream/promises';
 import { crc32 } from 'node:zlib';
 import * as yazl from 'yazl';
 import * as yauzl from 'yauzl';
+import { GUIDE_VIEWS } from '../shared/paintingGuide';
 import type { ProjectContents, ProjectManifest, ProjectState } from '../shared/paintProject';
 
 const MANIFEST = 'manifest.json';
@@ -63,9 +64,18 @@ function validateState(value: unknown): asserts value is ProjectState {
       typeof snapshot.name === 'string' && inRange(snapshot.azimuth, 0, 359) &&
       inRange(snapshot.elevation, -90, 90) && inRange(snapshot.midtone, 0, 100) &&
       inRange(snapshot.highlight, snapshot.midtone, 100) &&
-      typeof snapshot.applied === 'boolean' && typeof snapshot.manual === 'boolean') ||
+      typeof snapshot.applied === 'boolean' && typeof snapshot.manual === 'boolean' &&
+      (snapshot.appliedLightKey === undefined || typeof snapshot.appliedLightKey === 'string')) ||
       !nonemptyId(value.activeSnapshotId) || !validIdList(snapshots, value.activeSnapshotId)) {
     throw new Error('Invalid paint project lighting snapshots.');
+  }
+  if (value.guideCallouts !== undefined) {
+    const ids = new Set(regions.map(({ id }) => id));
+    if (!Array.isArray(value.guideCallouts) || !value.guideCallouts.every((callout) =>
+      isRecord(callout) && ids.has(callout.regionId) && GUIDE_VIEWS.some((view) => view === callout.view) &&
+      inRange(callout.x, 0, 1) && inRange(callout.y, 0, 1))) {
+      throw new Error('Invalid paint project guide callouts.');
+    }
   }
 }
 

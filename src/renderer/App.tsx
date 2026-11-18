@@ -10,6 +10,8 @@ import type {
 } from '../shared/workerProtocol';
 import { ALL_AXES, getOrthogonalFrontOptions } from './orientation';
 import { Viewport3D, type CameraPreset, type PickGenerationToken } from './components/Viewport3D';
+import PaintingGuideDialog from './guide/PaintingGuideDialog';
+import type { GuideCallout, GuideRow } from '../shared/paintingGuide';
 import type { OpenedProject } from '../shared/paintProject';
 import type { PaletteProjectHandle, PreparedPaletteProject } from './palette/paletteProject';
 import type { PaintRecipe } from './palette/types';
@@ -61,6 +63,12 @@ export default function App({
   const paletteProject = useRef<PaletteProjectHandle | null>(null);
   const pendingProject = useRef<{ project: OpenedProject; palette: PreparedPaletteProject } | null>(null);
   const projectMenu = useRef<HTMLDetailsElement | null>(null);
+  const [guideOpen, setGuideOpen] = useState(false);
+  const [guideCallouts, setGuideCallouts] = useState<GuideCallout[]>([]);
+  const guideRows = useMemo<GuideRow[]>(() => {
+    const palette = new Map(recipes.map((recipe) => [recipe.id, recipe.swatches]));
+    return shadow.regions.map((region) => ({ id: region.id, name: region.name, swatches: palette.get(region.recipeId) ?? null }));
+  }, [recipes, shadow.regions]);
   const [projectAction, setProjectAction] = useState<'open' | 'save' | null>(null);
   const [activeTab, setActiveTab] = useState<'model' | 'palette'>('model');
   const [model, setModel] = useState<ModelSummary | null>(null);
@@ -252,6 +260,7 @@ export default function App({
           activeRegionId: paint.activeRegionId,
           snapshots: snapshots.snapshots,
           activeSnapshotId: snapshots.activeSnapshotId,
+          guideCallouts,
         },
         referenceBytes: palette.referenceBytes,
         paint: paint.paint,
@@ -353,10 +362,12 @@ export default function App({
           const { state, paint, tones } = opened.project;
           setOrientation(state.orientation);
           setRecipes(state.recipes);
+          setGuideCallouts(state.guideCallouts ?? []);
           shadow.restoreProject(state, paint);
           lighting.restoreProject(state, tones);
           opened.palette.apply();
         } else {
+          setGuideCallouts([]);
           shadow.reset();
           lighting.reset();
         }
@@ -500,6 +511,15 @@ export default function App({
                 <button type="button" className="btn btn--secondary" disabled={isBusy || !model} onClick={saveProject}>
                   Save project
                 </button>
+                {api.exportPaintingGuide && (
+                  <button type="button" className="btn btn--secondary" disabled={isBusy || !model}
+                    onClick={() => {
+                      if (projectMenu.current) projectMenu.current.open = false;
+                      setGuideOpen(true);
+                    }}>
+                    Painting guide
+                  </button>
+                )}
               </div>
             </details>
           )}
@@ -798,6 +818,14 @@ export default function App({
           </section>
         </aside>
       </main>
+      {guideOpen && api && model && (
+        <PaintingGuideDialog
+          api={api} model={model} orientation={orientation} coverage={shadow.committedCoverage}
+          tones={lighting.committedMask} snapshot={lighting.snapshot.name.trim() || 'Untitled snapshot'}
+          rows={guideRows} callouts={guideCallouts} setCallouts={setGuideCallouts}
+          unapplied={lighting.unapplied} close={() => setGuideOpen(false)}
+        />
+      )}
     </div>
   );
 }

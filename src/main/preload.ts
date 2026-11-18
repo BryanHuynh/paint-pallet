@@ -31,6 +31,7 @@ const api: PaintPalletApi = {
   computeLightExposure: (request: ExposureRequest) => ipcRenderer.invoke('worker:light-exposure', request),
   cancelLightExposure: (jobId: string) => ipcRenderer.invoke('worker:cancel-light', jobId),
   saveProject: (request: ProjectSaveRequest) => ipcRenderer.invoke('project:save', request),
+  exportPaintingGuide: (guide) => ipcRenderer.invoke('guide:export', guide),
   openProject: () => ipcRenderer.invoke('project:open'),
   onImportProgress: (listener: (event: ImportProgressEvent) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, payload: ImportProgressEvent) => {

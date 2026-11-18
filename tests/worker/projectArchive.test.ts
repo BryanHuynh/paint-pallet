@@ -25,6 +25,7 @@ const fixture: ProjectContents = {
     snapshots: [{ id: 'snapshot-1', name: 'Studio light', azimuth: 40, elevation: 30,
       midtone: 35, highlight: 75, applied: true, manual: true }],
     activeSnapshotId: 'snapshot-1',
+    guideCallouts: [{ regionId: 'region-1', view: 'Front', x: 0.32, y: 0.79 }],
   },
   referenceBytes: ['#325487', '#b11023'].map((fill) => new TextEncoder().encode(
     '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1" fill="' + fill + '"/></svg>',

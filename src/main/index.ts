@@ -1,6 +1,8 @@
 import { app, BrowserWindow, dialog, ipcMain } from 'electron';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { savePaintingGuide } from './paintingGuide';
+import type { GuideExport } from '../shared/paintingGuide';
 import type { OpenedProject, ProjectContents, ProjectSaveRequest } from '../shared/paintProject';
 import { openProjectArchive, writeProjectArchive } from './projectArchive';
 import path from 'node:path';
@@ -305,6 +307,11 @@ app.whenReady().then(() => {
   ipcMain.handle('worker:cancel-light', async (_event, jobId: string) => {
     if (!activeLightingJobs.has(jobId)) return { canceled: false };
     return getWorkerClient().cancelImport(jobId);
+  });
+
+  ipcMain.handle('guide:export', (_event, guide: GuideExport) => {
+    if (!mainWindow || !loadedModelId) throw new Error('Open a model before exporting a painting guide.');
+    return savePaintingGuide(mainWindow, guide);
   });
 
   ipcMain.handle('project:save', async (_event, request: ProjectSaveRequest) => {

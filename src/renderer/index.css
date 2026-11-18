@@ -521,3 +521,87 @@ body,
   border: 1px solid var(--p-hairline);
   border-radius: var(--r-md);
 }
+
+.guide-dialog {
+  width: min(46rem, calc(100vw - 2rem));
+  max-height: calc(100dvh - 2rem);
+  padding: 1.25rem;
+  border: 1px solid #536359;
+  border-radius: 0.8rem;
+  background: #17241b;
+  color: #eef4ee;
+}
+
+.guide-dialog::backdrop { background: rgb(7 14 9 / 76%); }
+
+.guide-dialog__header,
+.guide-dialog__options,
+.guide-dialog__footer {
+  display: flex;
+  align-items: start;
+  gap: 0.8rem;
+}
+
+.guide-dialog__header { justify-content: space-between; }
+.guide-dialog__header h2 { margin: 0; }
+.guide-dialog__footer { justify-content: flex-end; margin-top: 1rem; }
+.guide-dialog__options { margin: 0.7rem 0; }
+.guide-dialog__options label { display: grid; gap: 0.35rem; font-size: 0.85rem; }
+.guide-dialog__options select { min-width: 5rem; padding: 0.35rem; }
+
+.guide-dialog__views {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.6rem;
+}
+
+.guide-dialog__views figure {
+  display: grid;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid #536359;
+  border-radius: 0.45rem;
+}
+
+.guide-dialog__views figcaption { text-align: center; padding: 0.4rem; font-size: 0.8rem; }
+.guide-dialog__view { position: relative; }
+
+.guide-dialog__image {
+  display: block;
+  border: 0;
+  width: 100%;
+  padding: 0;
+  background: white;
+  cursor: crosshair;
+}
+
+.guide-dialog__image img { display: block; width: 100%; }
+
+.guide-dialog__pin {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  min-width: 1.25rem;
+  height: 1.25rem;
+  padding: 0 0.18rem;
+  border: 1px solid white;
+  border-radius: 1rem;
+  background: #28463b;
+  color: white;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.guide-dialog__warnings {
+  padding: 0.65rem 0.8rem;
+  margin-top: 0.8rem;
+  border-radius: 0.4rem;
+  background: #40361e;
+  color: #fff0c6;
+  font-size: 0.85rem;
+}
+
+.guide-dialog__warnings p { margin: 0 0 0.4rem; }
+
+@media (max-width: 640px) {
+  .guide-dialog__views { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

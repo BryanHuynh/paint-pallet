@@ -1,5 +1,7 @@
 import type { OpenedProject, ProjectSaveRequest } from './paintProject';
 
+import type { GuideExport } from './paintingGuide';
+
 export type Vec3 = [number, number, number];
 
 export interface Bounds3 {
@@ -94,6 +96,7 @@ export interface PaintPalletApi {
   computeLightExposure?: (request: ExposureRequest) => Promise<Float32Array>;
   cancelLightExposure?: (jobId: string) => Promise<{ canceled: boolean }>;
   saveProject?: (request: ProjectSaveRequest) => Promise<boolean>;
+  exportPaintingGuide?: (guide: GuideExport) => Promise<boolean>;
   openProject?: () => Promise<OpenedProject | null>;
   onImportProgress: (listener: (event: ImportProgressEvent) => void) => () => void;
 }

@@ -16,6 +16,7 @@ interface ExposureResult {
 interface AppliedLighting {
   mask: ToneMask;
   manual: boolean;
+  lightKey: string;
 }
 
 interface LightingHistory {
@@ -51,6 +52,10 @@ const initialSnapshots = (): SnapshotState => ({
   items: [{ id: 'snapshot-1', name: 'Snapshot 1', settings: initialSettings(), history: emptyHistory() }],
 });
 
+function appliedLightKey(settings: LightSettings, orientation: ModelOrientation) {
+  return JSON.stringify([settings.azimuth, settings.elevation, settings.midtone, settings.highlight, orientation.upright, orientation.front]);
+}
+
 function localLightDirection(azimuth: number, elevation: number, orientation: ModelOrientation): Vec3 {
   const az = azimuth * Math.PI / 180;
   const el = elevation * Math.PI / 180;
@@ -82,6 +87,7 @@ export function useSurfaceLighting(
     azimuth, elevation, orientation,
   ]);
   const key = JSON.stringify([modelId, direction]);
+  const lightKey = appliedLightKey(snapshot.settings, orientation);
   const ready = result?.key === key ? result : null;
   const hasShadow = shadow.size !== 0;
 
@@ -179,7 +185,7 @@ export function useSurfaceLighting(
       setConfirming(true);
       return;
     }
-    commit({ mask: draft.mask, manual: false });
+    commit({ mask: draft.mask, manual: false, lightKey });
     setPreviewing(false);
     setConfirming(false);
   }
@@ -205,7 +211,8 @@ export function useSurfaceLighting(
     const stroke = strokeRef.current;
     if (!stroke) return;
     strokeRef.current = null;
-    if (keep && stroke.mask !== stroke.start) commit({ mask: stroke.mask, manual: true });
+    const current = currentHistory().current;
+    if (keep && current && stroke.mask !== stroke.start) commit({ ...current, mask: stroke.mask, manual: true });
     setBrushDraft(null);
   }
 
@@ -238,9 +245,9 @@ export function useSurfaceLighting(
 
   function restoreProject(state: ProjectState, tones: Uint32Array[]) {
     reset();
-    const items = state.snapshots.map(({ id, name, azimuth, elevation, midtone, highlight, applied, manual }, index) => ({
+    const items = state.snapshots.map(({ id, name, azimuth, elevation, midtone, highlight, applied, manual, appliedLightKey: savedKey }, index) => ({
       id, name, settings: { azimuth, elevation, midtone, highlight },
-      history: { ...emptyHistory(), current: applied ? { mask: unpackToneMask(tones[index], state.regions), manual } : null },
+      history: { ...emptyHistory(), current: applied ? { mask: unpackToneMask(tones[index], state.regions), manual, lightKey: savedKey ?? appliedLightKey({ azimuth, elevation, midtone, highlight }, state.orientation) } : null },
     }));
     writeSnapshots({ activeId: state.activeSnapshotId, items });
     nextSnapshotNumber.current = Math.max(0, ...items.map((item) => Number(item.id.replace(/^snapshot-/, '')) || 0)) + 1;
@@ -265,6 +272,8 @@ export function useSurfaceLighting(
     draft,
     mask: brushDraft ?? (applied?.manual ? applied.mask : draft?.mask ?? applied?.mask) ?? NO_MASK,
     applied: Boolean(applied),
+    committedMask: applied?.mask ?? NO_MASK,
+    unapplied: hasShadow && (!applied || applied.lightKey !== lightKey),
     manual: Boolean(applied?.manual),
     confirming,
     brushTool,
@@ -292,6 +301,7 @@ export function useSurfaceLighting(
         activeSnapshotId: snapshots.activeId,
         snapshots: snapshots.items.map(({ id, name, settings, history }) => ({
           id, name, ...settings, applied: Boolean(history.current), manual: Boolean(history.current?.manual),
+          appliedLightKey: history.current?.lightKey,
         })),
         tones: snapshots.items.map(({ history }) => packToneMask(history.current?.mask ?? NO_MASK, regions)),
       };
