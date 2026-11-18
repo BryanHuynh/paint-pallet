@@ -445,4 +445,25 @@ describe('UI import-orbit-orientation actions', () => {
     controls.dispose();
     canvas.remove();
   });
+
+  it('renders the bundled Paint Pallet brand logo in the header on both workspace tabs', () => {
+    const api = createMockApi();
+    const StubPalette = () => <div>Palette Stub</div>;
+    const { container } = render(
+      <App api={api} PaletteWorkspaceComponent={StubPalette} disableWebGL />,
+    );
+
+    const getLogoImg = () => container.querySelector('header.workbench-header img.brand-mark');
+    const logo = getLogoImg();
+    expect(logo).not.toBeNull();
+    expect(logo).toHaveAttribute('alt', '');
+    expect(logo).toHaveAttribute('aria-hidden', 'true');
+    expect(logo?.getAttribute('src')).toMatch(/paint-pallet-logo\.png/);
+    expect(screen.getByRole('heading', { name: 'Paint Pallet' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Palette' }));
+    expect(screen.getByText('Palette Stub')).toBeInTheDocument();
+    expect(getLogoImg()).toBeInTheDocument();
+    expect(getLogoImg()?.getAttribute('src')).toMatch(/paint-pallet-logo\.png/);
+  });
 });

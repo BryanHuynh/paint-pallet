@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain } from 'electron';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { WorkerClient, readBatchBinary } from './workerClient';
 import type { ModelSummary, Vec3 } from '../shared/workerProtocol';
@@ -47,7 +48,28 @@ function getWorkerClient(): WorkerClient {
   return workerClient;
 }
 
+function resolveAppIconPath(): string | undefined {
+  const iconFileName =
+    process.platform === 'win32'
+      ? 'paint-pallet-logo.ico'
+      : 'paint-pallet-logo.png';
+  const resourcesPath = (process as unknown as { resourcesPath?: string }).resourcesPath;
+  const candidates = [
+    resourcesPath ? path.join(resourcesPath, iconFileName) : null,
+    path.resolve(app.getAppPath(), 'assets', iconFileName),
+    path.resolve(process.cwd(), 'assets', iconFileName),
+  ];
+
+  for (const candidate of candidates) {
+    if (candidate && fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
 function createWindow(): void {
+  const iconPath = resolveAppIconPath();
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -55,6 +77,7 @@ function createWindow(): void {
     minHeight: 640,
     backgroundColor: '#0f1f10',
     title: 'Paint Pallet',
+    ...(iconPath ? { icon: iconPath } : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,

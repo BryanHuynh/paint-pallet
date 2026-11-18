@@ -10,6 +10,7 @@ import type {
 } from '../shared/workerProtocol';
 import { ALL_AXES, getOrthogonalFrontOptions } from './orientation';
 import { Viewport3D, type CameraPreset, type PickGenerationToken } from './components/Viewport3D';
+import appLogoUrl from '../../assets/paint-pallet-logo.png';
 
 type PaletteComponent = React.ComponentType<Record<string, unknown>>;
 
@@ -285,9 +286,15 @@ export default function App({
 
       <header className="workbench-header">
         <div className="brand-group">
-          <span className="brand-mark" aria-hidden="true">
-            P
-          </span>
+          <img
+            className="brand-mark"
+            src={appLogoUrl}
+            alt=""
+            aria-hidden="true"
+            width={36}
+            height={36}
+            decoding="async"
+          />
           <h1 className="brand-title">Paint Pallet</h1>
         </div>
 
