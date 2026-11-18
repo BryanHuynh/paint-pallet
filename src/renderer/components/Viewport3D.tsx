@@ -183,6 +183,7 @@ export function Viewport3D({
         ((e.clientX - rect.left) / rect.width) * 2 - 1,
         -((e.clientY - rect.top) / rect.height) * 2 + 1,
       );
+      camera.updateMatrixWorld(true);
       const raycaster = new THREE.Raycaster();
       raycaster.setFromCamera(ndc, camera);
 
@@ -362,6 +363,7 @@ export function Viewport3D({
         break;
     }
     refs.controls.update();
+    refs.camera.updateMatrixWorld(true);
   }, [cameraPresetRequest]);
 
   return (

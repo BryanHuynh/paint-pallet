@@ -1,25 +1,28 @@
 .workspace {
-  --pp-bg: #f6f5f2;
-  --pp-surface: #ffffff;
-  --pp-surface-alt: #eeece7;
-  --pp-ink: #161615;
-  --pp-muted: #52514c;
-  --pp-line: rgba(22, 22, 21, 0.14);
-  --pp-line-strong: rgba(22, 22, 21, 0.28);
-  --pp-accent: #1d4ed8;
-  --pp-accent-hover: #1e40af;
-  --pp-accent-soft: rgba(29, 78, 216, 0.08);
-  --pp-danger: #b91c1c;
-  --pp-r-lg: 16px;
-  --pp-r-md: 10px;
-  --pp-r-sm: 6px;
+  --pp-bg: var(--p-bg, #0f1f10);
+  --pp-surface: var(--p-surface, #162a17);
+  --pp-surface-alt: var(--p-surface-elevated, #1c351e);
+  --pp-ink: var(--p-ink, #ffffff);
+  --pp-muted: var(--p-muted, #9aa39a);
+  --pp-line: var(--p-hairline, rgba(255, 255, 255, 0.14));
+  --pp-line-strong: rgba(255, 255, 255, 0.28);
+  --pp-accent: var(--p-action, #c6f19d);
+  --pp-accent-hover: #d5f5b6;
+  --pp-accent-ink: var(--p-action-ink, #0f1f10);
+  --pp-accent-soft: rgba(198, 241, 157, 0.12);
+  --pp-danger: var(--p-danger, #f28b82);
+  --pp-r-lg: var(--r-lg, 8px);
+  --pp-r-md: var(--r-md, 6px);
+  --pp-r-sm: var(--r-sm, 4px);
   --pp-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
 
-  min-height: 100vh;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   background: var(--pp-bg);
   color: var(--pp-ink);
-  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
-  font-size: 16px;
+  font-family: var(--font-text, 'Host Grotesk', 'Segoe UI', system-ui, sans-serif);
+  font-size: 15px;
   line-height: 1.5;
   padding: 24px;
   box-sizing: border-box;
@@ -144,7 +147,7 @@
 
 .btnPrimary {
   background: var(--pp-accent);
-  color: #ffffff;
+  color: var(--pp-accent-ink);
 }
 
 .btnPrimary:hover:not(:disabled) {
@@ -157,13 +160,13 @@
 }
 
 .btnSecondary {
-  background: var(--pp-surface);
+  background: var(--pp-surface-alt);
   color: var(--pp-ink);
   border-color: var(--pp-line-strong);
 }
 
 .btnSecondary:hover:not(:disabled) {
-  background: var(--pp-surface-alt);
+  background: var(--pp-surface);
   border-color: var(--pp-ink);
   transform: translateY(-1px);
 }
@@ -173,9 +176,9 @@
 }
 
 .btnSecondary[aria-pressed='true'] {
-  background: var(--pp-ink);
-  color: #ffffff;
-  border-color: var(--pp-ink);
+  background: var(--pp-accent);
+  color: var(--pp-accent-ink);
+  border-color: var(--pp-accent);
 }
 
 .btn:disabled {
@@ -191,7 +194,7 @@
   padding: 0 16px;
   border-radius: var(--pp-r-sm);
   background: var(--pp-accent);
-  color: #ffffff;
+  color: var(--pp-accent-ink);
   font-size: 15px;
   font-weight: 500;
   cursor: pointer;
@@ -233,9 +236,9 @@
 }
 
 .recipeTab[aria-pressed='true'] {
-  background: var(--pp-ink);
-  color: #ffffff;
-  border-color: var(--pp-ink);
+  background: var(--pp-accent);
+  color: var(--pp-accent-ink);
+  border-color: var(--pp-accent);
 }
 
 .field {
@@ -316,7 +319,7 @@
 .toneBtn[aria-pressed='true'] {
   border-color: var(--pp-accent);
   background: var(--pp-accent);
-  color: #ffffff;
+  color: var(--pp-accent-ink);
 }
 
 .swatchChip {
@@ -333,9 +336,9 @@
   padding: 6px 10px;
   border-radius: var(--pp-r-sm);
   border: 1px solid var(--pp-line-strong);
-  background: var(--pp-surface);
+  background: var(--pp-bg);
   color: var(--pp-ink);
-  font-family: ui-monospace, 'Cascadia Mono', 'Consolas', monospace;
+  font-family: var(--font-mono, 'JetBrains Mono', 'Cascadia Code', Consolas, monospace);
   font-size: 14px;
 }
 
@@ -371,7 +374,7 @@
 .selectionOverlay {
   position: absolute;
   border: 2px solid var(--pp-accent);
-  background: rgba(29, 78, 216, 0.16);
+  background: rgba(198, 241, 157, 0.18);
   pointer-events: none;
 }
 
@@ -434,8 +437,8 @@
   padding: 10px 12px;
   border-radius: var(--pp-r-sm);
   border: 1px solid var(--pp-danger);
-  background: rgba(185, 28, 28, 0.08);
-  color: var(--pp-danger);
+  background: #2b1716;
+  color: #ffd8d6;
   font-size: 14px;
 }
 

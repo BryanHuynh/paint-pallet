@@ -685,7 +685,14 @@ ImportOutcome importBinaryStl(
       }
 
       int32_t sbIdx = activeCellSubBatch[cellIdx];
-      if (sbIdx < 0 || subBatches[sbIdx]->count >= kMaxTrianglesPerBatch) {
+      if (sbIdx >= 0 && subBatches[sbIdx]->count >= kMaxTrianglesPerBatch) {
+        if (!subBatches[sbIdx]->flush()) {
+          return failOrCancel(false, "Failed flushing spatial batch temp file");
+        }
+        subBatches[sbIdx]->close();
+        sbIdx = -1;
+      }
+      if (sbIdx < 0) {
         sbIdx = allocateSubBatch();
         activeCellSubBatch[cellIdx] = sbIdx;
       }

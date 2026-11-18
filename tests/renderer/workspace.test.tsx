@@ -154,6 +154,26 @@ describe('UI import-orbit-orientation actions', () => {
     expect(screen.getByRole('button', { name: /palette count: 1/i })).toBeInTheDocument();
   });
 
+  it('mounts the real PaletteWorkspace in the palette outlet and preserves recipe state across tab switches', () => {
+    const api = createMockApi();
+    render(<App api={api} disableWebGL />);
+
+    const paletteTab = screen.getByRole('tab', { name: /palette/i });
+    fireEvent.click(paletteTab);
+
+    expect(screen.getByTestId('palette-host')).not.toHaveAttribute('hidden');
+    const recipeNameInput = screen.getByLabelText(/recipe name/i) as HTMLInputElement;
+    fireEvent.change(recipeNameInput, { target: { value: 'NMM Gold Trim' } });
+    expect(recipeNameInput.value).toBe('NMM Gold Trim');
+
+    fireEvent.click(screen.getByRole('tab', { name: /model/i }));
+    expect(screen.getByTestId('palette-host')).toHaveAttribute('hidden');
+
+    fireEvent.click(paletteTab);
+    expect(screen.getByTestId('palette-host')).not.toHaveAttribute('hidden');
+    expect((screen.getByLabelText(/recipe name/i) as HTMLInputElement).value).toBe('NMM Gold Trim');
+  });
+
   it('keeps previous model open and shows rollback alert when readBatch fails or swap is canceled', async () => {
     const firstModel: ModelSummary = {
       modelId: 'model_first',

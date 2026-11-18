@@ -152,6 +152,7 @@ export default function App({
   const handlePendingModelCommit = useCallback((committed: ModelSummary) => {
     setModel(committed);
     setPendingModel(null);
+    setProgress(null);
     setPickResult(null);
   }, []);
 
