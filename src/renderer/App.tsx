@@ -1051,6 +1051,11 @@ export default function App({
               >
                 Right view
               </button>
+              {parts.length > 1 && (
+                <button type="button" className="btn btn--secondary btn--small" onClick={() => triggerCameraPreset('focus')}>
+                  Fit selected part
+                </button>
+              )}
               {assembly.draft && (['back', 'bottom', 'left'] as const).map((preset) => (
                 <button type="button" key={preset} className="btn btn--secondary btn--small" onClick={() => triggerCameraPreset(preset)}>
                   {preset[0].toUpperCase() + preset.slice(1)} view

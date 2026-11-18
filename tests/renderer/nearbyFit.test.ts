@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { IDENTITY_PART_POSE } from '../../src/shared/kit';
+import { selectNearbyCandidate } from '../../src/renderer/kit/findNearbyFit';
 import { solveNearbyFit } from '../../src/renderer/kit/nearbyFit';
 
 const corners = [
@@ -29,6 +30,14 @@ describe('nearby mating surfaces', () => {
     });
     expect(fit?.support).toBeGreaterThan(15);
     expect(fit?.pose.translation.every((position) => Math.abs(position) < 0.014)).toBe(true);
+  });
+
+  it('rejects competing candidate parents with similar support', () => {
+    const fit = { pose: IDENTITY_PART_POSE, point: [0, 0, 0] as [number, number, number], support: 30 };
+    expect(selectNearbyCandidate([{ ...fit, parentId: 'left', quality: 0.7 },
+      { ...fit, parentId: 'right', quality: 0.67 }])).toEqual({ kind: 'ambiguous' });
+    expect(selectNearbyCandidate([{ ...fit, parentId: 'left', quality: 0.7 },
+      { ...fit, parentId: 'right', quality: 0.4 }])).toMatchObject({ kind: 'fit', best: { parentId: 'left' } });
   });
 
   it('rejects a distant fit and the unconstrained slide of a planar match', () => {

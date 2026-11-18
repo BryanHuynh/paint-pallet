@@ -16,7 +16,7 @@ import type { ShadowCoverage, SurfaceFace } from '../paint/shadowPaint';
 import { SurfaceBrush } from '../paint/surfaceBrush';
 import { SurfaceBrushPreview } from '../paint/surfaceBrushPreview';
 
-export type CameraPreset = 'reset' | 'front' | 'back' | 'top' | 'bottom' | 'right' | 'left';
+export type CameraPreset = 'reset' | 'focus' | 'front' | 'back' | 'top' | 'bottom' | 'right' | 'left';
 
 export interface PickGenerationToken {
   modelId: string;
@@ -1047,8 +1047,18 @@ export function Viewport3D({
 
     const r = refs.radius;
     const targetY = r * 0.5;
+    const approach = refs.camera.position.clone().sub(refs.controls.target).normalize();
     refs.controls.target.set(0, targetY, 0);
     switch (cameraPresetRequest.preset) {
+      case 'focus': {
+        if (!model) break;
+        const bounds = new THREE.Box3(new THREE.Vector3(...model.bounds.min), new THREE.Vector3(...model.bounds.max));
+        const target = refs.surfaceGroup.localToWorld(bounds.getCenter(new THREE.Vector3()));
+        const radius = Math.max(0.5, bounds.getSize(new THREE.Vector3()).length() * 0.5);
+        refs.controls.target.copy(target);
+        refs.camera.position.copy(target).addScaledVector(approach, radius * 2.4);
+        break;
+      }
       case 'front':
         refs.camera.position.set(0, targetY, r * 2.4);
         break;
