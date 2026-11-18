@@ -222,14 +222,19 @@ std::string SurfaceLighting::writeExposure(
   if (!prepare(layout, key.str(), canceled) || !trace(normalized, canceled) ||
       canceled.load(std::memory_order_relaxed)) return {};
 
+  return writeExposureFile(model, jobId, exposure_, canceled);
+}
+
+std::string writeExposureFile(const ModelRecord& model, const std::string& jobId,
+    const std::vector<float>& scores, const std::atomic<bool>& canceled) {
   const auto path = std::filesystem::u8path(model.jobDir) / ("exposure-" + jobId + ".bin");
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   if (!out) throw std::runtime_error("Could not write the exposure preview.");
   constexpr size_t chunkFaces = 65536;
-  for (size_t offset = 0; offset < exposure_.size(); offset += chunkFaces) {
+  for (size_t offset = 0; offset < scores.size(); offset += chunkFaces) {
     if (canceled.load(std::memory_order_relaxed)) break;
-    const size_t count = std::min(chunkFaces, exposure_.size() - offset);
-    out.write(reinterpret_cast<const char*>(exposure_.data() + offset), count * sizeof(float));
+    const size_t count = std::min(chunkFaces, scores.size() - offset);
+    out.write(reinterpret_cast<const char*>(scores.data() + offset), count * sizeof(float));
   }
   out.close();
   if (!out || canceled.load(std::memory_order_relaxed)) {

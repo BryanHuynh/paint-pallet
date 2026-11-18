@@ -10,6 +10,9 @@
 
 namespace pp {
 
+std::string writeExposureFile(const ModelRecord& model, const std::string& jobId,
+    const std::vector<float>& scores, const std::atomic<bool>& canceled);
+
 struct LightingPart {
   const ModelRecord* model;
   uint32_t faceOffset = 0;

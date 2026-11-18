@@ -21,6 +21,17 @@ add_executable(paint_pallet_worker
 target_link_libraries(paint_pallet_worker PRIVATE meshoptimizer)
 
 if(WIN32)
+  find_program(PAINT_PALLET_DXC NAMES dxc HINTS "$ENV{WindowsSdkVerBinPath}/x64" REQUIRED)
+  set(EXPOSURE_SHADER "${CMAKE_CURRENT_BINARY_DIR}/exposure_shader.h")
+  add_custom_command(OUTPUT "${EXPOSURE_SHADER}"
+    COMMAND "${PAINT_PALLET_DXC}" -T cs_6_5 -E main -O3
+      -Fh "${EXPOSURE_SHADER}" -Vn g_exposureShader "${CMAKE_CURRENT_SOURCE_DIR}/src/exposure.hlsl"
+    DEPENDS src/exposure.hlsl
+    VERBATIM
+  )
+  target_sources(paint_pallet_worker PRIVATE src/dxr_lighting.cpp "${EXPOSURE_SHADER}")
+  target_include_directories(paint_pallet_worker PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+  target_link_libraries(paint_pallet_worker PRIVATE d3d12 dxgi)
   set(PAINT_PALLET_EMBREE_ROOT "" CACHE PATH "Pinned Embree Windows SDK")
   target_include_directories(paint_pallet_worker PRIVATE "${PAINT_PALLET_EMBREE_ROOT}/include")
   target_link_libraries(paint_pallet_worker PRIVATE "${PAINT_PALLET_EMBREE_ROOT}/lib/embree4.lib")

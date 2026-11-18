@@ -147,7 +147,7 @@ export class WorkerClient {
       } else if (msg.type === 'fill_error' || msg.type === 'fill_canceled') {
         entry.reject(new Error(String(msg.error ?? 'Fill canceled')));
       } else if (msg.type === 'light_complete') {
-        entry.resolve(msg.filePath);
+        entry.resolve(msg);
       } else if (msg.type === 'light_error' || msg.type === 'light_canceled') {
         entry.reject(new Error(String(msg.error ?? 'Lighting canceled')));
       } else if (msg.type === 'active_model') {
@@ -319,14 +319,14 @@ export class WorkerClient {
   async computeLightExposure(request: ExposureRequest): Promise<Float32Array> {
     if (!SAFE_JOB_ID_RE.test(request.jobId)) throw new Error('Invalid lighting job ID');
     const { parts, ...query } = request;
-    const filePath = await this.sendRequest<string>({
+    const result = await this.sendRequest<{ filePath: string }>({
       cmd: 'light_exposure', ...query,
       ...(parts?.length ? {
         exposureModels: parts.map((part) => part.modelId).join(','),
         exposurePoses: parts.flatMap((part) => [part.faceOffset, ...part.pose.translation, ...part.pose.rotation]),
       } : {}),
     });
-    return new Float32Array(await this.readAnalysisResult(filePath, `exposure-${request.jobId}.bin`, 4));
+    return new Float32Array(await this.readAnalysisResult(result.filePath, `exposure-${request.jobId}.bin`, 4));
   }
 
   private async readAnalysisResult(filePath: string, expectedName: string, stride: number): Promise<ArrayBuffer> {

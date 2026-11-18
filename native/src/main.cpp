@@ -2,6 +2,8 @@
 #include "stl_importer.hpp"
 #include "surface_topology.hpp"
 #include "surface_lighting.hpp"
+#include "dxr_lighting.hpp"
+#include <chrono>
 
 #include <atomic>
 #include <cctype>
@@ -110,6 +112,7 @@ struct WorkerState {
   pp::PickBatchCache pickCache{16};
   pp::SurfaceTopology topology;
   pp::SurfaceLighting lighting;
+  pp::DxrLighting dxr;
 };
 
 }  // namespace
@@ -202,6 +205,7 @@ int main() {
                 state.pickCache.clear();
                 state.topology.clear();
                 state.lighting.clear();
+                state.dxr.clear();
               }
               state.models[outcome.model.modelId] = outcome.model;
             }
@@ -249,6 +253,7 @@ int main() {
             state.pickCache.clear();
             state.topology.clear();
             state.lighting.clear();
+            state.dxr.clear();
             committed = true;
           }
         }
@@ -392,11 +397,37 @@ int main() {
               if (ranges[i - 1].second > ranges[i].first) throw std::runtime_error("Overlapping part face addresses.");
             }
           }
-          const std::string filePath = state.lighting.writeExposure(model->second, jobId, vector, *job.cancelFlag, parts);
+          const auto option = pp::extractJsonString(line, "exposureBackend").value_or("auto");
+          const auto start = std::chrono::steady_clock::now();
+          std::string backend = "cpu", fallback, filePath;
+          pp::DxrTimings timing;
+          // Local comparisons showed a clear end-to-end benefit at reference-model scale.
+          constexpr uint32_t referenceScale = 8000000;
+          const bool wantsDxr = option == "auto" ? model->second.triangleCount >= referenceScale : option != "cpu";
+          if (wantsDxr && parts.empty()) {
+            try {
+              std::vector<float> scores;
+              if (state.dxr.compute(model->second, vector, *job.cancelFlag, option, scores, timing)) {
+                filePath = pp::writeExposureFile(model->second, jobId, scores, *job.cancelFlag);
+                backend = "dxr";
+              }
+            } catch (const std::exception& failure) {
+              state.dxr.clear();
+              fallback = failure.what();
+            }
+          }
+          if (backend == "cpu" && !job.cancelFlag->load(std::memory_order_relaxed)) {
+            filePath = state.lighting.writeExposure(model->second, jobId, vector, *job.cancelFlag, parts);
+          }
+          const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
           if (filePath.empty()) {
             emitLine("{\"type\":\"light_canceled" + prefix + "}");
           } else {
-            emitLine("{\"type\":\"light_complete" + prefix + ",\"filePath\":\"" + pp::jsonEscape(filePath) + "\"}");
+            emitLine("{\"type\":\"light_complete" + prefix + ",\"filePath\":\"" + pp::jsonEscape(filePath) +
+                     "\",\"backend\":\"" + backend + "\",\"fallback\":\"" + pp::jsonEscape(fallback) +
+                     "\",\"nativeMs\":" + std::to_string(elapsed) + ",\"setupMs\":" + std::to_string(timing.setupMs) +
+                     ",\"dispatchMs\":" + std::to_string(timing.dispatchMs) + ",\"readbackMs\":" + std::to_string(timing.readbackMs) +
+                     ",\"peakDedicatedBytes\":" + std::to_string(timing.peakDedicatedBytes) + ",\"budget\":" + std::to_string(timing.budget) + "}");
           }
         } catch (const std::exception& error) {
           emitLine("{\"type\":\"light_error" + prefix + ",\"error\":\"" + pp::jsonEscape(error.what()) + "\"}");
