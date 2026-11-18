@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { GUIDE_PASSES, GUIDE_VIEWS, type GuideExport, type GuidePass } from '../shared/paintingGuide';
+import { GUIDE_PASSES, GUIDE_VIEWS, type GuideExport, type GuideImages, type GuidePass } from '../shared/paintingGuide';
 
 function escapeText(value: string) {
   return value.replace(/[&<>"']/g, (character) => (
@@ -14,14 +14,37 @@ function escapeText(value: string) {
 const validHex = /^#[a-f0-9]{6}$/i;
 const label = (pass: GuidePass) => pass === 'edge' ? 'Edge highlight' : pass[0].toUpperCase() + pass.slice(1);
 
+function imagePasses(images: GuideImages | undefined): GuidePass[] {
+  return images?.edge ? [...GUIDE_PASSES, 'edge'] : [...GUIDE_PASSES];
+}
+
+function validImages(images: GuideImages | undefined) {
+  return imagePasses(images).every((pass) => {
+    const views = images?.[pass];
+    return Array.isArray(views) && views.length === GUIDE_VIEWS.length &&
+      views.every((image) => /^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(image));
+  });
+}
+
+function validPosition(value: number) {
+  return Number.isFinite(value) && value >= 0 && value <= 1;
+}
+
+function guidePin(x: number, y: number, number: number) {
+  return '<span class="pin number" style="left:' + (x * 100) + '%;top:' + (y * 100) + '%">' + number + '</span>';
+}
+
 export function renderGuideDocument(guide: GuideExport) {
-  const passes: GuidePass[] = [...GUIDE_PASSES];
-  if (guide.images?.edge) passes.push('edge');
+  const passes = imagePasses(guide.images);
   if ((guide.paper !== 'Letter' && guide.paper !== 'A4') ||
       typeof guide.modelName !== 'string' || typeof guide.snapshot !== 'string' ||
       !Array.isArray(guide.rows) || !Array.isArray(guide.callouts) ||
-      !passes.every((pass) => guide.images?.[pass]?.length === GUIDE_VIEWS.length &&
-        guide.images[pass]!.every((image) => /^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(image)))) {
+      !validImages(guide.images) ||
+      (guide.isolatedSheets !== undefined && (!Array.isArray(guide.isolatedSheets) ||
+        !guide.isolatedSheets.every((sheet) => typeof sheet.partName === 'string' && validImages(sheet.images)))) ||
+      (guide.installation !== undefined && (!Array.isArray(guide.installation) ||
+        !guide.installation.every((step) => [step.incoming, step.parent, step.note].every((value) => typeof value === 'string') &&
+          GUIDE_VIEWS.includes(step.view) && validPosition(step.x) && validPosition(step.y))))) {
     throw new Error('The painting guide is missing printable views.');
   }
 
@@ -45,22 +68,35 @@ export function renderGuideDocument(guide: GuideExport) {
     '<h2>Paint recipes by region</h2><table><thead><tr><th scope="col">Region</th>' + heads.join('') +
     '</tr></thead><tbody>' + swatches.join('') + '</tbody></table></section>';
 
-  const sheets = passes.map((pass) => {
-    const views = GUIDE_VIEWS.map((view, index) => {
-      const pins = guide.callouts.flatMap((callout) => {
-        const row = guide.rows.findIndex((item) => item.id === callout.regionId);
-        if (callout.view !== view || row < 0 || !Number.isFinite(callout.x) || !Number.isFinite(callout.y) ||
-            callout.x < 0 || callout.x > 1 || callout.y < 0 || callout.y > 1) return [];
-        return '<span class="pin number" style="left:' + (callout.x * 100) + '%;top:' + (callout.y * 100) +
-          '%">' + (row + 1) + '</span>';
+  function paintSheets(images: GuideImages, partName?: string) {
+    return imagePasses(images).map((pass) => {
+      const views = GUIDE_VIEWS.map((view, index) => {
+        const pins = partName ? [] : guide.callouts.flatMap((callout) => {
+          const row = guide.rows.findIndex((item) => item.id === callout.regionId);
+          if (callout.view !== view || row < 0 || !validPosition(callout.x) || !validPosition(callout.y)) return [];
+          return guidePin(callout.x, callout.y, row + 1);
+        });
+        return '<figure><figcaption>' + view + '</figcaption><div class="view"><img src="' +
+          images[pass]![index] + '" alt="">' + pins.join('') + '</div></figure>';
       });
-      return '<figure><figcaption>' + view + '</figcaption><div class="view"><img src="' +
-        guide.images[pass]![index] + '" alt="">' + pins.join('') + '</div></figure>';
-    });
-    return '<section class="pass"><h1>' + label(pass) + '</h1>' + description +
-      '<p class="legend">Gray shows surfaces outside this pass. Callout numbers match the recipe table.</p>' +
-      '<div class="views">' + views.join('') + '</div></section>';
-  });
+      const heading = partName ? escapeText(partName) + ' · ' + label(pass) : label(pass);
+      const legend = partName ? 'Isolated part view. Gray shows surfaces outside this pass.' :
+        'Gray shows surfaces outside this pass. Callout numbers match the recipe table.';
+      return '<section class="pass"><h1>' + heading + '</h1>' + description +
+        '<p class="legend">' + legend + '</p><div class="views">' + views.join('') + '</div></section>';
+    }).join('');
+  }
+
+  const steps = guide.installation?.map((step, index) =>
+    '<li class="step"><div><h2><span class="number">' + (index + 1) + '</span> ' + escapeText(step.incoming) +
+    '</h2><p>Attach to ' + escapeText(step.parent) + '</p>' +
+    (step.note ? '<p class="notes">' + escapeText(step.note) + '</p>' : '') +
+    '</div><figure><figcaption>' + step.view + '</figcaption><div class="view"><img src="' +
+    guide.images.shadow[GUIDE_VIEWS.indexOf(step.view)] + '" alt="">' + guidePin(step.x, step.y, index + 1) +
+    '</div></figure></li>') ?? [];
+  const installation = steps.length ? '<section class="pass"><h1>Installation sequence</h1>' + description +
+    '<ol class="installation">' + steps.join('') + '</ol></section>' : '';
+  const isolated = guide.isolatedSheets?.map(({ partName, images }) => paintSheets(images, partName)).join('') ?? '';
 
   return `<!doctype html><html lang="en"><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'">
@@ -92,7 +128,11 @@ export function renderGuideDocument(guide: GuideExport) {
   .pin { position: absolute; transform: translate(-50%, -50%); border: 1px solid #fff; }
   .pin[style*="left:0%"] { transform: translate(0, -50%); }
   .pin[style*="left:100%"] { transform: translate(-100%, -50%); }
-</style>${reference}${sheets.join('')}</html>`;
+  .installation { list-style-type: none; padding: 0; }
+  .step { display: grid; grid-template-columns: 1fr 47mm; gap: 5mm; padding: 3mm 0; border-bottom: 1px solid #d7dfda; break-inside: avoid; }
+  .step h2 { margin: 0 0 1mm; overflow-wrap: anywhere; }
+  .step p { margin: 1mm 0; overflow-wrap: anywhere; }
+</style>${reference}${paintSheets(guide.images)}${installation}${isolated}</html>`;
 }
 
 export async function savePaintingGuide(parent: BrowserWindow, guide: GuideExport) {

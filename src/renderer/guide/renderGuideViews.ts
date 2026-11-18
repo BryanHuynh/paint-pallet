@@ -1,6 +1,8 @@
 import * as THREE from 'three';
-import { GUIDE_PASSES, type GuideExport, type GuidePass } from '../../shared/paintingGuide';
-import type { ModelOrientation, ModelSummary, PaintPalletApi } from '../../shared/workerProtocol';
+import { GUIDE_PASSES, GUIDE_VIEWS, type GuideExport, type GuidePass } from '../../shared/paintingGuide';
+import type { ModelOrientation, ModelSummary, PaintPalletApi, Vec3 } from '../../shared/workerProtocol';
+import { ANCHOR_ADDRESS, type KitPart } from '../../shared/kit';
+import { poseMatrix } from '../kit/jointMath';
 import { computeOrientationQuaternion } from '../orientation';
 import type { ToneMask } from '../paint/lightingState';
 import type { ShadowCoverage } from '../paint/shadowPaint';
@@ -10,9 +12,21 @@ const DIRECTIONS = [
   new THREE.Vector3(-1, 0, 0), new THREE.Vector3(1, 0, 0),
 ];
 
-function createCameras(model: ModelSummary, rotation: THREE.Quaternion) {
-  const box = new THREE.Box3(new THREE.Vector3(...model.bounds.min), new THREE.Vector3(...model.bounds.max));
-  box.applyMatrix4(new THREE.Matrix4().makeRotationFromQuaternion(rotation));
+function boundsOf(model: ModelSummary) {
+  return new THREE.Box3(new THREE.Vector3(...model.bounds.min), new THREE.Vector3(...model.bounds.max));
+}
+
+function worldBounds(model: ModelSummary, rotation: THREE.Quaternion, parts?: readonly KitPart[]) {
+  const oriented = new THREE.Matrix4().makeRotationFromQuaternion(rotation);
+  if (!parts?.length) return boundsOf(model).applyMatrix4(oriented);
+  const box = new THREE.Box3();
+  for (const part of parts) {
+    box.union(boundsOf(part.model).applyMatrix4(oriented.clone().multiply(poseMatrix(part.pose))));
+  }
+  return box;
+}
+
+function createCameras(box: THREE.Box3) {
   const center = box.getCenter(new THREE.Vector3());
   const size = box.getSize(new THREE.Vector3());
   const extent = Math.max(size.x, size.y, size.z, 1e-5);
@@ -21,8 +35,26 @@ function createCameras(model: ModelSummary, rotation: THREE.Quaternion) {
     const camera = new THREE.OrthographicCamera(-half, half, half, -half, extent * 0.01, extent * 4);
     camera.position.copy(center).addScaledVector(direction, extent * 2);
     camera.lookAt(center);
+    camera.updateMatrixWorld(true);
     return camera;
   });
+}
+
+export function locateJointOnGuide(model: ModelSummary, orientation: ModelOrientation, parts: readonly KitPart[], parent: KitPart, point: Vec3) {
+  const rotation = computeOrientationQuaternion(orientation.upright, orientation.front);
+  const cameras = createCameras(worldBounds(model, rotation, parts));
+  const pose = poseMatrix(parent.pose);
+  const center = boundsOf(parent.model).getCenter(new THREE.Vector3()).applyMatrix4(pose);
+  const world = new THREE.Vector3(...point).applyMatrix4(pose);
+  const outward = world.clone().sub(center).applyQuaternion(rotation);
+  let view = 0;
+  for (let i = 1; i < DIRECTIONS.length; i++) if (outward.dot(DIRECTIONS[i]) > outward.dot(DIRECTIONS[view])) view = i;
+  const projected = world.applyQuaternion(rotation).project(cameras[view]);
+  return {
+    view: GUIDE_VIEWS[view],
+    x: THREE.MathUtils.clamp((1 + projected.x) / 2, 0.04, 0.96),
+    y: THREE.MathUtils.clamp((1 - projected.y) / 2, 0.04, 0.96),
+  };
 }
 
 function toPng(renderer: THREE.WebGLRenderer, target: THREE.WebGLRenderTarget, canvas: HTMLCanvasElement): string {
@@ -43,6 +75,7 @@ function toPng(renderer: THREE.WebGLRenderer, target: THREE.WebGLRenderTarget, c
 interface GuideRenderOptions {
   readBatch: PaintPalletApi['readBatch'];
   model: ModelSummary;
+  parts?: readonly KitPart[];
   orientation: ModelOrientation;
   coverage: ShadowCoverage;
   tones: ToneMask;
@@ -52,19 +85,21 @@ interface GuideRenderOptions {
   signal: AbortSignal;
 }
 
-export async function renderGuideViews({ readBatch, model, orientation, coverage, tones, edges, rows, preview, signal }: GuideRenderOptions) {
+export async function renderGuideViews({ readBatch, model, parts, orientation, coverage, tones, edges, rows, preview, signal }: GuideRenderOptions) {
   const side = preview ? 384 : 1000;
   const passes: GuidePass[] = preview ? ['shadow'] : [...GUIDE_PASSES];
-  if (edges?.size && !preview) passes.push('edge');
+  if (edges?.size && !preview && (!parts?.length || parts.some((part) =>
+    part.model.batches.some((batch) => edges.has(batch.batchIndex + part.batchOffset))))) passes.push('edge');
   const images: GuideExport['images'] = { shadow: [], midtone: [], highlight: [] };
   const rotation = computeOrientationQuaternion(orientation.upright, orientation.front);
-  const cameras = createCameras(model, rotation);
+  const cameras = createCameras(worldBounds(model, rotation, parts));
   const output = document.createElement('canvas');
   output.width = output.height = side;
   const renderer = new THREE.WebGLRenderer({ powerPreference: 'high-performance', alpha: false });
   const material = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, toneMapped: false });
   const mesh = new THREE.Mesh(new THREE.BufferGeometry(), material);
-  mesh.quaternion.copy(rotation);
+  mesh.matrixAutoUpdate = false;
+  const orientationMatrix = new THREE.Matrix4().makeRotationFromQuaternion(rotation);
   mesh.frustumCulled = false;
   const scene = new THREE.Scene();
   scene.add(mesh);
@@ -88,51 +123,58 @@ export async function renderGuideViews({ readBatch, model, orientation, coverage
       renderer.setRenderTarget(target);
       renderer.clear();
     }
-    for (const batch of model.batches) {
-      signal.throwIfAborted();
-      const data = await readBatch(batch.filePath);
-      signal.throwIfAborted();
-      const geometry = new THREE.BufferGeometry();
-      mesh.geometry.dispose();
-      mesh.geometry = geometry;
-      geometry.setAttribute('position', new THREE.BufferAttribute(data.positions, 3));
-      const faceColors = passes.map(() => new Float32Array(data.positions.length));
-      const faces = coverage.get(batch.batchIndex);
-      const shades = tones.get(batch.batchIndex);
-      const band = edges?.get(batch.batchIndex);
-      for (let i = 0; i < data.faceIds.length; i++) {
-        const id = data.faceIds[i];
-        const hit = faces?.get(id);
-        const shade = shades?.get(id);
-        const palette = hit && swatches.get(hit.regionId);
-        const offset = i * 9;
-        // A restrained grayscale normal response gives uncovered shapes readable contours.
-        const relief = 0.8 + 0.2 * Math.abs(data.normals[offset + 1] * 0.6 + data.normals[offset + 2] * 0.8);
-        for (let index = 0; index < passes.length; index++) {
-          const pass = passes[index];
-          const covered = hit && (pass === 'edge' ? band?.get(id)?.regionId === hit.regionId
-            : pass === 'shadow' || shade?.regionId === hit.regionId &&
-              (pass === 'midtone' || shade?.tone === 'highlight'));
-          const color = covered ? palette?.get(pass) ?? (pass === 'edge' ? missingEdgeSwatch : neutral) : neutral;
-          const strength = color === neutral ? relief : 1;
-          const array = faceColors[index];
-          for (let vertex = offset; vertex < offset + 9; vertex += 3) {
-            array[vertex] = color.r * strength;
-            array[vertex + 1] = color.g * strength;
-            array[vertex + 2] = color.b * strength;
+    const sources = parts?.length
+      ? parts.map((part) => ({ model: part.model, address: part, matrix: orientationMatrix.clone().multiply(poseMatrix(part.pose)) }))
+      : [{ model, address: ANCHOR_ADDRESS, matrix: orientationMatrix }];
+    for (const source of sources) {
+      mesh.matrix.copy(source.matrix);
+      mesh.matrixWorldNeedsUpdate = true;
+      for (const batch of source.model.batches) {
+        signal.throwIfAborted();
+        const data = await readBatch(batch.filePath);
+        signal.throwIfAborted();
+        const geometry = new THREE.BufferGeometry();
+        mesh.geometry.dispose();
+        mesh.geometry = geometry;
+        geometry.setAttribute('position', new THREE.BufferAttribute(data.positions, 3));
+        const faceColors = passes.map(() => new Float32Array(data.positions.length));
+        const faces = coverage.get(batch.batchIndex + source.address.batchOffset);
+        const shades = tones.get(batch.batchIndex + source.address.batchOffset);
+        const band = edges?.get(batch.batchIndex + source.address.batchOffset);
+        for (let i = 0; i < data.faceIds.length; i++) {
+          const id = data.faceIds[i] + source.address.faceOffset;
+          const hit = faces?.get(id);
+          const shade = shades?.get(id);
+          const palette = hit && swatches.get(hit.regionId);
+          const offset = i * 9;
+          // A restrained grayscale normal response gives uncovered shapes readable contours.
+          const relief = 0.8 + 0.2 * Math.abs(data.normals[offset + 1] * 0.6 + data.normals[offset + 2] * 0.8);
+          for (let index = 0; index < passes.length; index++) {
+            const pass = passes[index];
+            const covered = hit && (pass === 'edge' ? band?.get(id)?.regionId === hit.regionId
+              : pass === 'shadow' || shade?.regionId === hit.regionId &&
+                (pass === 'midtone' || shade?.tone === 'highlight'));
+            const color = covered ? palette?.get(pass) ?? (pass === 'edge' ? missingEdgeSwatch : neutral) : neutral;
+            const strength = color === neutral ? relief : 1;
+            const array = faceColors[index];
+            for (let vertex = offset; vertex < offset + 9; vertex += 3) {
+              array[vertex] = color.r * strength;
+              array[vertex + 1] = color.g * strength;
+              array[vertex + 2] = color.b * strength;
+            }
           }
         }
-      }
-      const colorAttribute = new THREE.BufferAttribute(new Float32Array(data.positions.length), 3).setUsage(THREE.DynamicDrawUsage);
-      geometry.setAttribute('color', colorAttribute);
-      passes.forEach((_pass, passIndex) => {
-        colorAttribute.array.set(faceColors[passIndex]);
-        colorAttribute.needsUpdate = true;
-        cameras.forEach((camera, viewIndex) => {
-          renderer.setRenderTarget(targets[passIndex][viewIndex]);
-          renderer.render(scene, camera);
+        const colorAttribute = new THREE.BufferAttribute(new Float32Array(data.positions.length), 3).setUsage(THREE.DynamicDrawUsage);
+        geometry.setAttribute('color', colorAttribute);
+        passes.forEach((_pass, passIndex) => {
+          colorAttribute.array.set(faceColors[passIndex]);
+          colorAttribute.needsUpdate = true;
+          cameras.forEach((camera, viewIndex) => {
+            renderer.setRenderTarget(targets[passIndex][viewIndex]);
+            renderer.render(scene, camera);
+          });
         });
-      });
+      }
     }
     passes.forEach((pass, index) => {
       images[pass] = targets[index].map((target) => toPng(renderer, target, output));

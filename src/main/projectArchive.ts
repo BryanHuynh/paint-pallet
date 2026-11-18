@@ -71,6 +71,17 @@ function validateKit(value: unknown): asserts value is KitState {
     }
     parents.set(joint.childId, joint.parentId);
   }
+  if (value.installation !== undefined) {
+    const plan = value.installation;
+    if (!isRecord(plan) || !Array.isArray(plan.order) || !Array.isArray(plan.isolatedViews) || !isRecord(plan.notes) ||
+        plan.order.length !== parents.size || new Set(plan.order).size !== plan.order.length ||
+        !plan.order.every((id) => nonemptyId(id) && parents.has(id)) ||
+        !Object.entries(plan.notes).every(([id, note]) => parents.has(id) && typeof note === 'string') ||
+        new Set(plan.isolatedViews).size !== plan.isolatedViews.length ||
+        !plan.isolatedViews.every((id) => nonemptyId(id) && parts.has(id) && !parts.get(id).staged)) {
+      throw new Error('Invalid installation order or selected part views.');
+    }
+  }
   for (const part of value.parts) {
     if (part.staged || part.id === anchor.id) continue;
     const visited = new Set<string>();

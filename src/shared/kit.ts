@@ -39,9 +39,30 @@ export interface KitPartState extends Partial<PartAddress> {
   staged: boolean;
 }
 
+export interface InstallationPlan {
+  order: string[];
+  notes: Record<string, string>;
+  isolatedViews: string[];
+}
+
+export const EMPTY_INSTALLATION: InstallationPlan = { order: [], notes: {}, isolatedViews: [] };
+
+export function syncInstallation(draft: InstallationPlan, parts: readonly KitPart[], joints: readonly KitJoint[]): InstallationPlan {
+  const attachedIds = new Set(joints.map((joint) => joint.childId));
+  const order = draft.order.filter((id) => attachedIds.has(id));
+  for (const joint of joints) if (!order.includes(joint.childId)) order.push(joint.childId);
+  const available = new Set(parts.filter((part) => !part.staged).map((part) => part.id));
+  return {
+    order,
+    notes: Object.fromEntries(Object.entries(draft.notes).filter(([id]) => attachedIds.has(id))),
+    isolatedViews: draft.isolatedViews.filter((id) => available.has(id)),
+  };
+}
+
 export interface KitState {
   parts: KitPartState[];
   joints: KitJoint[];
+  installation?: InstallationPlan;
 }
 
 export function nextPartAddress(parts: readonly KitPart[]): PartAddress {

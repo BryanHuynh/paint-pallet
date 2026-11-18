@@ -20,11 +20,24 @@ export interface GuideRow {
   edgeSwatch?: SwatchEntry;
 }
 
+export type GuideImages = Record<ToneSlot, string[]> & { edge?: string[] };
+
+export interface InstallationStepView {
+  incoming: string;
+  parent: string;
+  note: string;
+  view: GuideView;
+  x: number;
+  y: number;
+}
+
 export interface GuideExport {
   paper: GuidePaper;
   modelName: string;
   snapshot: string;
   rows: GuideRow[];
   callouts: GuideCallout[];
-  images: Record<ToneSlot, string[]> & { edge?: string[] };
+  images: GuideImages;
+  installation?: InstallationStepView[];
+  isolatedSheets?: { partName: string; images: GuideImages }[];
 }

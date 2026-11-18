@@ -19,7 +19,7 @@ import type { PaintRecipe } from './palette/types';
 import { createEmptyRecipe } from './palette/recipes';
 import { EdgePanel } from './paint/EdgePanel';
 import { EDGE_PREVIEW, applyEdgesOver, clipEdgeCoverage, edgeColorKey, useEdgeHighlight } from './paint/useEdgeHighlight';
-import { ANCHOR_ADDRESS, IDENTITY_PART_POSE, nextPartAddress, restoreKitAddresses, type KitPart } from '../shared/kit';
+import { ANCHOR_ADDRESS, EMPTY_INSTALLATION, IDENTITY_PART_POSE, nextPartAddress, restoreKitAddresses, syncInstallation, type KitPart } from '../shared/kit';
 import { JointPanel } from './kit/JointPanel';
 import { JOINT_HIGHLIGHT, useKitAssembly } from './kit/useKitAssembly';
 import { KitPanel } from './kit/KitPanel';
@@ -97,6 +97,8 @@ export default function App({
     faceCount: selectedPart.model.triangleCount, id: selectedPart.id,
   } : undefined, [selectedPart]);
   const assembly = useKitAssembly(api, parts, setParts, choosePart);
+  const [installation, setInstallation] = useState(EMPTY_INSTALLATION);
+  const guideInstallation = useMemo(() => syncInstallation(installation, parts, assembly.joints), [installation, parts, assembly.joints]);
   const ghostPart = assembly.draft && (assembly.draft.preview || assembly.draft.method === 'manual')
     ? parts.find((part) => part.id === assembly.draft?.childId)
     : undefined;
@@ -312,6 +314,7 @@ export default function App({
               id, name, sourceName: partModel.fileName, pose, hidden, staged, faceOffset, batchOffset,
             })),
             joints: assembly.joints,
+            installation: guideInstallation,
           } : undefined,
         },
         referenceBytes: palette.referenceBytes,
@@ -529,6 +532,7 @@ export default function App({
         setFocusId(nextParts[0].id);
         fitKit(nextParts);
         assembly.reset(kit?.joints);
+        setInstallation(kit?.installation ?? EMPTY_INSTALLATION);
         setPendingModel(null);
         setProgress(null);
         setPickResult(null);
@@ -1057,6 +1061,7 @@ export default function App({
           api={api} model={model} orientation={orientation} coverage={shadow.committedCoverage}
           edges={guideEdges} tones={lighting.committedMask} snapshot={lighting.snapshot.name.trim() || 'Untitled snapshot'}
           rows={guideRows} callouts={guideCallouts} setCallouts={setGuideCallouts}
+          parts={parts} joints={assembly.joints} installation={guideInstallation} setInstallation={setInstallation}
           unapplied={lighting.unapplied} close={() => setGuideOpen(false)}
         />
       )}

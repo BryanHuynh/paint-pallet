@@ -3,7 +3,9 @@ import { GUIDE_VIEWS, type GuideCallout, type GuideExport, type GuidePaper, type
 import type { ModelOrientation, ModelSummary, PaintPalletApi } from '../../shared/workerProtocol';
 import type { ShadowCoverage } from '../paint/shadowPaint';
 import type { ToneMask } from '../paint/lightingState';
-import { renderGuideViews } from './renderGuideViews';
+import type { InstallationPlan, KitJoint, KitPart } from '../../shared/kit';
+import { InstallationEditor } from './InstallationEditor';
+import { locateJointOnGuide, renderGuideViews } from './renderGuideViews';
 
 interface Props {
   api: PaintPalletApi;
@@ -18,11 +20,15 @@ interface Props {
   callouts: GuideCallout[];
   setCallouts: (callouts: GuideCallout[]) => void;
   close: () => void;
+  parts: readonly KitPart[];
+  joints: readonly KitJoint[];
+  installation: InstallationPlan;
+  setInstallation: (plan: InstallationPlan) => void;
 }
 
 const pinPosition = (value: number) => Math.min(0.96, Math.max(0.04, value));
 
-export default function PaintingGuideDialog({ api, model, orientation, coverage, tones, edges, rows, snapshot, unapplied, callouts, setCallouts, close }: Props) {
+export default function PaintingGuideDialog({ api, model, orientation, coverage, tones, edges, rows, snapshot, unapplied, callouts, setCallouts, close, parts, joints, installation, setInstallation }: Props) {
   const dialog = useRef<HTMLDialogElement>(null);
   const request = useRef<AbortController | null>(null);
   const [paper, setPaper] = useState<GuidePaper>('Letter');
@@ -42,6 +48,7 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
   }, [edges, rows]);
   const warnings = unapplied || missing.length > 0 || missingEdges.length > 0;
   const readBatch = api.readBatch;
+  const printParts = useMemo(() => parts.filter((part) => !part.staged), [parts]);
 
   useEffect(() => {
     dialog.current?.showModal();
@@ -50,14 +57,14 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
 
   useEffect(() => {
     const controller = new AbortController();
-    void renderGuideViews({ readBatch, model, orientation, coverage, tones, rows, preview: true, signal: controller.signal })
+    void renderGuideViews({ readBatch, model, parts: printParts, orientation, coverage, tones, rows, preview: true, signal: controller.signal })
       .then((images) => {
         if (!controller.signal.aborted) setPreviews(images.shadow);
       }, (error: unknown) => {
         if (!controller.signal.aborted) setMessage({ text: error instanceof Error ? error.message : 'Unable to render the guide preview.', error: true });
       });
     return () => controller.abort();
-  }, [readBatch, model, orientation, coverage, tones, rows]);
+  }, [readBatch, model, printParts, orientation, coverage, tones, rows]);
 
   function position(view: GuideView, x: number, y: number) {
     if (!region) return;
@@ -72,9 +79,34 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
     setExporting(true);
     setMessage(null);
     try {
-      const images = await renderGuideViews({ readBatch, model, orientation, coverage, tones, edges, rows, preview: false, signal: controller.signal });
+      const options = { readBatch, model, orientation, coverage, tones, edges, rows, preview: false, signal: controller.signal };
+      const images = await renderGuideViews({ ...options, parts: printParts });
+      const byId = new Map(printParts.map((part) => [part.id, part]));
+      const jointByChild = new Map(joints.map((joint) => [joint.childId, joint]));
+      const steps = installation.order.flatMap((id) => {
+        const joint = jointByChild.get(id);
+        const child = byId.get(id);
+        const parent = joint && byId.get(joint.parentId);
+        if (!child || !parent || !joint) return [];
+        return [{
+          incoming: child.name || 'Untitled part',
+          parent: parent.name || 'Untitled parent',
+          note: installation.notes[id] ?? '',
+          ...locateJointOnGuide(model, orientation, printParts, parent, joint.point),
+        }];
+      });
+      const isolatedSheets: NonNullable<GuideExport['isolatedSheets']> = [];
+      for (const id of installation.isolatedViews) {
+        const part = byId.get(id);
+        if (!part) continue;
+        controller.signal.throwIfAborted();
+        isolatedSheets.push({ partName: part.name || 'Untitled part',
+          images: await renderGuideViews({ ...options, parts: [part] }) });
+      }
       controller.signal.throwIfAborted();
-      const saved = await api.exportPaintingGuide({ paper, modelName: model.fileName, snapshot, rows, callouts, images });
+      const saved = await api.exportPaintingGuide({
+        paper, modelName: model.fileName, snapshot, rows, callouts, images, installation: steps, isolatedSheets,
+      });
       if (!controller.signal.aborted && saved) setMessage({ text: 'Painting guide saved.', error: false });
     } catch (error) {
       if (!controller.signal.aborted) setMessage({ text: error instanceof Error ? error.message : 'Unable to export the painting guide.', error: true });
@@ -141,6 +173,8 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
           ))}
         </div>
       ) : !message && <p className="hint-text" role="status">Rendering the model views…</p>}
+      {joints.length > 0 && <InstallationEditor parts={printParts} joints={joints} plan={installation}
+        onChange={setInstallation} disabled={exporting} />}
       {warnings && (
         <div className="guide-dialog__warnings">
           {unapplied && <p>Lighting changes are unapplied. The guide will use the committed masks.</p>}
