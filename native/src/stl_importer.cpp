@@ -871,7 +871,7 @@ ImportOutcome importBinaryStl(
 
   outcome.ok = true;
   outcome.model.modelId = "model_" + jobId;
-  outcome.model.partId = "part_0";
+  outcome.model.partId = "part_" + jobId;
   outcome.model.fileName = pathToUtf8(utf8ToPath(filePathUtf8).filename());
   outcome.model.fileSizeBytes = fileSize;
   outcome.model.triangleCount = triangleCount;

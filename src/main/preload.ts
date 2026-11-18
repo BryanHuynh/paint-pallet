@@ -21,6 +21,7 @@ const api: PaintPalletApi = {
     ipcRenderer.invoke('worker:commit-model', modelId),
   discardModel: (modelId: string) =>
     ipcRenderer.invoke('worker:discard-model', modelId),
+  importKitParts: () => ipcRenderer.invoke('kit:import-parts'),
   cancelImport: () => ipcRenderer.invoke('worker:cancel-import'),
   getActiveModel: () => ipcRenderer.invoke('worker:get-active-model'),
   readBatch: (filePath: string) => ipcRenderer.invoke('worker:read-batch', filePath),

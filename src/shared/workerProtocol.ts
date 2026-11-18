@@ -27,6 +27,12 @@ export interface ModelSummary {
   previewFilePath: string | null;
 }
 
+export interface KitImportResult {
+  models: ModelSummary[];
+  errors: string[];
+  canceled: boolean;
+}
+
 export interface ImportProgressEvent {
   type: 'progress';
   jobId: string;
@@ -90,6 +96,7 @@ export interface PaintPalletApi {
   importStl: (filePath: string) => Promise<ModelSummary>;
   commitModel?: (modelId: string) => Promise<{ committed: boolean }>;
   discardModel?: (modelId: string) => Promise<{ discarded: boolean }>;
+  importKitParts?: () => Promise<KitImportResult | null>;
   cancelImport: () => Promise<{ canceled: boolean }>;
   getActiveModel: () => Promise<ModelSummary | null>;
   readBatch: (filePath: string) => Promise<BatchBinaryData>;

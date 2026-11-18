@@ -3,11 +3,13 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type {
   BatchDescriptor,
+  Bounds3,
   ModelOrientation,
   ModelSummary,
   PaintPalletApi,
   Vec3,
 } from '../../shared/workerProtocol';
+import { IDENTITY_PART_POSE, type KitPart, type PartPose } from '../../shared/kit';
 import { computeOrientationQuaternion } from '../orientation';
 import { disposeDetailMesh, setShadowOverlay } from '../paint/shadowOverlay';
 import type { ShadowCoverage, SurfaceFace } from '../paint/shadowPaint';
@@ -26,6 +28,10 @@ export interface Viewport3DProps {
   api?: PaintPalletApi;
   model: ModelSummary | null;
   pendingModel: ModelSummary | null;
+  companionParts?: readonly KitPart[];
+  focusPose?: PartPose;
+  fitBounds?: Bounds3;
+  hideFocused?: boolean;
   orientation: ModelOrientation;
   cameraPresetRequest: { preset: CameraPreset; seq: number } | null;
   onSurfacePick: (
@@ -266,6 +272,10 @@ export function Viewport3D({
   api,
   model,
   pendingModel,
+  companionParts,
+  focusPose = IDENTITY_PART_POSE,
+  fitBounds,
+  hideFocused = false,
   orientation,
   cameraPresetRequest,
   onSurfacePick,
@@ -308,6 +318,10 @@ export function Viewport3D({
     orbitLifecycle: ReturnType<typeof attachOrbitDetailLifecycle>;
     renderer: THREE.WebGLRenderer;
     modelGroup: THREE.Group;
+    surfaceGroup: THREE.Group;
+    companionMaterial: THREE.MeshStandardMaterial;
+    stagedMaterial: THREE.MeshStandardMaterial;
+    companions: Map<string, THREE.Group>;
     previewGroup: THREE.Group;
     detailGroup: THREE.Group;
     material: THREE.MeshStandardMaterial;
@@ -436,7 +450,7 @@ export function Viewport3D({
     if (!refs) return;
     const gen = ++streamGenerationRef.current;
     refs.modelGroup.updateMatrixWorld(true);
-    const invMat = new THREE.Matrix4().copy(refs.modelGroup.matrixWorld).invert();
+    const invMat = new THREE.Matrix4().copy(refs.surfaceGroup.matrixWorld).invert();
     const camLocal = refs.camera.position.clone().applyMatrix4(invMat);
     const tgtLocal = refs.controls.target.clone().applyMatrix4(invMat);
 
@@ -518,10 +532,15 @@ export function Viewport3D({
     brushPreview.attach(shadowMaterial);
 
     const modelGroup = new THREE.Group();
+    const surfaceGroup = new THREE.Group();
     const previewGroup = new THREE.Group();
     const detailGroup = new THREE.Group();
-    modelGroup.add(previewGroup);
-    modelGroup.add(detailGroup);
+    surfaceGroup.add(previewGroup, detailGroup);
+    modelGroup.add(surfaceGroup);
+    const companionMaterial = new THREE.MeshStandardMaterial({ color: '#aaaeb2', roughness: 0.84, side: THREE.DoubleSide });
+    const stagedMaterial = new THREE.MeshStandardMaterial({ color: '#83b4a5', roughness: 0.8,
+      opacity: 0.38, transparent: true, depthWrite: false, side: THREE.FrontSide });
+    const companions = new Map<string, THREE.Group>();
     scene.add(modelGroup);
 
     const orbitLifecycle = attachOrbitDetailLifecycle(
@@ -551,6 +570,10 @@ export function Viewport3D({
       orbitLifecycle,
       renderer,
       modelGroup,
+      surfaceGroup,
+      companionMaterial,
+      stagedMaterial,
+      companions,
       previewGroup,
       detailGroup,
       material,
@@ -561,7 +584,7 @@ export function Viewport3D({
 
     const pickAt = (e: PointerEvent) => {
       const currentModel = activeModelRef.current;
-      if (!currentModel) return;
+      if (!currentModel || !surfaceGroup.visible) return;
 
       const rect = renderer.domElement.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return;
@@ -574,7 +597,7 @@ export function Viewport3D({
       raycaster.setFromCamera(ndc, camera);
 
       modelGroup.updateMatrixWorld(true);
-      const invMat = new THREE.Matrix4().copy(modelGroup.matrixWorld).invert();
+      const invMat = new THREE.Matrix4().copy(surfaceGroup.matrixWorld).invert();
       const localRay = raycaster.ray.clone().applyMatrix4(invMat);
       localRay.direction.normalize();
 
@@ -767,6 +790,10 @@ export function Viewport3D({
       disposeGroupMeshes(detailGroup);
       detailCacheRef.current.clear();
       detailTrianglesRef.current = 0;
+      for (const layer of companions.values()) disposeGroupMeshes(layer);
+      companions.clear();
+      companionMaterial.dispose();
+      stagedMaterial.dispose();
       material.dispose();
       previewMaterial.dispose();
       shadowMaterial.dispose();
@@ -887,10 +914,67 @@ export function Viewport3D({
     };
   }, [api, pendingModel]);
 
-  // Apply upright & front orientation and fit camera for the committed model
   useEffect(() => {
     const refs = sceneRefs.current;
-    if (!refs || !model) return;
+    if (!refs || !api) return;
+    const wanted = new Set(companionParts?.map((part) => part.model.modelId));
+    for (const [id, layer] of refs.companions) {
+      if (wanted.has(id)) continue;
+      refs.modelGroup.remove(layer);
+      disposeGroupMeshes(layer);
+      refs.companions.delete(id);
+    }
+
+    let canceled = false;
+    async function loadCompanions() {
+      if (!refs || !api) return;
+      for (const part of companionParts ?? []) {
+        const id = part.model.modelId;
+        let layer = refs.companions.get(id);
+        if (!layer) {
+          layer = new THREE.Group();
+          refs.companions.set(id, layer);
+          refs.modelGroup.add(layer);
+        }
+        layer.visible = !part.hidden && id !== model?.modelId;
+        layer.position.fromArray(part.pose.translation);
+        layer.quaternion.fromArray(part.pose.rotation);
+        const material = part.staged ? refs.stagedMaterial : refs.companionMaterial;
+        for (const child of layer.children) (child as THREE.Mesh).material = material;
+        if (!layer.visible || layer.userData.complete) continue;
+        const files = part.model.previewFilePath ? [part.model.previewFilePath] : part.model.batches.map((batch) => batch.filePath);
+        try {
+          for (let i = layer.children.length; i < files.length; i++) {
+            const bin = await api.readBatch(files[i]);
+            if (canceled) return;
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.BufferAttribute(bin.positions, 3));
+            geometry.setAttribute('normal', new THREE.BufferAttribute(bin.normals, 3));
+            layer.add(new THREE.Mesh(geometry, material));
+          }
+          layer.userData.complete = true;
+        } catch (error) {
+          if (!canceled) onPickNeedsDetailRef.current?.(error instanceof Error ? error.message : 'Could not display a kit part.');
+        }
+      }
+    }
+    void loadCompanions();
+    return () => { canceled = true; };
+  }, [api, model?.modelId, companionParts]);
+
+  useEffect(() => {
+    const refs = sceneRefs.current;
+    if (!refs) return;
+    refs.surfaceGroup.position.fromArray(focusPose.translation);
+    refs.surfaceGroup.quaternion.fromArray(focusPose.rotation);
+    refs.surfaceGroup.visible = !hideFocused;
+    refs.modelGroup.updateMatrixWorld(true);
+  }, [focusPose, hideFocused]);
+
+  const frameBounds = fitBounds ?? model?.bounds;
+  useEffect(() => {
+    const refs = sceneRefs.current;
+    if (!refs || !frameBounds) return;
 
     ++viewGenRef.current;
     onViewChangeRef.current?.();
@@ -898,8 +982,8 @@ export function Viewport3D({
     const q = computeOrientationQuaternion(orientation.upright, orientation.front);
     refs.modelGroup.quaternion.copy(q);
 
-    const min = new THREE.Vector3(...model.bounds.min);
-    const max = new THREE.Vector3(...model.bounds.max);
+    const min = new THREE.Vector3(...frameBounds.min);
+    const max = new THREE.Vector3(...frameBounds.max);
     const center = new THREE.Vector3().addVectors(min, max).multiplyScalar(0.5);
     const size = new THREE.Vector3().subVectors(max, min);
     const radius = Math.max(0.5, size.length() * 0.5);
@@ -917,8 +1001,11 @@ export function Viewport3D({
     refs.controls.update();
     refs.orbitLifecycle.syncRestSnapshot();
 
-    void streamForCurrentCamera(model);
-  }, [model, orientation]);
+  }, [frameBounds, orientation]);
+
+  useEffect(() => {
+    if (model) void streamForCurrentCamera(model);
+  }, [model, frameBounds, orientation, focusPose]);
 
   // Camera view presets
   useEffect(() => {

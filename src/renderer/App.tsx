@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AxisDirection,
+  Bounds3,
   ImportProgressEvent,
   ModelOrientation,
   ModelSummary,
@@ -18,6 +19,8 @@ import type { PaintRecipe } from './palette/types';
 import { createEmptyRecipe } from './palette/recipes';
 import { EdgePanel } from './paint/EdgePanel';
 import { EDGE_PREVIEW, applyEdgesOver, clipEdgeCoverage, edgeColorKey, useEdgeHighlight } from './paint/useEdgeHighlight';
+import { IDENTITY_PART_POSE, type KitPart } from '../shared/kit';
+import { KitPanel } from './kit/KitPanel';
 import { ShadowPanel } from './paint/ShadowPanel';
 import { useShadowPainting } from './paint/useShadowPainting';
 import { LightingPanel } from './paint/LightingPanel';
@@ -25,6 +28,8 @@ import { renderToneMask, toneColorKey } from './paint/lightingState';
 import { useSurfaceLighting } from './paint/useSurfaceLighting';
 import { FILL_PREVIEW_REGION, unpackFillFaces, useConnectedFill } from './paint/useConnectedFill';
 import appLogoUrl from '../../assets/paint-pallet-logo.png';
+
+const EMPTY_COVERAGE = new Map();
 
 type PaletteComponent = React.ComponentType<Record<string, unknown>>;
 
@@ -77,6 +82,14 @@ export default function App({
   const [projectAction, setProjectAction] = useState<'open' | 'save' | null>(null);
   const [activeTab, setActiveTab] = useState<'model' | 'palette'>('model');
   const [model, setModel] = useState<ModelSummary | null>(null);
+  const [parts, setParts] = useState<KitPart[]>([]);
+  const [focusId, setFocusId] = useState('');
+  const [kitBounds, setKitBounds] = useState<Bounds3 | undefined>();
+  const [kitImporting, setKitImporting] = useState(false);
+  const focusPending = useRef<{ id: string; modelId: string; remove?: KitPart } | null>(null);
+  const selectedPart = parts.find((part) => part.id === focusId);
+  const displayModel = selectedPart?.model ?? model;
+  const onAnchor = displayModel?.modelId === model?.modelId;
   const fill = useConnectedFill(api, shadow.tool === 'fill', model?.modelId, shadow.region?.id, shadow.committedCoverage);
   const [pendingModel, setPendingModel] = useState<ModelSummary | null>(null);
   const [orientation, setOrientation] = useState<ModelOrientation>({
@@ -120,7 +133,7 @@ export default function App({
   const pendingModelRef = useRef<ModelSummary | null>(null);
   pendingModelRef.current = pendingModel;
   const activeModelIdRef = useRef<string | null>(null);
-  activeModelIdRef.current = model?.modelId ?? null;
+  activeModelIdRef.current = displayModel?.modelId ?? null;
   const appModelGenRef = useRef(0);
   const appViewGenRef = useRef(0);
   const pickSeqRef = useRef(0);
@@ -312,9 +325,75 @@ export default function App({
     }
   }
 
+  function choosePart(part: KitPart, remove?: KitPart) {
+    if (pendingModelRef.current || importInFlight.current || part.id === focusId) return;
+    fill.cancel();
+    lighting.cancel();
+    edge.cancel();
+    shadow.setTool(null);
+    lighting.setBrushTool(null);
+    edge.setTool(null);
+    setPickResult(null);
+    setStatusMsg(null);
+    focusPending.current = { id: part.id, modelId: part.model.modelId, remove };
+    pendingModelRef.current = part.model;
+    setPendingModel(part.model);
+  }
+
+  async function addKitParts() {
+    if (!api?.importKitParts || !model || importInFlight.current || pendingModelRef.current) return;
+    importInFlight.current = true;
+    setKitImporting(true);
+    setStatusMsg(null);
+    try {
+      const result = await api.importKitParts();
+      if (!result) return;
+      const added = result.models.map((part) => ({
+        id: part.partId, name: part.fileName.replace(/\.stl$/i, ''), model: part,
+        pose: IDENTITY_PART_POSE, staged: true, hidden: false,
+      }));
+      if (added.length) {
+        const next = [...parts, ...added];
+        setParts(next);
+        const min: Vec3 = [...model.bounds.min];
+        const max: Vec3 = [...model.bounds.max];
+        for (const { model: part } of next) {
+          for (let axis = 0; axis < 3; axis++) {
+            min[axis] = Math.min(min[axis], part.bounds.min[axis]);
+            max[axis] = Math.max(max[axis], part.bounds.max[axis]);
+          }
+        }
+        setKitBounds({ min, max });
+      }
+      const feedback = [...result.errors];
+      if (result.canceled) feedback.push('Import canceled. Previously staged parts are still available.');
+      if (feedback.length) setStatusMsg(feedback.join(' '));
+    } catch (error) {
+      setStatusMsg(error instanceof Error ? error.message : 'Could not add kit parts.');
+    } finally {
+      setProgress(null);
+      setKitImporting(false);
+      importInFlight.current = false;
+    }
+  }
+
+  async function discardKitPart(part: KitPart) {
+    try {
+      const discarded = await api?.discardModel?.(part.model.modelId);
+      if (discarded?.discarded) {
+        setParts((current) => current.filter((item) => item.id !== part.id));
+        if (parts.length === 2) setKitBounds(undefined);
+      } else {
+        setStatusMsg('Could not remove the staged part.');
+      }
+    } catch (error) {
+      setStatusMsg(error instanceof Error ? error.message : 'Could not remove the staged part.');
+    }
+  }
+
   const handleCancelImport = async () => {
     if (!api || isCommitting) return;
-    if (isImporting) {
+    if (isImporting || kitImporting) {
       await api.cancelImport();
       return;
     }
@@ -322,6 +401,10 @@ export default function App({
     if (staged) {
       pendingModelRef.current = null;
       setPendingModel(null);
+      if (focusPending.current?.modelId === staged.modelId) {
+        focusPending.current = null;
+        return;
+      }
       takePendingProject(staged.modelId)?.palette.dispose();
       await api.discardModel?.(staged.modelId);
       setStatusMsg(
@@ -336,6 +419,17 @@ export default function App({
     async (committed: ModelSummary): Promise<boolean> => {
       if (pendingModelRef.current?.modelId !== committed.modelId) {
         return false;
+      }
+      const focus = focusPending.current;
+      if (focus?.modelId === committed.modelId && pendingModelRef.current?.modelId === committed.modelId) {
+        focusPending.current = null;
+        pendingModelRef.current = null;
+        ++appModelGenRef.current;
+        activeModelIdRef.current = committed.modelId;
+        setFocusId(focus.id);
+        setPendingModel(null);
+        if (focus.remove) void discardKitPart(focus.remove);
+        return true;
       }
       setIsCommitting(true);
       try {
@@ -386,6 +480,10 @@ export default function App({
           edge.reset();
         }
         setModel(committed);
+        setParts([{ id: committed.partId, name: committed.fileName.replace(/\.(stl|obj)$/i, ''),
+          model: committed, pose: IDENTITY_PART_POSE, hidden: false, staged: false }]);
+        setFocusId(committed.partId);
+        setKitBounds(undefined);
         setPendingModel(null);
         setProgress(null);
         setPickResult(null);
@@ -402,7 +500,7 @@ export default function App({
         setIsCommitting(false);
       }
     },
-    [api, model],
+    [api, model, parts],
   );
 
   const handlePendingModelError = useCallback(
@@ -411,6 +509,11 @@ export default function App({
       if (!staged) return;
       pendingModelRef.current = null;
       setPendingModel(null);
+      if (focusPending.current?.modelId === staged.modelId) {
+        focusPending.current = null;
+        setStatusMsg(err.message);
+        return;
+      }
       takePendingProject(staged.modelId)?.palette.dispose();
       await api?.discardModel?.(staged.modelId);
       setStatusMsg(
@@ -436,7 +539,7 @@ export default function App({
     batchIndices: number[],
     token: PickGenerationToken,
   ) => {
-    if (!api || !model || token.modelId !== model.modelId) return;
+    if (!api || !displayModel || token.modelId !== displayModel.modelId) return;
     const startAppModelGen = appModelGenRef.current;
     const startAppViewGen = appViewGenRef.current;
     const isCurrent = () =>
@@ -446,9 +549,9 @@ export default function App({
 
     try {
       const sequence = ++pickSeqRef.current;
-      const result = await api.pickFace(model.modelId, origin, direction, batchIndices);
+      const result = await api.pickFace(displayModel.modelId, origin, direction, batchIndices);
       if (sequence !== pickSeqRef.current || !isCurrent()) return;
-      if (shadow.tool === 'fill' && shadow.region) {
+      if (onAnchor && shadow.tool === 'fill' && shadow.region && model) {
         if (result.hit && result.originalFaceId !== null && result.partId === model.partId) {
           fill.select({ modelId: model.modelId, faceId: result.originalFaceId, regionId: shadow.region.id });
         }
@@ -469,7 +572,7 @@ export default function App({
       ? Math.min(100, Math.round((progress.bytesRead / progress.totalBytes) * 100))
       : 0;
 
-  const isBusy = isImporting || Boolean(pendingModel) || isCommitting || projectAction !== null;
+  const isBusy = isImporting || kitImporting || Boolean(pendingModel) || isCommitting || projectAction !== null;
 
   return (
     <div className="app-shell">
@@ -537,7 +640,7 @@ export default function App({
               </div>
             </details>
           )}
-          {(isImporting || pendingModel || isCommitting) ? (
+          {(isImporting || kitImporting || pendingModel || isCommitting) ? (
             <button
               type="button"
               className="btn btn--secondary"
@@ -579,15 +682,19 @@ export default function App({
         >
           <Viewport3D
             api={api}
-            model={model}
+            model={displayModel}
+            companionParts={parts.length > 1 ? parts : undefined}
+            focusPose={selectedPart?.pose}
+            hideFocused={selectedPart?.hidden}
+            fitBounds={kitBounds}
             pendingModel={pendingModel}
             orientation={orientation}
             cameraPresetRequest={cameraPresetRequest}
             onSurfacePick={handleSurfacePick}
             shadowPaint={{
-              enabled: Boolean(model && !isBusy && (edge.tool || lighting.brushTool ||
+              enabled: Boolean(model && onAnchor && !isBusy && (edge.tool || lighting.brushTool ||
                 (shadow.tool && shadow.tool !== 'fill' && shadow.recipe))),
-              coverage,
+              coverage: onAnchor ? coverage : EMPTY_COVERAGE,
               colors: shadowColors,
               diameter: shadow.brushSize,
               onFaces: edge.tool ? edge.paintFaces : lighting.brushTool ? lighting.paintFaces : shadow.paintFaces,
@@ -679,7 +786,14 @@ export default function App({
         </section>
 
         <aside className="inspector-panel" aria-label="Model inspector">
-          {model && (
+          {api?.importKitParts && model && (
+            <KitPanel parts={parts} selected={selectedPart} busy={isBusy}
+              choose={choosePart} add={addKitParts}
+              rename={(name) => setParts((current) => current.map((part) => part.id === focusId ? { ...part, name } : part))}
+              remove={(part) => parts[0] && choosePart(parts[0], part)}
+            />
+          )}
+          {model && onAnchor && (
             <ShadowPanel
               paint={shadow}
               fill={fill}
@@ -697,7 +811,7 @@ export default function App({
               }}
             />
           )}
-          {model && lighting.available && (
+          {model && onAnchor && lighting.available && (
             <LightingPanel
               lighting={lighting}
               busy={isBusy || shadow.strokePending || lighting.brushPending || edge.stroke}
@@ -731,7 +845,7 @@ export default function App({
             />
           )}
 
-          {model && edge.available && (
+          {model && onAnchor && edge.available && (
             <EdgePanel edge={edge} busy={isBusy || shadow.strokePending || lighting.brushPending || edge.stroke}
               brushSize={shadow.brushSize} setBrushSize={shadow.setBrushSize}
               beginPreview={() => {
@@ -753,21 +867,21 @@ export default function App({
 
           <section className="inspector-section">
             <h2>Model summary</h2>
-            {model ? (
+            {displayModel ? (
               <dl className="kv-list">
                 <dt>File</dt>
-                <dd>{model.fileName}</dd>
+                <dd>{displayModel.fileName}</dd>
                 <dt>Triangles</dt>
-                <dd>{model.triangleCount.toLocaleString()}</dd>
+                <dd>{displayModel.triangleCount.toLocaleString()}</dd>
                 <dt>Spatial batches</dt>
-                <dd>{model.batches.length}</dd>
+                <dd>{displayModel.batches.length}</dd>
                 <dt>Bounds min</dt>
                 <dd>
-                  {model.bounds.min.map((v) => v.toFixed(1)).join(', ')}
+                  {displayModel.bounds.min.map((v) => v.toFixed(1)).join(', ')}
                 </dd>
                 <dt>Bounds max</dt>
                 <dd>
-                  {model.bounds.max.map((v) => v.toFixed(1)).join(', ')}
+                  {displayModel.bounds.max.map((v) => v.toFixed(1)).join(', ')}
                 </dd>
               </dl>
             ) : (

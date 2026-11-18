@@ -7,7 +7,7 @@ import type { OpenedProject, ProjectContents, ProjectSaveRequest } from '../shar
 import { openProjectArchive, writeProjectArchive } from './projectArchive';
 import path from 'node:path';
 import { WorkerClient, readBatchBinary } from './workerClient';
-import type { ConnectedFillRequest, ExposureRequest, RidgeBandRequest, ModelSummary, Vec3 } from '../shared/workerProtocol';
+import type { ConnectedFillRequest, ExposureRequest, RidgeBandRequest, KitImportResult, ModelSummary, Vec3 } from '../shared/workerProtocol';
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 declare const MAIN_WINDOW_VITE_NAME: string;
@@ -19,6 +19,9 @@ let workerClient: WorkerClient | null = null;
 const activeFillJobs = new Set<string>();
 const activeLightingJobs = new Set<string>();
 let activeImportJobId: string | null = null;
+let activeKitImport: AbortController | null = null;
+const kitModels = new Map<string, ModelSummary>();
+const MAX_KIT_BYTES = 2 * 1024 * 1024 * 1024;
 const authorizedImportPaths = new Set<string>();
 let committedBatchPaths = new Set<string>();
 const stagedBatchesByModelId = new Map<string, Set<string>>();
@@ -208,6 +211,71 @@ app.whenReady().then(() => {
     return importStl(path.resolve(filePath));
   });
 
+  ipcMain.handle('kit:import-parts', async (): Promise<KitImportResult | null> => {
+    if (!mainWindow || !loadedModelId || activeKitImport || activeImportJobId) return null;
+    const controller = new AbortController();
+    activeKitImport = controller;
+    const models: ModelSummary[] = [];
+    const errors: string[] = [];
+    try {
+      const selection = await dialog.showOpenDialog(mainWindow, {
+        title: 'Add binary STL kit parts',
+        properties: ['openFile', 'multiSelections'],
+        filters: [{ name: 'Binary STL kit parts', extensions: ['stl'] }],
+      });
+      if (selection.canceled) return null;
+      const anchor = await getWorkerClient().getActiveModel();
+      if (!anchor) throw new Error('Open the kit anchor before adding parts.');
+      let total = anchor.fileSizeBytes;
+      for (const part of kitModels.values()) total += part.fileSizeBytes;
+      const loadedSources = new Set([...originalSources.values()].map((source) => source.path.toLowerCase()));
+      for (const file of selection.filePaths) {
+        if (controller.signal.aborted) break;
+        const source = path.resolve(file);
+        const name = path.basename(source);
+        const key = source.toLowerCase();
+        if (loadedSources.has(key)) {
+          errors.push(`${name} is already loaded.`);
+          continue;
+        }
+        try {
+          if (path.extname(source).toLowerCase() !== '.stl') throw new Error('Choose a binary STL.');
+          const handle = await fs.promises.open(source, 'r');
+          let bytes: number;
+          try {
+            bytes = (await handle.stat()).size;
+            const header = Buffer.alloc(84);
+            const { bytesRead } = await handle.read(header, 0, header.length, 0);
+            if (bytesRead !== header.length || header.readUInt32LE(80) === 0 || bytes !== 84 + header.readUInt32LE(80) * 50) {
+              throw new Error('Kit parts must be full binary STL files.');
+            }
+            if (total + bytes > MAX_KIT_BYTES) throw new Error('Adding this part would exceed the 2 GiB kit limit.');
+          } finally {
+            await handle.close();
+          }
+          controller.signal.throwIfAborted();
+          const part = await importStl(source);
+          if (controller.signal.aborted || total + part.fileSizeBytes > MAX_KIT_BYTES) {
+            await getWorkerClient().discardModel(part.modelId);
+            stagedBatchesByModelId.delete(part.modelId);
+            await releaseOriginalSource(part.modelId);
+            controller.signal.throwIfAborted();
+            throw new Error('Adding this part would exceed the 2 GiB kit limit.');
+          }
+          kitModels.set(part.modelId, part);
+          models.push(part);
+          loadedSources.add(key);
+          total += part.fileSizeBytes;
+        } catch (error) {
+          if (!controller.signal.aborted) errors.push(`${name} · ${error instanceof Error ? error.message : 'Import failed.'}`);
+        }
+      }
+      return { models, errors, canceled: controller.signal.aborted };
+    } finally {
+      activeKitImport = null;
+    }
+  });
+
   ipcMain.handle('worker:commit-model', async (_event, modelId: string) => {
     if (typeof modelId !== 'string' || !modelId) {
       return { committed: false };
@@ -217,6 +285,11 @@ app.whenReady().then(() => {
       const previous = loadedModelId;
       loadedModelId = modelId;
       if (previous && previous !== modelId) await releaseOriginalSource(previous);
+      for (const partId of kitModels.keys()) {
+        stagedBatchesByModelId.delete(partId);
+        await releaseOriginalSource(partId);
+      }
+      kitModels.clear();
       const promoted = stagedBatchesByModelId.get(modelId);
       if (promoted) {
         committedBatchPaths = promoted;
@@ -232,6 +305,7 @@ app.whenReady().then(() => {
     }
     const res = await getWorkerClient().discardModel(modelId);
     if (res.discarded) {
+      kitModels.delete(modelId);
       stagedBatchesByModelId.delete(modelId);
       await releaseOriginalSource(modelId);
     }
@@ -239,8 +313,9 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle('worker:cancel-import', async () => {
+    activeKitImport?.abort();
     if (!activeImportJobId) {
-      return { canceled: false };
+      return { canceled: Boolean(activeKitImport?.signal.aborted) };
     }
     return getWorkerClient().cancelImport(activeImportJobId);
   });
