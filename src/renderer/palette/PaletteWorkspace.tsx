@@ -1,6 +1,7 @@
 import React, { useEffect, useId, useRef, useState } from 'react';
 import {
   mapClientToCanvasPixel,
+  readBoundedRegionImageData,
   rgbToHex,
   suggestTonesFromImageData,
 } from './colorMath';
@@ -74,6 +75,7 @@ export default function PaletteWorkspace(): React.ReactElement {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const nextRefId = useRef(1);
+  const isMountedRef = useRef(true);
   const urlsToRevokeRef = useRef<string[]>([]);
 
   const [references, setReferences] = useState<ReferenceImage[]>([]);
@@ -88,6 +90,11 @@ export default function PaletteWorkspace(): React.ReactElement {
   const [toolMode, setToolMode] = useState<'eyedropper' | 'select'>('eyedropper');
   const [selection, setSelection] = useState<PixelRect | null>(null);
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
+  const [cursor, setCursor] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [keyboardAnchor, setKeyboardAnchor] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
   const [suggestionPreview, setSuggestionPreview] =
     useState<ToneSuggestions | null>(null);
 
@@ -98,10 +105,13 @@ export default function PaletteWorkspace(): React.ReactElement {
     recipes.find((recipe) => recipe.id === activeRecipeId) ?? recipes[0];
 
   useEffect(() => {
+    isMountedRef.current = true;
     return () => {
+      isMountedRef.current = false;
       for (const url of urlsToRevokeRef.current) {
         URL.revokeObjectURL(url);
       }
+      urlsToRevokeRef.current = [];
     };
   }, []);
 
@@ -127,38 +137,69 @@ export default function PaletteWorkspace(): React.ReactElement {
     }
     const files = Array.from(fileList);
     const supported = files.filter(isSupportedImageFile);
-    const rejectedCount = files.length - supported.length;
+    const unsupportedNames = files
+      .filter((file) => !isSupportedImageFile(file))
+      .map((file) => file.name);
+    event.target.value = '';
 
     if (supported.length === 0) {
-      setImportError('Select PNG, JPEG, or WebP image files.');
-      event.target.value = '';
+      setImportError(
+        `Unsupported file format (${unsupportedNames.join(', ')}). Select PNG, JPEG, or WebP images.`,
+      );
       return;
     }
 
-    setImportError(
-      rejectedCount > 0
-        ? 'Skipped unsupported files. Only PNG, JPEG, and WebP images are supported.'
-        : null,
+    const results = await Promise.allSettled(
+      supported.map((file) =>
+        loadReferenceFile(file, `ref-${nextRefId.current++}`),
+      ),
     );
 
-    try {
-      const loaded = await Promise.all(
-        supported.map((file) =>
-          loadReferenceFile(file, `ref-${nextRefId.current++}`),
-        ),
-      );
+    const loaded: ReferenceImage[] = [];
+    const failedMessages: string[] = [];
+
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        loaded.push(result.value);
+      } else {
+        failedMessages.push(
+          result.reason instanceof Error
+            ? result.reason.message
+            : 'Could not decode an image.',
+        );
+      }
+    }
+
+    if (!isMountedRef.current) {
+      for (const item of loaded) {
+        URL.revokeObjectURL(item.url);
+      }
+      return;
+    }
+
+    if (loaded.length > 0) {
       for (const item of loaded) {
         urlsToRevokeRef.current.push(item.url);
       }
       setReferences((prev) => [...prev, ...loaded]);
       setActiveRefId((prev) => prev ?? loaded[0].id);
-    } catch (err) {
-      setImportError(
-        err instanceof Error ? err.message : 'Failed to import reference image.',
-      );
-    } finally {
-      event.target.value = '';
     }
+
+    const feedbackParts: string[] = [];
+    if (unsupportedNames.length > 0) {
+      feedbackParts.push(
+        `Skipped unsupported files (${unsupportedNames.join(', ')}). Use PNG, JPEG, or WebP.`,
+      );
+    }
+    if (failedMessages.length > 0) {
+      feedbackParts.push(failedMessages.join(' '));
+    }
+    if (feedbackParts.length > 0 && loaded.length > 0) {
+      feedbackParts.push(
+        `Kept ${loaded.length} valid ${loaded.length === 1 ? 'image' : 'images'}.`,
+      );
+    }
+    setImportError(feedbackParts.length > 0 ? feedbackParts.join(' ') : null);
   }
 
   function handleCreateRecipe() {
@@ -192,26 +233,63 @@ export default function PaletteWorkspace(): React.ReactElement {
     );
   }
 
+  function clampToImage(x: number, y: number): { x: number; y: number } {
+    if (!activeReference) {
+      return { x: 0, y: 0 };
+    }
+    return {
+      x: Math.max(0, Math.min(activeReference.width - 1, Math.round(x))),
+      y: Math.max(0, Math.min(activeReference.height - 1, Math.round(y))),
+    };
+  }
+
+  function makeRectFromPoints(
+    a: { x: number; y: number },
+    b: { x: number; y: number },
+  ): PixelRect {
+    const left = Math.min(a.x, b.x);
+    const top = Math.min(a.y, b.y);
+    const right = Math.max(a.x, b.x);
+    const bottom = Math.max(a.y, b.y);
+    return {
+      x: left,
+      y: top,
+      width: Math.max(1, right - left + 1),
+      height: Math.max(1, bottom - top + 1),
+    };
+  }
+
+  function samplePixelAt(x: number, y: number) {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      return;
+    }
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      return;
+    }
+    const clamped = clampToImage(x, y);
+    const data = ctx.getImageData(clamped.x, clamped.y, 1, 1).data;
+    const hex = rgbToHex(data[0], data[1], data[2]);
+    updateActiveSwatch(activeTone, { hex });
+  }
+
   function handleCanvasPointerDown(event: React.PointerEvent<HTMLCanvasElement>) {
     const canvas = canvasRef.current;
     if (!canvas) {
       return;
     }
     const { x, y } = mapClientToCanvasPixel(canvas, event.clientX, event.clientY);
+    setCursor({ x, y });
 
     if (toolMode === 'select') {
+      setKeyboardAnchor(null);
       setDragStart({ x, y });
       setSelection({ x, y, width: 1, height: 1 });
       return;
     }
 
-    const ctx = canvas.getContext('2d');
-    if (!ctx) {
-      return;
-    }
-    const data = ctx.getImageData(x, y, 1, 1).data;
-    const hex = rgbToHex(data[0], data[1], data[2]);
-    updateActiveSwatch(activeTone, { hex });
+    samplePixelAt(x, y);
   }
 
   function handleCanvasPointerMove(event: React.PointerEvent<HTMLCanvasElement>) {
@@ -220,16 +298,8 @@ export default function PaletteWorkspace(): React.ReactElement {
       return;
     }
     const { x, y } = mapClientToCanvasPixel(canvas, event.clientX, event.clientY);
-    const left = Math.min(dragStart.x, x);
-    const top = Math.min(dragStart.y, y);
-    const right = Math.max(dragStart.x, x);
-    const bottom = Math.max(dragStart.y, y);
-    setSelection({
-      x: left,
-      y: top,
-      width: Math.max(1, right - left + 1),
-      height: Math.max(1, bottom - top + 1),
-    });
+    setCursor({ x, y });
+    setSelection(makeRectFromPoints(dragStart, { x, y }));
   }
 
   function handleCanvasPointerUp() {
@@ -238,13 +308,57 @@ export default function PaletteWorkspace(): React.ReactElement {
     }
   }
 
+  function toggleKeyboardSelection() {
+    if (!keyboardAnchor) {
+      setKeyboardAnchor(cursor);
+      setSelection({ x: cursor.x, y: cursor.y, width: 1, height: 1 });
+      return;
+    }
+    setSelection(makeRectFromPoints(keyboardAnchor, cursor));
+    setKeyboardAnchor(null);
+  }
+
+  function handleCanvasKeyDown(event: React.KeyboardEvent<HTMLCanvasElement>) {
+    if (!activeReference) {
+      return;
+    }
+    const step = event.shiftKey ? 10 : 1;
+    let nextCursor: { x: number; y: number } | null = null;
+
+    if (event.key === 'ArrowLeft') {
+      nextCursor = clampToImage(cursor.x - step, cursor.y);
+    } else if (event.key === 'ArrowRight') {
+      nextCursor = clampToImage(cursor.x + step, cursor.y);
+    } else if (event.key === 'ArrowUp') {
+      nextCursor = clampToImage(cursor.x, cursor.y - step);
+    } else if (event.key === 'ArrowDown') {
+      nextCursor = clampToImage(cursor.x, cursor.y + step);
+    } else if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      if (toolMode === 'eyedropper') {
+        samplePixelAt(cursor.x, cursor.y);
+      } else {
+        toggleKeyboardSelection();
+      }
+      return;
+    } else if (event.key === 'Escape' && keyboardAnchor) {
+      event.preventDefault();
+      setKeyboardAnchor(null);
+      return;
+    }
+
+    if (nextCursor) {
+      event.preventDefault();
+      setCursor(nextCursor);
+      if (toolMode === 'select' && keyboardAnchor) {
+        setSelection(makeRectFromPoints(keyboardAnchor, nextCursor));
+      }
+    }
+  }
+
   function handleSuggestTones() {
     const canvas = canvasRef.current;
     if (!canvas) {
-      return;
-    }
-    const ctx = canvas.getContext('2d');
-    if (!ctx) {
       return;
     }
     const rect = selection ?? {
@@ -253,7 +367,10 @@ export default function PaletteWorkspace(): React.ReactElement {
       width: canvas.width,
       height: canvas.height,
     };
-    const imageData = ctx.getImageData(rect.x, rect.y, rect.width, rect.height);
+    const imageData = readBoundedRegionImageData(canvas, rect);
+    if (!imageData) {
+      return;
+    }
     const suggested = suggestTonesFromImageData(imageData);
     if (suggested) {
       setSuggestionPreview(suggested);
@@ -347,6 +464,8 @@ export default function PaletteWorkspace(): React.ReactElement {
                   onClick={() => {
                     setActiveRefId(ref.id);
                     setSelection(null);
+                    setKeyboardAnchor(null);
+                    setCursor({ x: 0, y: 0 });
                     setSuggestionPreview(null);
                   }}
                 >
@@ -399,10 +518,22 @@ export default function PaletteWorkspace(): React.ReactElement {
                     ref={canvasRef}
                     data-testid="reference-canvas"
                     className={styles.canvas}
-                    aria-label={`Reference canvas for ${activeReference.name}`}
+                    width={activeReference.width}
+                    height={activeReference.height}
+                    tabIndex={0}
+                    aria-label={`Reference canvas for ${activeReference.name}. Use arrow keys to move cursor and Enter or Space to ${toolMode === 'eyedropper' ? 'sample pixel' : 'set selection corner'}.`}
+                    onKeyDown={handleCanvasKeyDown}
                     onPointerDown={handleCanvasPointerDown}
                     onPointerMove={handleCanvasPointerMove}
                     onPointerUp={handleCanvasPointerUp}
+                  />
+                  <div
+                    className={styles.cursorMarker}
+                    aria-hidden="true"
+                    style={{
+                      left: `${((cursor.x + 0.5) / activeReference.width) * 100}%`,
+                      top: `${((cursor.y + 0.5) / activeReference.height) * 100}%`,
+                    }}
                   />
                   {selection && (
                     <div
@@ -417,6 +548,71 @@ export default function PaletteWorkspace(): React.ReactElement {
                     />
                   )}
                 </div>
+              </div>
+              <div className={styles.coordBar}>
+                <div className={styles.coordField}>
+                  <label className={styles.label} htmlFor={`${importInputId}-cursor-x`}>
+                    Cursor X
+                  </label>
+                  <input
+                    id={`${importInputId}-cursor-x`}
+                    className={styles.input}
+                    type="number"
+                    min={0}
+                    max={activeReference.width - 1}
+                    value={cursor.x}
+                    onChange={(event) => {
+                      const next = clampToImage(
+                        Number(event.target.value) || 0,
+                        cursor.y,
+                      );
+                      setCursor(next);
+                      if (toolMode === 'select' && keyboardAnchor) {
+                        setSelection(makeRectFromPoints(keyboardAnchor, next));
+                      }
+                    }}
+                  />
+                </div>
+                <div className={styles.coordField}>
+                  <label className={styles.label} htmlFor={`${importInputId}-cursor-y`}>
+                    Cursor Y
+                  </label>
+                  <input
+                    id={`${importInputId}-cursor-y`}
+                    className={styles.input}
+                    type="number"
+                    min={0}
+                    max={activeReference.height - 1}
+                    value={cursor.y}
+                    onChange={(event) => {
+                      const next = clampToImage(
+                        cursor.x,
+                        Number(event.target.value) || 0,
+                      );
+                      setCursor(next);
+                      if (toolMode === 'select' && keyboardAnchor) {
+                        setSelection(makeRectFromPoints(keyboardAnchor, next));
+                      }
+                    }}
+                  />
+                </div>
+                {toolMode === 'eyedropper' ? (
+                  <button
+                    type="button"
+                    className={`${styles.btn} ${styles.btnSecondary}`}
+                    onClick={() => samplePixelAt(cursor.x, cursor.y)}
+                  >
+                    Sample pixel
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className={`${styles.btn} ${styles.btnSecondary}`}
+                    onClick={toggleKeyboardSelection}
+                  >
+                    {keyboardAnchor ? 'Finish selection' : 'Start selection'}
+                  </button>
+                )}
               </div>
               {suggestionPreview && (
                 <section

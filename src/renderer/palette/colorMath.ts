@@ -1,4 +1,4 @@
-import type { ToneSuggestions } from './types';
+import type { PixelRect, ToneSuggestions } from './types';
 
 function byteToHex(value: number): string {
   return Math.max(0, Math.min(255, Math.round(value)))
@@ -193,4 +193,44 @@ export function suggestTonesFromImageData(
     midtone: clusterRgb[1].hex,
     highlight: clusterRgb[2].hex,
   };
+}
+
+const MAX_AREA_SAMPLE_PIXELS = 65536;
+
+export function readBoundedRegionImageData(
+  sourceCanvas: HTMLCanvasElement,
+  rect: PixelRect,
+): ImageData | null {
+  const area = rect.width * rect.height;
+  if (area <= 0) {
+    return null;
+  }
+  if (area <= MAX_AREA_SAMPLE_PIXELS) {
+    const ctx = sourceCanvas.getContext('2d');
+    return ctx ? ctx.getImageData(rect.x, rect.y, rect.width, rect.height) : null;
+  }
+
+  const scale = Math.sqrt(MAX_AREA_SAMPLE_PIXELS / area);
+  const sampleW = Math.max(1, Math.floor(rect.width * scale));
+  const sampleH = Math.max(1, Math.floor(rect.height * scale));
+  const sampleCanvas = document.createElement('canvas');
+  sampleCanvas.width = sampleW;
+  sampleCanvas.height = sampleH;
+  const sampleCtx = sampleCanvas.getContext('2d');
+  if (!sampleCtx) {
+    return null;
+  }
+  sampleCtx.imageSmoothingEnabled = false;
+  sampleCtx.drawImage(
+    sourceCanvas,
+    rect.x,
+    rect.y,
+    rect.width,
+    rect.height,
+    0,
+    0,
+    sampleW,
+    sampleH,
+  );
+  return sampleCtx.getImageData(0, 0, sampleW, sampleH);
 }

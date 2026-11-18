@@ -15,7 +15,7 @@ function createBitmapFixture(
   width: number,
   height: number,
   fillPixel: (x: number, y: number) => [number, number, number, number?],
-  registry: Map<string, FixtureBitmap>,
+  registry: Map<string, FixtureBitmap | 'error' | 'deferred'>,
 ): File {
   const data = new Uint8ClampedArray(width * height * 4);
   for (let y = 0; y < height; y++) {
@@ -36,8 +36,11 @@ function createBitmapFixture(
 }
 
 function installCanvasAndImageHarness() {
-  const registry = new Map<string, FixtureBitmap>();
-  const urlToBitmap = new Map<string, FixtureBitmap>();
+  const registry = new Map<string, FixtureBitmap | 'error' | 'deferred'>();
+  const urlToBitmap = new Map<string, FixtureBitmap | 'error' | 'deferred'>();
+  const deferredResolvers = new Map<string, (bitmap: FixtureBitmap) => void>();
+  const createdUrls: string[] = [];
+  const revokeCounts = new Map<string, number>();
   const canvasBuffers = new WeakMap<HTMLCanvasElement, FixtureBitmap>();
   let urlCounter = 0;
 
@@ -46,12 +49,14 @@ function installCanvasAndImageHarness() {
     createObjectURL: (blob: Blob) => {
       const key = (blob as File & { __fixtureKey?: string }).__fixtureKey;
       const url = `blob:fixture-${++urlCounter}`;
+      createdUrls.push(url);
       if (key && registry.has(key)) {
         urlToBitmap.set(url, registry.get(key)!);
       }
       return url;
     },
     revokeObjectURL: (url: string) => {
+      revokeCounts.set(url, (revokeCounts.get(url) ?? 0) + 1);
       urlToBitmap.delete(url);
     },
   });
@@ -72,17 +77,28 @@ function installCanvasAndImageHarness() {
 
     set src(value: string) {
       this._src = value;
-      const bitmap = urlToBitmap.get(value);
+      const entry = urlToBitmap.get(value);
+      if (entry === 'deferred') {
+        deferredResolvers.set(value, (bitmap: FixtureBitmap) => {
+          this.naturalWidth = bitmap.width;
+          this.naturalHeight = bitmap.height;
+          this.width = bitmap.width;
+          this.height = bitmap.height;
+          this.__bitmap = bitmap;
+          this.onload?.();
+        });
+        return;
+      }
       queueMicrotask(() => {
-        if (!bitmap) {
+        if (!entry || entry === 'error') {
           this.onerror?.();
           return;
         }
-        this.naturalWidth = bitmap.width;
-        this.naturalHeight = bitmap.height;
-        this.width = bitmap.width;
-        this.height = bitmap.height;
-        this.__bitmap = bitmap;
+        this.naturalWidth = entry.width;
+        this.naturalHeight = entry.height;
+        this.width = entry.width;
+        this.height = entry.height;
+        this.__bitmap = entry;
         this.onload?.();
       });
     }
@@ -98,8 +114,55 @@ function installCanvasAndImageHarness() {
     const canvas = this;
     return {
       clearRect: () => {},
-      drawImage: (img: unknown) => {
-        const bitmap = (img as { __bitmap?: FixtureBitmap }).__bitmap;
+      drawImage: (
+        imgOrCanvas: unknown,
+        sx?: number,
+        sy?: number,
+        sw?: number,
+        sh?: number,
+        dx?: number,
+        dy?: number,
+        dw?: number,
+        dh?: number,
+      ) => {
+        if (imgOrCanvas instanceof HTMLCanvasElement) {
+          const srcBuf = canvasBuffers.get(imgOrCanvas);
+          if (!srcBuf) return;
+          const srcX = sx ?? 0;
+          const srcY = sy ?? 0;
+          const srcW = sw ?? srcBuf.width;
+          const srcH = sh ?? srcBuf.height;
+          const dstW = dw ?? srcW;
+          const dstH = dh ?? srcH;
+          const dstX = dx ?? 0;
+          const dstY = dy ?? 0;
+          const out = new Uint8ClampedArray(canvas.width * canvas.height * 4);
+          for (let y = 0; y < dstH; y++) {
+            for (let x = 0; x < dstW; x++) {
+              const sampleX = Math.min(
+                srcBuf.width - 1,
+                Math.floor(srcX + (x / dstW) * srcW),
+              );
+              const sampleY = Math.min(
+                srcBuf.height - 1,
+                Math.floor(srcY + (y / dstH) * srcH),
+              );
+              const srcIdx = (sampleY * srcBuf.width + sampleX) * 4;
+              const dstIdx = ((dstY + y) * canvas.width + (dstX + x)) * 4;
+              out[dstIdx] = srcBuf.data[srcIdx];
+              out[dstIdx + 1] = srcBuf.data[srcIdx + 1];
+              out[dstIdx + 2] = srcBuf.data[srcIdx + 2];
+              out[dstIdx + 3] = srcBuf.data[srcIdx + 3];
+            }
+          }
+          canvasBuffers.set(canvas, {
+            width: canvas.width,
+            height: canvas.height,
+            data: out,
+          });
+          return;
+        }
+        const bitmap = (imgOrCanvas as { __bitmap?: FixtureBitmap }).__bitmap;
         if (bitmap) {
           canvasBuffers.set(canvas, {
             width: bitmap.width,
@@ -133,14 +196,18 @@ function installCanvasAndImageHarness() {
     } as unknown as CanvasRenderingContext2D;
   } as unknown as typeof HTMLCanvasElement.prototype.getContext;
 
-  return { registry };
+  return { registry, createdUrls, revokeCounts, deferredResolvers };
 }
 
 describe('PaletteWorkspace', () => {
-  let registry: Map<string, FixtureBitmap>;
+  let registry: Map<string, FixtureBitmap | 'error' | 'deferred'>;
+  let createdUrls: string[];
+  let revokeCounts: Map<string, number>;
+  let deferredResolvers: Map<string, (bitmap: FixtureBitmap) => void>;
 
   beforeEach(() => {
-    ({ registry } = installCanvasAndImageHarness());
+    ({ registry, createdUrls, revokeCounts, deferredResolvers } =
+      installCanvasAndImageHarness());
   });
 
   it('mounts with no required props and lets the painter create and rename recipes', async () => {
@@ -412,5 +479,192 @@ describe('PaletteWorkspace', () => {
     expect(screen.getByLabelText(/shadow mix notes/i)).toHaveValue(
       '1:1 with water',
     );
+  });
+
+  it('retains valid images on mixed decode failure, revokes every object URL once, and cleans up late decodes after unmount', async () => {
+    const { unmount } = render(<PaletteWorkspace />);
+
+    const goodFile = createBitmapFixture(
+      'good.png',
+      'image/png',
+      12,
+      12,
+      () => [40, 80, 120],
+      registry as Map<string, FixtureBitmap>,
+    );
+    const badFile = new File([new Uint8Array([1, 2, 3])], 'corrupt.png', {
+      type: 'image/png',
+    });
+    (badFile as File & { __fixtureKey?: string }).__fixtureKey = 'corrupt-key';
+    registry.set('corrupt-key', 'error');
+
+    const fileInput = screen.getByLabelText(/import reference images/i);
+    fireEvent.change(fileInput, { target: { files: [goodFile, badFile] } });
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: /good\.png/i }),
+      ).toBeInTheDocument();
+    });
+    expect(screen.getByRole('alert')).toHaveTextContent(/corrupt\.png/i);
+    expect(createdUrls).toHaveLength(2);
+    expect(revokeCounts.get(createdUrls[1])).toBe(1);
+    expect(revokeCounts.get(createdUrls[0]) ?? 0).toBe(0);
+
+    // Trigger a slow decode, unmount before it resolves, then resolve it
+    const slowFile = new File([new Uint8Array([4, 5, 6])], 'slow.png', {
+      type: 'image/png',
+    });
+    (slowFile as File & { __fixtureKey?: string }).__fixtureKey = 'slow-key';
+    registry.set('slow-key', 'deferred');
+    fireEvent.change(fileInput, { target: { files: [slowFile] } });
+
+    const slowUrl = createdUrls[2];
+    expect(slowUrl).toBeDefined();
+    expect(deferredResolvers.has(slowUrl)).toBe(true);
+
+    unmount();
+    expect(revokeCounts.get(createdUrls[0])).toBe(1);
+    expect(revokeCounts.get(createdUrls[1])).toBe(1);
+
+    deferredResolvers.get(slowUrl)!({
+      width: 8,
+      height: 8,
+      data: new Uint8ClampedArray(8 * 8 * 4),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(revokeCounts.get(slowUrl)).toBe(1);
+  });
+
+  it('bounds getImageData area memory for very large images while preserving exact 1x1 eyedropper sampling', async () => {
+    const user = userEvent.setup();
+    render(<PaletteWorkspace />);
+
+    const largeImg = createBitmapFixture(
+      'large-4mp.png',
+      'image/png',
+      2000,
+      2000,
+      (x, y) => {
+        if (x === 1234 && y === 1567) return [42, 173, 99];
+        if (y < 667) return [15, 25, 35];
+        if (y < 1334) return [95, 115, 135];
+        return [215, 225, 235];
+      },
+      registry,
+    );
+
+    const fileInput = screen.getByLabelText(/import reference images/i);
+    fireEvent.change(fileInput, { target: { files: [largeImg] } });
+
+    await waitFor(() => {
+      const el = screen.getByTestId('reference-canvas') as HTMLCanvasElement;
+      expect(el.width).toBe(2000);
+    });
+
+    const canvas = screen.getByTestId('reference-canvas') as HTMLCanvasElement;
+    const origGetContext = canvas.getContext.bind(canvas);
+    const getImageDataSizes: number[] = [];
+    vi.spyOn(canvas, 'getContext').mockImplementation(((id: string) => {
+      const ctx = origGetContext(id as '2d');
+      if (!ctx) return null;
+      const origGetImageData = ctx.getImageData.bind(ctx);
+      ctx.getImageData = (sx: number, sy: number, sw: number, sh: number) => {
+        getImageDataSizes.push(sw * sh);
+        return origGetImageData(sx, sy, sw, sh);
+      };
+      return ctx;
+    }) as typeof canvas.getContext);
+
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 2000,
+      height: 2000,
+      right: 2000,
+      bottom: 2000,
+      x: 0,
+      y: 0,
+      toJSON: () => {},
+    });
+
+    fireEvent.pointerDown(canvas, { clientX: 1234, clientY: 1567 });
+    fireEvent.pointerUp(canvas, { clientX: 1234, clientY: 1567 });
+    expect(screen.getByLabelText(/shadow hex/i)).toHaveValue('#2AAD63');
+
+    await user.click(screen.getByRole('button', { name: /suggest tones/i }));
+    const preview = screen.getByRole('region', {
+      name: /tone suggestion preview/i,
+    });
+    expect(preview).toHaveTextContent('#0F1923');
+    expect(preview).toHaveTextContent('#5F7387');
+    expect(preview).toHaveTextContent('#D7E1EB');
+    expect(Math.max(...getImageDataSizes)).toBeLessThanOrEqual(65536);
+  });
+
+  it('supports keyboard pixel sampling and keyboard rectangle selection with clear labels and focus', async () => {
+    const user = userEvent.setup();
+    render(<PaletteWorkspace />);
+
+    const img = createBitmapFixture(
+      'keyboard-ref.png',
+      'image/png',
+      20,
+      20,
+      (x, y) => {
+        if (x === 2 && y === 1) return [17, 136, 204];
+        if (x >= 10 && y >= 10) {
+          if (y < 13) return [30, 15, 15];
+          if (y < 16) return [140, 40, 40];
+          return [240, 180, 180];
+        }
+        return [220, 220, 220];
+      },
+      registry,
+    );
+
+    const fileInput = screen.getByLabelText(/import reference images/i);
+    fireEvent.change(fileInput, { target: { files: [img] } });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('reference-canvas')).toBeInTheDocument();
+    });
+
+    const canvas = screen.getByTestId('reference-canvas') as HTMLCanvasElement;
+    expect(canvas).toHaveAttribute('tabindex', '0');
+
+    // Keyboard arrow navigation + Enter samples exact pixel (2, 1) -> #1188CC
+    canvas.focus();
+    expect(canvas).toHaveFocus();
+    fireEvent.keyDown(canvas, { key: 'ArrowRight' });
+    fireEvent.keyDown(canvas, { key: 'ArrowRight' });
+    fireEvent.keyDown(canvas, { key: 'ArrowDown' });
+    fireEvent.keyDown(canvas, { key: 'Enter' });
+    expect(screen.getByLabelText(/shadow hex/i)).toHaveValue('#1188CC');
+
+    // Switch to Select region and select bottom-right quadrant via keyboard
+    await user.click(screen.getByRole('button', { name: /select region/i }));
+    const cursorX = screen.getByLabelText(/cursor x/i);
+    const cursorY = screen.getByLabelText(/cursor y/i);
+    await user.clear(cursorX);
+    await user.type(cursorX, '10');
+    await user.clear(cursorY);
+    await user.type(cursorY, '10');
+
+    canvas.focus();
+    fireEvent.keyDown(canvas, { key: 'Enter' });
+    fireEvent.keyDown(canvas, { key: 'ArrowRight', shiftKey: true });
+    fireEvent.keyDown(canvas, { key: 'ArrowDown', shiftKey: true });
+    fireEvent.keyDown(canvas, { key: 'Enter' });
+
+    await user.click(screen.getByRole('button', { name: /suggest tones/i }));
+    const preview = screen.getByRole('region', {
+      name: /tone suggestion preview/i,
+    });
+    expect(preview).toHaveTextContent('#1E0F0F');
+    expect(preview).toHaveTextContent('#8C2828');
+    expect(preview).toHaveTextContent('#F0B4B4');
   });
 });

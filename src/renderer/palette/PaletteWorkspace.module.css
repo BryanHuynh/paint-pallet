@@ -506,6 +506,36 @@
   border-radius: 4px;
 }
 
+.canvas:focus-visible {
+  outline: 2px solid var(--pp-accent);
+  outline-offset: 2px;
+}
+
+.cursorMarker {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--pp-accent);
+  background: rgba(255, 255, 255, 0.75);
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.coordBar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.coordField {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 88px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .btn,
   .fileLabel,
