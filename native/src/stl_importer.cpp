@@ -1,0 +1,649 @@
+#include "stl_importer.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <limits>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+namespace fs = std::filesystem;
+
+namespace pp {
+namespace {
+
+constexpr uint64_t kStlHeaderBytes = 84ULL;
+constexpr uint64_t kStlRecordBytes = 50ULL;
+constexpr uint32_t kChunkTriangles = 65536;
+constexpr uint32_t kCellFlushThreshold = 4096;
+constexpr uint32_t kPreviewMaxTriangles = 180000;
+constexpr uint32_t kBatchMagic = 0x31425050;  // 'PPB1' little-endian
+
+#ifdef _WIN32
+std::wstring utf8ToWide(const std::string& utf8) {
+  if (utf8.empty()) return {};
+  int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), nullptr, 0);
+  if (len <= 0) return {};
+  std::wstring out(static_cast<size_t>(len), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), out.data(), len);
+  return out;
+}
+
+std::string wideToUtf8(const std::wstring& w) {
+  if (w.empty()) return {};
+  int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+  if (len <= 0) return {};
+  std::string out(static_cast<size_t>(len), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), out.data(), len, nullptr, nullptr);
+  return out;
+}
+
+inline fs::path utf8ToPath(const std::string& s) {
+  return fs::path(utf8ToWide(s));
+}
+
+inline std::string pathToUtf8(const fs::path& p) {
+  return wideToUtf8(p.wstring());
+}
+
+class Win64FileReader {
+ public:
+  explicit Win64FileReader(const std::string& pathUtf8) {
+    std::wstring wpath = utf8ToWide(pathUtf8);
+    handle_ = CreateFileW(
+        wpath.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+        nullptr);
+    if (handle_ != INVALID_HANDLE_VALUE) {
+      LARGE_INTEGER sz{};
+      if (GetFileSizeEx(handle_, &sz)) {
+        fileSize_ = static_cast<uint64_t>(sz.QuadPart);
+      }
+    }
+  }
+
+  ~Win64FileReader() {
+    if (handle_ != INVALID_HANDLE_VALUE) {
+      CloseHandle(handle_);
+    }
+  }
+
+  Win64FileReader(const Win64FileReader&) = delete;
+  Win64FileReader& operator=(const Win64FileReader&) = delete;
+
+  bool isOpen() const { return handle_ != INVALID_HANDLE_VALUE; }
+  uint64_t fileSize() const { return fileSize_; }
+
+  bool seek64(uint64_t offset) {
+    LARGE_INTEGER li{};
+    li.QuadPart = static_cast<LONGLONG>(offset);
+    return SetFilePointerEx(handle_, li, nullptr, FILE_BEGIN) != 0;
+  }
+
+  bool readExact(void* dst, size_t bytes, size_t* outRead = nullptr) {
+    uint8_t* ptr = static_cast<uint8_t*>(dst);
+    size_t total = 0;
+    while (total < bytes) {
+      DWORD toRead = static_cast<DWORD>(std::min<size_t>(bytes - total, 16u * 1024u * 1024u));
+      DWORD readNow = 0;
+      if (!ReadFile(handle_, ptr + total, toRead, &readNow, nullptr)) {
+        if (outRead) *outRead = total;
+        return false;
+      }
+      if (readNow == 0) {
+        if (outRead) *outRead = total;
+        return false;
+      }
+      total += readNow;
+    }
+    if (outRead) *outRead = total;
+    return true;
+  }
+
+ private:
+  HANDLE handle_ = INVALID_HANDLE_VALUE;
+  uint64_t fileSize_ = 0;
+};
+#endif
+
+struct PackedTri {
+  float pos[9];
+  float norm[9];
+  uint32_t faceId;
+};
+
+struct CellBuffer {
+  Bounds3 bounds{};
+  uint32_t count = 0;
+  std::vector<PackedTri> buffer;
+  std::string tempPath;
+  FILE* tempFile = nullptr;
+
+  CellBuffer() {
+    resetBounds();
+  }
+
+  ~CellBuffer() {
+    if (tempFile) {
+      fclose(tempFile);
+      tempFile = nullptr;
+    }
+  }
+
+  void resetBounds() {
+    bounds.min[0] = bounds.min[1] = bounds.min[2] = std::numeric_limits<float>::infinity();
+    bounds.max[0] = bounds.max[1] = bounds.max[2] = -std::numeric_limits<float>::infinity();
+  }
+
+  void expandBounds(const float* p) {
+    for (int k = 0; k < 3; ++k) {
+      float v0 = p[k];
+      float v1 = p[3 + k];
+      float v2 = p[6 + k];
+      bounds.min[k] = std::min({bounds.min[k], v0, v1, v2});
+      bounds.max[k] = std::max({bounds.max[k], v0, v1, v2});
+    }
+  }
+
+  bool append(const PackedTri& tri) {
+    expandBounds(tri.pos);
+    ++count;
+    buffer.push_back(tri);
+    if (buffer.size() >= kCellFlushThreshold) {
+      return flush();
+    }
+    return true;
+  }
+
+  bool flush() {
+    if (buffer.empty()) return true;
+    if (!tempFile) {
+      tempFile = fopen(tempPath.c_str(), "wb");
+      if (!tempFile) return false;
+    }
+    size_t written = fwrite(buffer.data(), sizeof(PackedTri), buffer.size(), tempFile);
+    buffer.clear();
+    return written == 0 ? false : true;
+  }
+};
+
+inline float readFloatLE(const uint8_t* p) {
+  float v = 0.0f;
+  std::memcpy(&v, p, sizeof(float));
+  return v;
+}
+
+inline uint32_t readUInt32LE(const uint8_t* p) {
+  uint32_t v = 0;
+  std::memcpy(&v, p, sizeof(uint32_t));
+  return v;
+}
+
+inline void computeFaceNormal(const float* pos, float* outN) {
+  float ux = pos[3] - pos[0];
+  float uy = pos[4] - pos[1];
+  float uz = pos[5] - pos[2];
+  float vx = pos[6] - pos[0];
+  float vy = pos[7] - pos[1];
+  float vz = pos[8] - pos[2];
+  float nx = uy * vz - uz * vy;
+  float ny = uz * vx - ux * vz;
+  float nz = ux * vy - uy * vx;
+  float len = std::sqrt(nx * nx + ny * ny + nz * nz);
+  if (len > 1e-12f) {
+    outN[0] = nx / len;
+    outN[1] = ny / len;
+    outN[2] = nz / len;
+  } else {
+    outN[0] = 0.0f;
+    outN[1] = 0.0f;
+    outN[2] = 1.0f;
+  }
+}
+
+bool writeBatchFileFromPacked(const std::string& outPath, const std::vector<PackedTri>& tris) {
+  FILE* f = fopen(outPath.c_str(), "wb");
+  if (!f) return false;
+
+  uint32_t header[4] = {kBatchMagic, 1u, static_cast<uint32_t>(tris.size()), 0u};
+  if (fwrite(header, sizeof(uint32_t), 4, f) != 4) {
+    fclose(f);
+    return false;
+  }
+
+  const size_t n = tris.size();
+  std::vector<float> posBuf(n * 9);
+  std::vector<float> normBuf(n * 9);
+  std::vector<uint32_t> idBuf(n);
+  for (size_t i = 0; i < n; ++i) {
+    std::memcpy(&posBuf[i * 9], tris[i].pos, 9 * sizeof(float));
+    std::memcpy(&normBuf[i * 9], tris[i].norm, 9 * sizeof(float));
+    idBuf[i] = tris[i].faceId;
+  }
+
+  bool ok = fwrite(posBuf.data(), sizeof(float), posBuf.size(), f) == posBuf.size() &&
+            fwrite(normBuf.data(), sizeof(float), normBuf.size(), f) == normBuf.size() &&
+            fwrite(idBuf.data(), sizeof(uint32_t), idBuf.size(), f) == idBuf.size();
+  fclose(f);
+  return ok;
+}
+
+bool finalizeCellToBatch(CellBuffer& cell, const std::string& outPath) {
+  if (cell.count == 0) return true;
+  if (!cell.tempFile) {
+    return writeBatchFileFromPacked(outPath, cell.buffer);
+  }
+  if (!cell.flush()) return false;
+  fclose(cell.tempFile);
+  cell.tempFile = nullptr;
+
+  FILE* in = fopen(cell.tempPath.c_str(), "rb");
+  if (!in) return false;
+
+  std::vector<PackedTri> tris(cell.count);
+  size_t readCount = fread(tris.data(), sizeof(PackedTri), cell.count, in);
+  fclose(in);
+  std::error_code ec;
+  fs::remove(utf8ToPath(cell.tempPath), ec);
+  if (readCount != cell.count) return false;
+
+  return writeBatchFileFromPacked(outPath, tris);
+}
+
+bool rayIntersectsBounds(
+    const std::array<float, 3>& origin,
+    const std::array<float, 3>& invDir,
+    const Bounds3& b,
+    float maxDist,
+    float& outTMin) {
+  float tmin = 0.0f;
+  float tmax = maxDist;
+  for (int i = 0; i < 3; ++i) {
+    float t1 = (b.min[i] - origin[i]) * invDir[i];
+    float t2 = (b.max[i] - origin[i]) * invDir[i];
+    if (t1 > t2) std::swap(t1, t2);
+    tmin = std::max(tmin, t1);
+    tmax = std::min(tmax, t2);
+    if (tmin > tmax) return false;
+  }
+  outTMin = tmin;
+  return true;
+}
+
+bool rayTriangleMollerTrumbore(
+    const std::array<float, 3>& orig,
+    const std::array<float, 3>& dir,
+    const float* v0,
+    const float* v1,
+    const float* v2,
+    float& outT) {
+  constexpr float kEps = 1e-7f;
+  float e1[3] = {v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]};
+  float e2[3] = {v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]};
+  float h[3] = {
+      dir[1] * e2[2] - dir[2] * e2[1],
+      dir[2] * e2[0] - dir[0] * e2[2],
+      dir[0] * e2[1] - dir[1] * e2[0],
+  };
+  float a = e1[0] * h[0] + e1[1] * h[1] + e1[2] * h[2];
+  if (a > -kEps && a < kEps) return false;
+  float f = 1.0f / a;
+  float s[3] = {orig[0] - v0[0], orig[1] - v0[1], orig[2] - v0[2]};
+  float u = f * (s[0] * h[0] + s[1] * h[1] + s[2] * h[2]);
+  if (u < 0.0f || u > 1.0f) return false;
+  float q[3] = {
+      s[1] * e1[2] - s[2] * e1[1],
+      s[2] * e1[0] - s[0] * e1[2],
+      s[0] * e1[1] - s[1] * e1[0],
+  };
+  float v = f * (dir[0] * q[0] + dir[1] * q[1] + dir[2] * q[2]);
+  if (v < 0.0f || u + v > 1.0f) return false;
+  float t = f * (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]);
+  if (t > kEps) {
+    outT = t;
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+void cleanupJobDir(const std::string& jobDirUtf8) {
+  if (jobDirUtf8.empty()) return;
+  std::error_code ec;
+  fs::remove_all(utf8ToPath(jobDirUtf8), ec);
+}
+
+ImportOutcome importBinaryStl(
+    const std::string& filePathUtf8,
+    const std::string& cacheDirUtf8,
+    const std::string& jobId,
+    const std::atomic<bool>& cancelFlag,
+    const std::function<void(const ImportProgress&)>& onProgress) {
+  ImportOutcome outcome;
+
+  Win64FileReader reader(filePathUtf8);
+  if (!reader.isOpen()) {
+    outcome.errorMessage = "Could not open STL file: " + filePathUtf8;
+    return outcome;
+  }
+
+  const uint64_t fileSize = reader.fileSize();
+  if (fileSize < kStlHeaderBytes) {
+    outcome.errorMessage = "Malformed STL: file is smaller than 84-byte binary STL header";
+    return outcome;
+  }
+
+  uint8_t header[kStlHeaderBytes]{};
+  if (!reader.readExact(header, kStlHeaderBytes)) {
+    outcome.errorMessage = "Malformed STL: failed to read 84-byte header";
+    return outcome;
+  }
+
+  const uint32_t triangleCount = readUInt32LE(header + 80);
+  if (triangleCount == 0) {
+    outcome.errorMessage = "Malformed STL: triangle count is 0";
+    return outcome;
+  }
+
+  const uint64_t expectedSize = kStlHeaderBytes + static_cast<uint64_t>(triangleCount) * kStlRecordBytes;
+  if (fileSize != expectedSize) {
+    outcome.errorMessage = "Truncated or malformed binary STL: expected " +
+                           std::to_string(expectedSize) + " bytes for " +
+                           std::to_string(triangleCount) + " triangles, got " +
+                           std::to_string(fileSize) + " bytes";
+    return outcome;
+  }
+
+  fs::path jobDir = utf8ToPath(cacheDirUtf8) / utf8ToPath("job_" + jobId);
+  std::error_code ec;
+  fs::create_directories(jobDir, ec);
+  if (ec) {
+    outcome.errorMessage = "Failed to create job cache directory: " + ec.message();
+    return outcome;
+  }
+  const std::string jobDirUtf8 = pathToUtf8(jobDir);
+
+  auto failOrCancel = [&](bool canceled, const std::string& msg) -> ImportOutcome {
+    cleanupJobDir(jobDirUtf8);
+    outcome.ok = false;
+    outcome.canceled = canceled;
+    outcome.errorMessage = msg;
+    return outcome;
+  };
+
+  // Pass 1: stream chunks, compute global bounds, and build optional LOD preview
+  Bounds3 globalBounds{};
+  globalBounds.min[0] = globalBounds.min[1] = globalBounds.min[2] = std::numeric_limits<float>::infinity();
+  globalBounds.max[0] = globalBounds.max[1] = globalBounds.max[2] = -std::numeric_limits<float>::infinity();
+
+  const uint32_t previewStride =
+      triangleCount > kPreviewMaxTriangles
+          ? std::max(1u, triangleCount / kPreviewMaxTriangles)
+          : 0u;
+  std::vector<PackedTri> previewTris;
+  if (previewStride > 0) {
+    previewTris.reserve(kPreviewMaxTriangles + 16);
+  }
+
+  std::vector<uint8_t> chunkBuf(static_cast<size_t>(kChunkTriangles) * kStlRecordBytes);
+  uint32_t triIndex = 0;
+  uint64_t bytesRead = kStlHeaderBytes;
+
+  while (triIndex < triangleCount) {
+    if (cancelFlag.load(std::memory_order_relaxed)) {
+      return failOrCancel(true, "Import canceled");
+    }
+    const uint32_t countThisChunk = std::min(kChunkTriangles, triangleCount - triIndex);
+    const size_t bytesThisChunk = static_cast<size_t>(countThisChunk) * kStlRecordBytes;
+    if (!reader.readExact(chunkBuf.data(), bytesThisChunk)) {
+      return failOrCancel(false, "Unexpected EOF while reading STL records");
+    }
+
+    for (uint32_t i = 0; i < countThisChunk; ++i) {
+      const uint8_t* rec = chunkBuf.data() + static_cast<size_t>(i) * kStlRecordBytes;
+      float pos[9];
+      for (int v = 0; v < 9; ++v) {
+        pos[v] = readFloatLE(rec + 12 + v * 4);
+      }
+      for (int k = 0; k < 3; ++k) {
+        globalBounds.min[k] = std::min({globalBounds.min[k], pos[k], pos[3 + k], pos[6 + k]});
+        globalBounds.max[k] = std::max({globalBounds.max[k], pos[k], pos[3 + k], pos[6 + k]});
+      }
+
+      if (previewStride > 0 && (triIndex % previewStride == 0) && previewTris.size() < kPreviewMaxTriangles) {
+        PackedTri pt{};
+        std::memcpy(pt.pos, pos, sizeof(pos));
+        float fn[3];
+        computeFaceNormal(pos, fn);
+        for (int k = 0; k < 3; ++k) {
+          pt.norm[k] = fn[k];
+          pt.norm[3 + k] = fn[k];
+          pt.norm[6 + k] = fn[k];
+        }
+        pt.faceId = triIndex;
+        previewTris.push_back(pt);
+      }
+      ++triIndex;
+    }
+
+    bytesRead += bytesThisChunk;
+    if (onProgress) {
+      onProgress(ImportProgress{"reading", bytesRead, fileSize, triIndex, triangleCount});
+    }
+  }
+
+  // Decide spatial grid dimensions based on triangle count
+  uint32_t gridN = 1;
+  if (triangleCount > 2000000u) {
+    gridN = 6;  // 216 cells
+  } else if (triangleCount > 50000u) {
+    gridN = 4;  // 64 cells
+  } else if (triangleCount > 2048u) {
+    gridN = 2;  // 8 cells
+  }
+  const uint32_t totalCells = gridN * gridN * gridN;
+
+  std::vector<CellBuffer> cells(totalCells);
+  for (uint32_t c = 0; c < totalCells; ++c) {
+    char name[32];
+    snprintf(name, sizeof(name), "cell_%04u.tmp", c);
+    cells[c].tempPath = pathToUtf8(jobDir / name);
+  }
+
+  float ext[3];
+  for (int k = 0; k < 3; ++k) {
+    ext[k] = std::max(1e-6f, globalBounds.max[k] - globalBounds.min[k]);
+  }
+
+  // Pass 2: partition into disk-backed spatial batches with 64-bit seek back to record 0
+  if (!reader.seek64(kStlHeaderBytes)) {
+    return failOrCancel(false, "Failed to seek STL stream for spatial batching");
+  }
+
+  triIndex = 0;
+  bytesRead = kStlHeaderBytes;
+  while (triIndex < triangleCount) {
+    if (cancelFlag.load(std::memory_order_relaxed)) {
+      return failOrCancel(true, "Import canceled");
+    }
+    const uint32_t countThisChunk = std::min(kChunkTriangles, triangleCount - triIndex);
+    const size_t bytesThisChunk = static_cast<size_t>(countThisChunk) * kStlRecordBytes;
+    if (!reader.readExact(chunkBuf.data(), bytesThisChunk)) {
+      return failOrCancel(false, "Unexpected EOF during spatial batching");
+    }
+
+    for (uint32_t i = 0; i < countThisChunk; ++i) {
+      const uint8_t* rec = chunkBuf.data() + static_cast<size_t>(i) * kStlRecordBytes;
+      PackedTri pt{};
+      for (int v = 0; v < 9; ++v) {
+        pt.pos[v] = readFloatLE(rec + 12 + v * 4);
+      }
+      float fn[3];
+      computeFaceNormal(pt.pos, fn);
+      for (int k = 0; k < 3; ++k) {
+        pt.norm[k] = fn[k];
+        pt.norm[3 + k] = fn[k];
+        pt.norm[6 + k] = fn[k];
+      }
+      pt.faceId = triIndex;
+
+      uint32_t cellIdx = 0;
+      if (gridN > 1) {
+        float cx = (pt.pos[0] + pt.pos[3] + pt.pos[6]) / 3.0f;
+        float cy = (pt.pos[1] + pt.pos[4] + pt.pos[7]) / 3.0f;
+        float cz = (pt.pos[2] + pt.pos[5] + pt.pos[8]) / 3.0f;
+        uint32_t ix = std::min(gridN - 1, static_cast<uint32_t>(std::max(0.0f, (cx - globalBounds.min[0]) / ext[0] * gridN)));
+        uint32_t iy = std::min(gridN - 1, static_cast<uint32_t>(std::max(0.0f, (cy - globalBounds.min[1]) / ext[1] * gridN)));
+        uint32_t iz = std::min(gridN - 1, static_cast<uint32_t>(std::max(0.0f, (cz - globalBounds.min[2]) / ext[2] * gridN)));
+        cellIdx = (iz * gridN + iy) * gridN + ix;
+      }
+
+      if (!cells[cellIdx].append(pt)) {
+        return failOrCancel(false, "Failed writing spatial batch temp file");
+      }
+      ++triIndex;
+    }
+
+    bytesRead += bytesThisChunk;
+    if (onProgress) {
+      onProgress(ImportProgress{"batching", bytesRead, fileSize, triIndex, triangleCount});
+    }
+  }
+
+  std::vector<BatchDescriptor> batches;
+  uint32_t batchIdx = 0;
+  for (uint32_t c = 0; c < totalCells; ++c) {
+    if (cancelFlag.load(std::memory_order_relaxed)) {
+      return failOrCancel(true, "Import canceled");
+    }
+    if (cells[c].count == 0) continue;
+    char name[32];
+    snprintf(name, sizeof(name), "batch_%04u.bin", batchIdx);
+    std::string outPath = pathToUtf8(jobDir / name);
+    if (!finalizeCellToBatch(cells[c], outPath)) {
+      return failOrCancel(false, "Failed finalizing spatial batch file");
+    }
+    batches.push_back(BatchDescriptor{batchIdx, outPath, cells[c].count, cells[c].bounds});
+    ++batchIdx;
+  }
+
+  std::string previewPath;
+  if (!previewTris.empty()) {
+    previewPath = pathToUtf8(jobDir / "preview.bin");
+    if (!writeBatchFileFromPacked(previewPath, previewTris)) {
+      return failOrCancel(false, "Failed writing preview batch");
+    }
+  }
+
+  if (onProgress) {
+    onProgress(ImportProgress{"indexing", fileSize, fileSize, triangleCount, triangleCount});
+  }
+
+  outcome.ok = true;
+  outcome.model.modelId = "model_" + jobId;
+  outcome.model.partId = "part_0";
+  outcome.model.fileName = pathToUtf8(utf8ToPath(filePathUtf8).filename());
+  outcome.model.fileSizeBytes = fileSize;
+  outcome.model.triangleCount = triangleCount;
+  outcome.model.bounds = globalBounds;
+  outcome.model.batches = std::move(batches);
+  outcome.model.previewFilePath = previewPath;
+  outcome.model.jobDir = jobDirUtf8;
+  return outcome;
+}
+
+PickResult pickModelFace(
+    const ModelRecord& model,
+    const std::array<float, 3>& origin,
+    const std::array<float, 3>& direction) {
+  PickResult best{};
+  float dirLen = std::sqrt(direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2]);
+  if (dirLen < 1e-12f) return best;
+  std::array<float, 3> dir{direction[0] / dirLen, direction[1] / dirLen, direction[2] / dirLen};
+  std::array<float, 3> invDir{
+      std::abs(dir[0]) > 1e-12f ? 1.0f / dir[0] : 1e30f,
+      std::abs(dir[1]) > 1e-12f ? 1.0f / dir[1] : 1e30f,
+      std::abs(dir[2]) > 1e-12f ? 1.0f / dir[2] : 1e30f,
+  };
+
+  float bestDist = std::numeric_limits<float>::infinity();
+  float globalTMin = 0.0f;
+  if (!rayIntersectsBounds(origin, invDir, model.bounds, bestDist, globalTMin)) {
+    return best;
+  }
+
+  struct CandidateBatch {
+    size_t idx;
+    float tMin;
+  };
+  std::vector<CandidateBatch> candidates;
+  for (size_t i = 0; i < model.batches.size(); ++i) {
+    float tMin = 0.0f;
+    if (rayIntersectsBounds(origin, invDir, model.batches[i].bounds, bestDist, tMin)) {
+      candidates.push_back(CandidateBatch{i, tMin});
+    }
+  }
+  std::sort(candidates.begin(), candidates.end(), [](const CandidateBatch& a, const CandidateBatch& b) {
+    return a.tMin < b.tMin;
+  });
+
+  for (const auto& cand : candidates) {
+    if (cand.tMin > bestDist) break;
+    const auto& batch = model.batches[cand.idx];
+    FILE* f = fopen(batch.filePath.c_str(), "rb");
+    if (!f) continue;
+
+    uint32_t header[4]{};
+    if (fread(header, sizeof(uint32_t), 4, f) != 4 || header[0] != kBatchMagic) {
+      fclose(f);
+      continue;
+    }
+    const uint32_t n = header[2];
+    std::vector<float> pos(static_cast<size_t>(n) * 9);
+    if (fread(pos.data(), sizeof(float), pos.size(), f) != pos.size()) {
+      fclose(f);
+      continue;
+    }
+    // Skip normals (n * 9 floats)
+    if (fseek(f, static_cast<long>(n) * 9L * static_cast<long>(sizeof(float)), SEEK_CUR) != 0) {
+      fclose(f);
+      continue;
+    }
+    std::vector<uint32_t> faceIds(n);
+    if (fread(faceIds.data(), sizeof(uint32_t), n, f) != n) {
+      fclose(f);
+      continue;
+    }
+    fclose(f);
+
+    for (uint32_t i = 0; i < n; ++i) {
+      const float* v0 = &pos[static_cast<size_t>(i) * 9];
+      float t = 0.0f;
+      if (rayTriangleMollerTrumbore(origin, dir, v0, v0 + 3, v0 + 6, t)) {
+        if (t < bestDist) {
+          bestDist = t;
+          best.hit = true;
+          best.partId = model.partId;
+          best.originalFaceId = faceIds[i];
+          best.distance = t;
+          best.point = {origin[0] + dir[0] * t, origin[1] + dir[1] * t, origin[2] + dir[2] * t};
+          computeFaceNormal(v0, best.normal.data());
+        }
+      }
+    }
+  }
+
+  return best;
+}
+
+}  // namespace pp
