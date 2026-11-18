@@ -1,0 +1,61 @@
+import type { ForgeConfig } from '@electron-forge/shared-types';
+import { MakerSquirrel } from '@electron-forge/maker-squirrel';
+import { MakerZIP } from '@electron-forge/maker-zip';
+import { VitePlugin } from '@electron-forge/plugin-vite';
+import path from 'node:path';
+import fs from 'node:fs';
+
+export const WORKER_BINARY_PATH = path.resolve(
+  __dirname,
+  'native/build/paint_pallet_worker.exe',
+);
+
+export function assertWorkerBinaryPresent(workerPath = WORKER_BINARY_PATH): string {
+  if (!fs.existsSync(workerPath)) {
+    throw new Error(
+      `Missing required x64 native worker binary at ${workerPath}. Run "npm run build:worker" before packaging.`,
+    );
+  }
+  return workerPath;
+}
+
+const config: ForgeConfig = {
+  packagerConfig: {
+    asar: true,
+    extraResource: [WORKER_BINARY_PATH],
+  },
+  hooks: {
+    prePackage: async () => {
+      assertWorkerBinaryPresent();
+    },
+  },
+  rebuildConfig: {},
+  makers: [
+    new MakerSquirrel({ name: 'PaintPallet' }),
+    new MakerZIP({}, ['win32']),
+  ],
+  plugins: [
+    new VitePlugin({
+      build: [
+        {
+          entry: 'src/main/index.ts',
+          config: 'vite.main.config.ts',
+          target: 'main',
+        },
+        {
+          entry: 'src/main/preload.ts',
+          config: 'vite.preload.config.ts',
+          target: 'preload',
+        },
+      ],
+      renderer: [
+        {
+          name: 'main_window',
+          config: 'vite.renderer.config.ts',
+        },
+      ],
+    }),
+  ],
+};
+
+export default config;

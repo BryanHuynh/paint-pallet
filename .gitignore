@@ -1,0 +1,9 @@
+node_modules/
+.vite/
+out/
+dist/
+native/build/
+.taste-skill/
+shots/
+*.stl
+!tests/**/*.stl
