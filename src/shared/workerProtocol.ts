@@ -59,9 +59,16 @@ export interface BatchBinaryData {
 export interface PaintPalletApi {
   selectStlFile: () => Promise<string | null>;
   importStl: (filePath: string) => Promise<ModelSummary>;
+  commitModel?: (modelId: string) => Promise<{ committed: boolean }>;
+  discardModel?: (modelId: string) => Promise<{ discarded: boolean }>;
   cancelImport: () => Promise<{ canceled: boolean }>;
   getActiveModel: () => Promise<ModelSummary | null>;
   readBatch: (filePath: string) => Promise<BatchBinaryData>;
-  pickFace: (modelId: string, origin: Vec3, direction: Vec3) => Promise<PickResult>;
+  pickFace: (
+    modelId: string,
+    origin: Vec3,
+    direction: Vec3,
+    batchIndices?: number[],
+  ) => Promise<PickResult>;
   onImportProgress: (listener: (event: ImportProgressEvent) => void) => () => void;
 }

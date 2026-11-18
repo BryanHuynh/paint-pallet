@@ -4,7 +4,14 @@ import React from 'react';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react';
 import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import App from '../../src/renderer/App';
+import {
+  attachOrbitDetailLifecycle,
+  findRayIntersectingBatchIndices,
+  resolveClickAgainstVisibleDetail,
+  selectCameraVisibleBatchIndices,
+} from '../../src/renderer/components/Viewport3D';
 import { computeOrientationQuaternion } from '../../src/renderer/orientation';
 import type { ModelSummary, PaintPalletApi } from '../../src/shared/workerProtocol';
 
@@ -222,16 +229,24 @@ describe('UI import-orbit-orientation actions', () => {
       .mockResolvedValueOnce(secondModel)
       .mockResolvedValueOnce(secondModel);
 
-    const api = createMockApi({ selectStlFile, importStl, readBatch });
+    const api = createMockApi({
+      selectStlFile,
+      importStl,
+      readBatch,
+      commitModel: vi.fn().mockResolvedValue({ committed: true }),
+      discardModel: vi.fn().mockResolvedValue({ discarded: true }),
+    });
     render(<App api={api} disableWebGL />);
 
     // Commit first.stl
     fireEvent.click(screen.getByRole('button', { name: /open stl/i }));
     expect(await screen.findByText('first.stl')).toBeInTheDocument();
+    expect(api.commitModel).toHaveBeenCalledWith('model_first');
 
-    // Fail readBatch on second.stl -> keeps first.stl open with visible alert
+    // Fail readBatch on second.stl -> discards secondModel and keeps first.stl open
     fireEvent.click(screen.getByRole('button', { name: /open stl/i }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/Disk batch read failed.*Kept first\.stl open/i);
+    expect(api.discardModel).toHaveBeenCalledWith('model_second');
     expect(screen.getByText('first.stl')).toBeInTheDocument();
 
     // Start third attempt where readBatch is pending, then cancel geometry swap
@@ -240,7 +255,194 @@ describe('UI import-orbit-orientation actions', () => {
     fireEvent.click(cancelBtn);
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/Canceled geometry swap; kept first\.stl open/i);
+    expect(api.discardModel).toHaveBeenCalledTimes(2);
     expect(screen.getByText('first.stl')).toBeInTheDocument();
     resolvePendingBatch?.(emptyBatch);
+  });
+
+  it('selects camera-visible and ray-intersected batches across peripheral areas', () => {
+    const batches = Array.from({ length: 24 }, (_, idx) => ({
+      batchIndex: idx,
+      filePath: `b_${idx}.bin`,
+      triangleCount: 100,
+      bounds: {
+        min: [idx * 10, 0, 0] as [number, number, number],
+        max: [idx * 10 + 5, 5, 5] as [number, number, number],
+      },
+    }));
+
+    // Camera focused on far peripheral batch 22 ([222, 2, 2])
+    const selected = selectCameraVisibleBatchIndices(batches, [222, 2, 25], [222, 2, 2], 4);
+    expect(selected).toContain(22);
+    expect(selected.length).toBe(4);
+
+    // Ray aimed at batch 20
+    const rayHits = findRayIntersectingBatchIndices(batches, [202, 2, 20], [0, 0, -1]);
+    expect(rayHits).toEqual([20]);
+  });
+
+  it('rejects preview-only clicks, requests second click when detail is missing, and resolves visible detail', () => {
+    // 1. Preview-only click (detailGroup hidden or empty)
+    expect(resolveClickAgainstVisibleDetail(false, new Set([0, 1]), [0])).toEqual({
+      kind: 'preview-only',
+    });
+    expect(resolveClickAgainstVisibleDetail(true, new Set(), [0])).toEqual({
+      kind: 'preview-only',
+    });
+
+    // 2. Clicked region needs more detail -> load targetBatches and ask for second click
+    expect(resolveClickAgainstVisibleDetail(true, new Set([0, 1]), [12, 13])).toEqual({
+      kind: 'needs-detail',
+      targetBatches: [12, 13],
+    });
+
+    // 3. Clicked region is visible in detail -> resolve against captured visibleBatchIds
+    expect(resolveClickAgainstVisibleDetail(true, new Set([0, 12]), [12, 13])).toEqual({
+      kind: 'pick',
+      visibleBatchIds: [0, 12],
+    });
+  });
+
+  it('disables Cancel during atomic commit and rolls back on rejected commit', async () => {
+    const firstModel: ModelSummary = {
+      modelId: 'model_first',
+      partId: 'part_0',
+      fileName: 'first.stl',
+      fileSizeBytes: 512,
+      triangleCount: 120,
+      bounds: { min: [0, 0, 0], max: [1, 1, 1] },
+      batches: [{ batchIndex: 0, filePath: 'first_b0.bin', triangleCount: 120, bounds: { min: [0, 0, 0], max: [1, 1, 1] } }],
+      previewFilePath: null,
+    };
+    const secondModel: ModelSummary = {
+      modelId: 'model_second',
+      partId: 'part_0',
+      fileName: 'second.stl',
+      fileSizeBytes: 1024,
+      triangleCount: 240,
+      bounds: { min: [0, 0, 0], max: [2, 2, 2] },
+      batches: [{ batchIndex: 0, filePath: 'second_b0.bin', triangleCount: 240, bounds: { min: [0, 0, 0], max: [2, 2, 2] } }],
+      previewFilePath: null,
+    };
+
+    let resolveCommit: ((v: { committed: boolean }) => void) | undefined;
+    const commitModel = vi
+      .fn()
+      .mockResolvedValueOnce({ committed: true })
+      .mockImplementationOnce(
+        () =>
+          new Promise<{ committed: boolean }>((resolve) => {
+            resolveCommit = resolve;
+          }),
+      );
+    const discardModel = vi.fn().mockResolvedValue({ discarded: true });
+    const importStl = vi
+      .fn()
+      .mockResolvedValueOnce(firstModel)
+      .mockResolvedValueOnce(secondModel);
+
+    const api = createMockApi({ importStl, commitModel, discardModel });
+    render(<App api={api} disableWebGL />);
+
+    // Commit first.stl
+    fireEvent.click(screen.getByRole('button', { name: /open stl/i }));
+    expect(await screen.findByText('first.stl')).toBeInTheDocument();
+
+    // Start second.stl; commitModel is in-flight -> Cancel must be disabled
+    fireEvent.click(screen.getByRole('button', { name: /open stl/i }));
+    await waitFor(() => {
+      expect(commitModel).toHaveBeenCalledWith('model_second');
+    });
+    const cancelBtn = screen.getByRole('button', { name: /cancel import/i });
+    expect(cancelBtn).toBeDisabled();
+
+    // Reject commit -> discards secondModel and preserves first.stl
+    resolveCommit?.({ committed: false });
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /Replacement commit was rejected; kept first\.stl open/i,
+    );
+    expect(discardModel).toHaveBeenCalledWith('model_second');
+    expect(screen.getByText('first.stl')).toBeInTheDocument();
+  });
+
+  it('keeps exact detail on stationary OrbitControls pointerdown/pointerup and enters preview only on real drag', async () => {
+    const canvas = document.createElement('canvas');
+    Object.defineProperty(canvas, 'clientWidth', { value: 800 });
+    Object.defineProperty(canvas, 'clientHeight', { value: 600 });
+    canvas.setPointerCapture = vi.fn();
+    canvas.releasePointerCapture = vi.fn();
+    canvas.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, width: 800, height: 600, right: 800, bottom: 600, x: 0, y: 0, toJSON: () => {} }) as DOMRect;
+    document.body.appendChild(canvas);
+
+    const camera = new THREE.PerspectiveCamera(42, 800 / 600, 0.1, 1000);
+    camera.position.set(0, 1, 5);
+    const controls = new OrbitControls(camera, canvas);
+
+    const previewGroup = new THREE.Group();
+    previewGroup.add(new THREE.Mesh(new THREE.BufferGeometry()));
+    previewGroup.visible = true;
+
+    const detailGroup = new THREE.Group();
+    detailGroup.add(new THREE.Mesh(new THREE.BufferGeometry()));
+    detailGroup.visible = true;
+
+    const onCameraMoved = vi.fn();
+    const onCameraSettled = vi.fn();
+    const lifecycle = attachOrbitDetailLifecycle(
+      controls,
+      camera,
+      previewGroup,
+      detailGroup,
+      { onCameraMoved, onCameraSettled, settleDelayMs: 20 },
+    );
+
+    const dispatchPointer = (type: string, x: number, y: number) => {
+      const evt = new Event(type, { bubbles: true, cancelable: true }) as unknown as PointerEvent;
+      Object.defineProperties(evt, {
+        pointerId: { value: 1 },
+        pointerType: { value: 'mouse' },
+        button: { value: 0 },
+        buttons: { value: type === 'pointerup' ? 0 : 1 },
+        clientX: { value: x },
+        clientY: { value: y },
+      });
+      canvas.dispatchEvent(evt);
+    };
+
+    // 1. Stationary press + release: real OrbitControls emits 'start' on pointerdown,
+    //    but detailGroup must stay visible and onCameraMoved must NOT fire.
+    dispatchPointer('pointerdown', 400, 300);
+    expect(detailGroup.visible).toBe(true);
+    expect(onCameraMoved).not.toHaveBeenCalled();
+
+    dispatchPointer('pointerup', 400, 300);
+    expect(detailGroup.visible).toBe(true);
+    expect(resolveClickAgainstVisibleDetail(detailGroup.visible, new Set([0]), [0])).toEqual({
+      kind: 'pick',
+      visibleBatchIds: [0],
+    });
+
+    // 2. Stationary repeat click
+    dispatchPointer('pointerdown', 400, 300);
+    dispatchPointer('pointerup', 400, 300);
+    expect(detailGroup.visible).toBe(true);
+    expect(onCameraMoved).not.toHaveBeenCalled();
+
+    // 3. Real drag that moves camera -> enters moving preview, then settles
+    dispatchPointer('pointerdown', 400, 300);
+    dispatchPointer('pointermove', 480, 340);
+    expect(onCameraMoved).toHaveBeenCalledTimes(1);
+    expect(detailGroup.visible).toBe(false);
+    expect(previewGroup.visible).toBe(true);
+
+    dispatchPointer('pointerup', 480, 340);
+    await waitFor(() => {
+      expect(onCameraSettled).toHaveBeenCalledTimes(1);
+    });
+
+    lifecycle.dispose();
+    controls.dispose();
+    canvas.remove();
   });
 });

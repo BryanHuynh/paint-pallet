@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AxisDirection,
   ImportProgressEvent,
@@ -9,7 +9,7 @@ import type {
   Vec3,
 } from '../shared/workerProtocol';
 import { ALL_AXES, getOrthogonalFrontOptions } from './orientation';
-import { Viewport3D, type CameraPreset } from './components/Viewport3D';
+import { Viewport3D, type CameraPreset, type PickGenerationToken } from './components/Viewport3D';
 
 type PaletteComponent = React.ComponentType<Record<string, unknown>>;
 
@@ -53,11 +53,20 @@ export default function App({
   const [pickResult, setPickResult] = useState<PickResult | null>(null);
   const [progress, setProgress] = useState<ImportProgressEvent | null>(null);
   const [isImporting, setIsImporting] = useState(false);
+  const [isCommitting, setIsCommitting] = useState(false);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [cameraPresetRequest, setCameraPresetRequest] = useState<{
     preset: CameraPreset;
     seq: number;
   } | null>(null);
+
+  const pendingModelRef = useRef<ModelSummary | null>(null);
+  pendingModelRef.current = pendingModel;
+  const activeModelIdRef = useRef<string | null>(null);
+  activeModelIdRef.current = model?.modelId ?? null;
+  const appModelGenRef = useRef(0);
+  const appViewGenRef = useRef(0);
+  const pickSeqRef = useRef(0);
 
   useEffect(() => {
     if (!api) return;
@@ -74,6 +83,7 @@ export default function App({
 
   const updateOrientation = useCallback(
     (next: ModelOrientation) => {
+      ++appViewGenRef.current;
       setOrientation(next);
       onOrientationChange?.(next);
     },
@@ -134,13 +144,16 @@ export default function App({
   };
 
   const handleCancelImport = async () => {
-    if (!api) return;
+    if (!api || isCommitting) return;
     if (isImporting) {
       await api.cancelImport();
       return;
     }
-    if (pendingModel) {
+    const staged = pendingModelRef.current;
+    if (staged) {
+      pendingModelRef.current = null;
       setPendingModel(null);
+      await api.discardModel?.(staged.modelId);
       setStatusMsg(
         model
           ? `Canceled geometry swap; kept ${model.fileName} open.`
@@ -149,29 +162,105 @@ export default function App({
     }
   };
 
-  const handlePendingModelCommit = useCallback((committed: ModelSummary) => {
-    setModel(committed);
-    setPendingModel(null);
-    setProgress(null);
-    setPickResult(null);
-  }, []);
+  const handlePendingModelCommit = useCallback(
+    async (committed: ModelSummary): Promise<boolean> => {
+      if (pendingModelRef.current?.modelId !== committed.modelId) {
+        return false;
+      }
+      setIsCommitting(true);
+      try {
+        const res = api?.commitModel
+          ? await api.commitModel(committed.modelId)
+          : { committed: true };
+
+        // Guard stale commit reply if staged model was superseded or cleared
+        if (pendingModelRef.current?.modelId !== committed.modelId) {
+          if (res.committed) {
+            await api?.discardModel?.(committed.modelId);
+          }
+          return false;
+        }
+
+        if (!res.committed) {
+          pendingModelRef.current = null;
+          setPendingModel(null);
+          await api?.discardModel?.(committed.modelId);
+          setStatusMsg(
+            model
+              ? `Replacement commit was rejected; kept ${model.fileName} open.`
+              : 'Replacement commit was rejected.',
+          );
+          return false;
+        }
+
+        ++appModelGenRef.current;
+        activeModelIdRef.current = committed.modelId;
+        pendingModelRef.current = null;
+        setModel(committed);
+        setPendingModel(null);
+        setProgress(null);
+        setPickResult(null);
+        return true;
+      } catch (err) {
+        pendingModelRef.current = null;
+        setPendingModel(null);
+        await api?.discardModel?.(committed.modelId);
+        const msg = err instanceof Error ? err.message : 'Replacement commit failed.';
+        setStatusMsg(model ? `${msg} Kept ${model.fileName} open.` : msg);
+        return false;
+      } finally {
+        setIsCommitting(false);
+      }
+    },
+    [api, model],
+  );
 
   const handlePendingModelError = useCallback(
-    (err: Error) => {
+    async (err: Error) => {
+      const staged = pendingModelRef.current;
+      if (!staged) return;
+      pendingModelRef.current = null;
       setPendingModel(null);
+      await api?.discardModel?.(staged.modelId);
       setStatusMsg(
         model
           ? `${err.message} Kept ${model.fileName} open.`
           : err.message,
       );
     },
-    [model],
+    [api, model],
   );
 
+  const handleViewChange = useCallback(() => {
+    ++appViewGenRef.current;
+  }, []);
+
+  const handlePickNeedsDetail = useCallback((message: string) => {
+    setStatusMsg(message);
+  }, []);
+
   const handleSurfacePick = useCallback(
-    async (origin: Vec3, direction: Vec3) => {
-      if (!api || !model) return;
-      const result = await api.pickFace(model.modelId, origin, direction);
+    async (
+      origin: Vec3,
+      direction: Vec3,
+      batchIndices: number[],
+      token: PickGenerationToken,
+    ) => {
+      if (!api || !model || token.modelId !== model.modelId) return;
+      const mySeq = ++pickSeqRef.current;
+      const startAppModelGen = appModelGenRef.current;
+      const startAppViewGen = appViewGenRef.current;
+      const result = await api.pickFace(model.modelId, origin, direction, batchIndices);
+
+      // Discard stale response if model, view, or a newer pick occurred while awaiting
+      if (
+        mySeq !== pickSeqRef.current ||
+        activeModelIdRef.current !== token.modelId ||
+        appModelGenRef.current !== startAppModelGen ||
+        appViewGenRef.current !== startAppViewGen
+      ) {
+        return;
+      }
       setPickResult(result);
     },
     [api, model],
@@ -186,7 +275,7 @@ export default function App({
       ? Math.min(100, Math.round((progress.bytesRead / progress.totalBytes) * 100))
       : 0;
 
-  const isBusy = isImporting || Boolean(pendingModel);
+  const isBusy = isImporting || Boolean(pendingModel) || isCommitting;
 
   return (
     <div className="app-shell">
@@ -231,6 +320,7 @@ export default function App({
               type="button"
               className="btn btn--secondary"
               onClick={handleCancelImport}
+              disabled={isCommitting}
             >
               Cancel import
             </button>
@@ -269,6 +359,8 @@ export default function App({
             orientation={orientation}
             cameraPresetRequest={cameraPresetRequest}
             onSurfacePick={handleSurfacePick}
+            onPickNeedsDetail={handlePickNeedsDetail}
+            onViewChange={handleViewChange}
             onPendingModelCommit={handlePendingModelCommit}
             onPendingModelError={handlePendingModelError}
             disableWebGL={disableWebGL}
@@ -327,6 +419,7 @@ export default function App({
                   type="button"
                   className="btn btn--secondary btn--small"
                   onClick={handleCancelImport}
+                  disabled={isCommitting}
                 >
                   Cancel import
                 </button>

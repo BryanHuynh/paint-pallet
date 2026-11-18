@@ -11,16 +11,26 @@ let mainWindow: BrowserWindow | null = null;
 let workerClient: WorkerClient | null = null;
 let activeImportJobId: string | null = null;
 const authorizedImportPaths = new Set<string>();
-const authorizedBatchPaths = new Set<string>();
+let committedBatchPaths = new Set<string>();
+const stagedBatchesByModelId = new Map<string, Set<string>>();
 
-function registerAuthorizedBatches(summary: ModelSummary): void {
-  authorizedBatchPaths.clear();
+function isAuthorizedBatchPath(resolvedPath: string): boolean {
+  if (committedBatchPaths.has(resolvedPath)) return true;
+  for (const paths of stagedBatchesByModelId.values()) {
+    if (paths.has(resolvedPath)) return true;
+  }
+  return false;
+}
+
+function collectBatchPaths(summary: ModelSummary): Set<string> {
+  const paths = new Set<string>();
   if (summary.previewFilePath) {
-    authorizedBatchPaths.add(path.resolve(summary.previewFilePath));
+    paths.add(path.resolve(summary.previewFilePath));
   }
   for (const b of summary.batches) {
-    authorizedBatchPaths.add(path.resolve(b.filePath));
+    paths.add(path.resolve(b.filePath));
   }
+  return paths;
 }
 
 function getWorkerClient(): WorkerClient {
@@ -91,14 +101,40 @@ app.whenReady().then(() => {
     const jobId = crypto.randomUUID().replace(/-/g, '');
     activeImportJobId = jobId;
     try {
-      const summary = await getWorkerClient().importStl(resolved, jobId);
-      registerAuthorizedBatches(summary);
+      const summary = await getWorkerClient().importStl(resolved, jobId, { staged: true });
+      stagedBatchesByModelId.set(summary.modelId, collectBatchPaths(summary));
       return summary;
     } finally {
       if (activeImportJobId === jobId) {
         activeImportJobId = null;
       }
     }
+  });
+
+  ipcMain.handle('worker:commit-model', async (_event, modelId: string) => {
+    if (typeof modelId !== 'string' || !modelId) {
+      return { committed: false };
+    }
+    const res = await getWorkerClient().commitModel(modelId);
+    if (res.committed) {
+      const promoted = stagedBatchesByModelId.get(modelId);
+      if (promoted) {
+        committedBatchPaths = promoted;
+      }
+      stagedBatchesByModelId.delete(modelId);
+    }
+    return res;
+  });
+
+  ipcMain.handle('worker:discard-model', async (_event, modelId: string) => {
+    if (typeof modelId !== 'string' || !modelId) {
+      return { discarded: false };
+    }
+    const res = await getWorkerClient().discardModel(modelId);
+    if (res.discarded) {
+      stagedBatchesByModelId.delete(modelId);
+    }
+    return res;
   });
 
   ipcMain.handle('worker:cancel-import', async () => {
@@ -117,7 +153,7 @@ app.whenReady().then(() => {
       throw new Error('Invalid batch path');
     }
     const resolved = path.resolve(filePath);
-    if (!authorizedBatchPaths.has(resolved)) {
+    if (!isAuthorizedBatchPath(resolved)) {
       throw new Error('Unauthorized batch file path');
     }
     return readBatchBinary(resolved);
@@ -125,8 +161,8 @@ app.whenReady().then(() => {
 
   ipcMain.handle(
     'worker:pick-face',
-    async (_event, modelId: string, origin: Vec3, direction: Vec3) => {
-      return getWorkerClient().pickFace(modelId, origin, direction);
+    async (_event, modelId: string, origin: Vec3, direction: Vec3, batchIndices?: number[]) => {
+      return getWorkerClient().pickFace(modelId, origin, direction, batchIndices);
     },
   );
 

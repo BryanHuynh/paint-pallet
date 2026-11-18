@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -137,7 +138,7 @@ struct SubBatchTemp {
   Bounds3 bounds{};
   uint32_t count = 0;
   std::string tempPath;
-  FILE* tempFile = nullptr;
+  bool spilledToDisk = false;
   std::vector<PackedTri> buffer;
 
   SubBatchTemp() {
@@ -145,15 +146,9 @@ struct SubBatchTemp {
     bounds.max[0] = bounds.max[1] = bounds.max[2] = -std::numeric_limits<float>::infinity();
   }
 
-  ~SubBatchTemp() {
-    close();
-  }
-
   void close() {
-    if (tempFile) {
-      fclose(tempFile);
-      tempFile = nullptr;
-    }
+    // Spill handles are opened and closed per flush so simultaneous open
+    // native spill handles remain bounded (<= 1) even with hundreds of sub-batches.
   }
 
   void expandBounds(const float* p) {
@@ -175,12 +170,12 @@ struct SubBatchTemp {
 
   bool flush() {
     if (buffer.empty()) return true;
-    if (!tempFile) {
-      tempFile = fopenUtf8(tempPath, L"wb");
-      if (!tempFile) return false;
-    }
-    size_t written = fwrite(buffer.data(), sizeof(PackedTri), buffer.size(), tempFile);
-    bool ok = (written == buffer.size());
+    FILE* f = fopenUtf8(tempPath, L"ab");
+    if (!f) return false;
+    size_t written = fwrite(buffer.data(), sizeof(PackedTri), buffer.size(), f);
+    int closeRes = fclose(f);
+    bool ok = (written == buffer.size()) && (closeRes == 0);
+    spilledToDisk = true;
     buffer.clear();
     return ok;
   }
@@ -258,7 +253,7 @@ bool finalizeSubBatchStreaming(
     bool* outCanceled) {
   *outCanceled = false;
   if (sub.count == 0) return true;
-  if (!sub.tempFile) {
+  if (!sub.spilledToDisk) {
     if (cancelFlag.load(std::memory_order_relaxed)) {
       *outCanceled = true;
       return false;
@@ -266,10 +261,8 @@ bool finalizeSubBatchStreaming(
     return writeBatchFileFromPacked(outPath, sub.buffer);
   }
   if (!sub.flush()) {
-    sub.close();
     return false;
   }
-  sub.close();
 
   FILE* in = fopenUtf8(sub.tempPath, L"rb");
   if (!in) return false;
@@ -778,7 +771,8 @@ PickResult pickModelFace(
     const ModelRecord& model,
     const std::array<float, 3>& origin,
     const std::array<float, 3>& direction,
-    PickBatchCache& cache) {
+    PickBatchCache& cache,
+    const std::vector<uint32_t>* allowedBatchIndices) {
   PickResult best{};
   float dirLen = std::sqrt(direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2]);
   if (dirLen < 1e-12f) return best;
@@ -795,12 +789,23 @@ PickResult pickModelFace(
     return best;
   }
 
+  std::unordered_set<uint32_t> allowedSet;
+  if (allowedBatchIndices) {
+    allowedSet.reserve(allowedBatchIndices->size());
+    for (uint32_t idx : *allowedBatchIndices) {
+      allowedSet.insert(idx);
+    }
+  }
+
   struct CandidateBatch {
     size_t idx;
     float tMin;
   };
   std::vector<CandidateBatch> candidates;
   for (size_t i = 0; i < model.batches.size(); ++i) {
+    if (allowedBatchIndices && allowedSet.find(model.batches[i].batchIndex) == allowedSet.end()) {
+      continue;
+    }
     float tMin = 0.0f;
     if (rayIntersectsBounds(origin, invDir, model.batches[i].bounds, bestDist, tMin)) {
       candidates.push_back(CandidateBatch{i, tMin});
