@@ -111,17 +111,11 @@ body,
 }
 
 .brand-mark {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: var(--r-sm);
-  background: var(--p-action);
-  color: var(--p-action-ink);
-  font-family: var(--font-display);
-  font-weight: 700;
-  font-size: 14px;
+  display: block;
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  object-fit: contain;
 }
 
 .brand-title {

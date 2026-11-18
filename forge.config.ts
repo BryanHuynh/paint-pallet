@@ -10,6 +10,13 @@ export const WORKER_BINARY_PATH = path.resolve(
   'native/build/paint_pallet_worker.exe',
 );
 
+export const APP_ICON_BASE_PATH = path.resolve(
+  __dirname,
+  'assets/paint-pallet-logo',
+);
+export const APP_ICON_ICO_PATH = `${APP_ICON_BASE_PATH}.ico`;
+export const APP_ICON_PNG_PATH = `${APP_ICON_BASE_PATH}.png`;
+
 export function assertWorkerBinaryPresent(workerPath = WORKER_BINARY_PATH): string {
   if (!fs.existsSync(workerPath)) {
     throw new Error(
@@ -22,7 +29,12 @@ export function assertWorkerBinaryPresent(workerPath = WORKER_BINARY_PATH): stri
 const config: ForgeConfig = {
   packagerConfig: {
     asar: true,
-    extraResource: [WORKER_BINARY_PATH],
+    icon: APP_ICON_BASE_PATH,
+    extraResource: [
+      WORKER_BINARY_PATH,
+      APP_ICON_ICO_PATH,
+      APP_ICON_PNG_PATH,
+    ],
   },
   hooks: {
     prePackage: async () => {
@@ -31,7 +43,10 @@ const config: ForgeConfig = {
   },
   rebuildConfig: {},
   makers: [
-    new MakerSquirrel({ name: 'PaintPallet' }),
+    new MakerSquirrel({
+      name: 'PaintPallet',
+      setupIcon: APP_ICON_ICO_PATH,
+    }),
     new MakerZIP({}, ['win32']),
   ],
   plugins: [
