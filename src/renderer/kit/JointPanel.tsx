@@ -24,12 +24,18 @@ export function JointPanel({ assembly, parts, selected, busy }: {
             <label htmlFor="joint-parent">Parent</label>
             <select id="joint-parent" className="select-input" value={draft.parentId} disabled={busy || assembly.analyzing}
               onChange={(event) => assembly.selectParent(event.target.value)}>
+              {draft.method === 'nearby' && <option value="">All attached parts</option>}
               {parts.filter((part) => canAttach(parts, assembly.joints, draft.childId, part.id)).map((part) => (
                 <option key={part.id} value={part.id}>{part.name}</option>
               ))}
             </select>
           </div>
-          {draft.method === 'six-face' ? (
+          {draft.method === 'nearby' ? (
+            <div className="shadow-tools">
+              {!draft.preview && <button type="button" className="btn btn--primary btn--small"
+                disabled={busy || assembly.analyzing} onClick={() => void assembly.snapNearby()}>Find nearby fit</button>}
+            </div>
+          ) : draft.method === 'six-face' ? (
             <>
               <ol className="joint-steps">
                 {JOINT_STEPS.map((label, index) => (
@@ -80,7 +86,9 @@ export function JointPanel({ assembly, parts, selected, busy }: {
             </>
           )}
           {assembly.picking && <p className="hint-text" role="status">Click the joint location on the parent.</p>}
-          {assembly.analyzing && <p className="hint-text" role="status">Finding the connected planar face…</p>}
+          {assembly.analyzing && <p className="hint-text" role="status">
+            {draft.method === 'nearby' ? 'Comparing nearby mating surfaces…' : 'Finding the connected planar face…'}
+          </p>}
           {assembly.error && <p className="hint-text" role="alert">{assembly.error}</p>}
           <div className="shadow-tools">
             {!draft.preview && assembly.expectedId === draft.parentId && (
@@ -101,6 +109,8 @@ export function JointPanel({ assembly, parts, selected, busy }: {
             onClick={() => assembly.begin(selected, 'six-face')}>Six-face fit</button>
           <button type="button" className="btn btn--secondary btn--small" disabled={busy}
             onClick={() => assembly.begin(selected, 'manual')}>Move and rotate</button>
+          {selected.staged && <button type="button" className="btn btn--secondary btn--small" disabled={busy}
+            onClick={() => assembly.begin(selected, 'nearby')}>Snap nearby</button>}
         </div>
       )}
       {!draft && (assembly.canUndo || assembly.canRedo) && (

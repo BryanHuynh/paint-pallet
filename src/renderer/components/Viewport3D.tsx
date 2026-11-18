@@ -33,6 +33,7 @@ export interface Viewport3DProps {
   fitBounds?: Bounds3;
   hideFocused?: boolean;
   ghostModelId?: string;
+  jointMarker?: Vec3;
   orientation: ModelOrientation;
   cameraPresetRequest: { preset: CameraPreset; seq: number } | null;
   onSurfacePick: (
@@ -279,6 +280,7 @@ export function Viewport3D({
   fitBounds,
   hideFocused = false,
   ghostModelId,
+  jointMarker,
   orientation,
   cameraPresetRequest,
   onSurfacePick,
@@ -325,6 +327,7 @@ export function Viewport3D({
     companionMaterial: THREE.MeshStandardMaterial;
     stagedMaterial: THREE.MeshStandardMaterial;
     companions: Map<string, THREE.Group>;
+    marker: THREE.Mesh<THREE.SphereGeometry, THREE.MeshBasicMaterial>;
     previewGroup: THREE.Group;
     detailGroup: THREE.Group;
     material: THREE.MeshStandardMaterial;
@@ -545,6 +548,11 @@ export function Viewport3D({
     const stagedMaterial = new THREE.MeshStandardMaterial({ color: '#83b4a5', roughness: 0.8,
       opacity: 0.38, transparent: true, depthWrite: false, side: THREE.FrontSide });
     const companions = new Map<string, THREE.Group>();
+    const marker = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 8),
+      new THREE.MeshBasicMaterial({ color: '#ffd17a', depthTest: false, depthWrite: false }));
+    marker.visible = false;
+    marker.renderOrder = 9;
+    modelGroup.add(marker);
     scene.add(modelGroup);
 
     const orbitLifecycle = attachOrbitDetailLifecycle(
@@ -578,6 +586,7 @@ export function Viewport3D({
       companionMaterial,
       stagedMaterial,
       companions,
+      marker,
       previewGroup,
       detailGroup,
       material,
@@ -803,6 +812,8 @@ export function Viewport3D({
       detailTrianglesRef.current = 0;
       for (const layer of companions.values()) disposeGroupMeshes(layer);
       companions.clear();
+      marker.geometry.dispose();
+      marker.material.dispose();
       companionMaterial.dispose();
       stagedMaterial.dispose();
       material.dispose();
@@ -983,6 +994,15 @@ export function Viewport3D({
   }, [focusPose, hideFocused]);
 
   const frameBounds = fitBounds ?? model?.bounds;
+  useEffect(() => {
+    const refs = sceneRefs.current;
+    if (!refs) return;
+    refs.marker.visible = Boolean(jointMarker);
+    if (jointMarker) {
+      refs.marker.position.fromArray(jointMarker);
+      refs.marker.scale.setScalar(refs.radius * 0.016);
+    }
+  }, [jointMarker, frameBounds]);
   useEffect(() => {
     const refs = sceneRefs.current;
     if (!refs || !frameBounds) return;

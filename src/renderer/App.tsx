@@ -1,3 +1,4 @@
+import { Vector3 } from 'three';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AxisDirection,
@@ -20,6 +21,7 @@ import { createEmptyRecipe } from './palette/recipes';
 import { EdgePanel } from './paint/EdgePanel';
 import { EDGE_PREVIEW, applyEdgesOver, clipEdgeCoverage, edgeColorKey, useEdgeHighlight } from './paint/useEdgeHighlight';
 import { ANCHOR_ADDRESS, EMPTY_INSTALLATION, IDENTITY_PART_POSE, nextPartAddress, restoreKitAddresses, syncInstallation, type KitPart } from '../shared/kit';
+import { poseMatrix } from './kit/jointMath';
 import { JointPanel } from './kit/JointPanel';
 import { JOINT_HIGHLIGHT, useKitAssembly } from './kit/useKitAssembly';
 import { KitPanel } from './kit/KitPanel';
@@ -103,6 +105,10 @@ export default function App({
     ? parts.find((part) => part.id === assembly.draft?.childId)
     : undefined;
   const isolatedPartId = assembly.isolated ?? paintIsolation;
+  const parentPose = parts.find((part) => part.id === assembly.draft?.parentId)?.pose;
+  const jointPoint = assembly.draft?.point;
+  const jointMarker = useMemo(() => parentPose && jointPoint ? new Vector3(...jointPoint)
+    .applyMatrix4(poseMatrix(parentPose)).toArray() : undefined, [parentPose, jointPoint]);
   const companionParts = useMemo(() => parts.length > 1 ? parts.map((part) => ({
     ...part,
     hidden: Boolean(isolatedPartId && isolatedPartId !== part.id) || part.hidden,
@@ -737,6 +743,7 @@ export default function App({
             model={displayModel}
             companionParts={companionParts}
             ghostModelId={ghostPart?.model.modelId}
+            jointMarker={jointMarker}
             focusPose={selectedPart?.pose}
             hideFocused={selectedPart?.hidden || selectedPart?.id === ghostPart?.id && Boolean(ghostPart) || Boolean(isolatedPartId && isolatedPartId !== selectedPart?.id)}
             fitBounds={kitBounds}

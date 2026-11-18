@@ -5,8 +5,9 @@ import type { PaintPalletApi, PickResult, Vec3 } from '../../shared/workerProtoc
 import { startShadowStroke, paintShadowFaces, type ShadowCoverage, type ShadowHit } from '../paint/shadowPaint';
 import { unpackFillFaces } from '../paint/useConnectedFill';
 import { canAttach, fitSixFaces, moveKitPart, type PlanePick } from './jointMath';
+import { findNearbyFit } from './findNearbyFit';
 
-export type JointMode = 'authored' | 'six-face' | 'manual';
+export type JointMode = 'authored' | 'six-face' | 'manual' | 'nearby';
 export const JOINT_HIGHLIGHT = 'joint-highlight';
 export const JOINT_STEPS = ['Peg tip', 'Peg first side', 'Peg second side', 'Socket floor', 'Socket first wall', 'Socket second wall'];
 
@@ -44,6 +45,7 @@ export function useKitAssembly(
   const [error, setError] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const pickJob = useRef<string | null>(null);
+  const snapJob = useRef<AbortController | null>(null);
 
   const expectedId = !draft || draft.preview ? null
     : draft.method === 'six-face' ? draft.picks.length < 3 ? draft.childId : draft.parentId
@@ -55,6 +57,8 @@ export function useKitAssembly(
   }
 
   function cancel() {
+    snapJob.current?.abort();
+    snapJob.current = null;
     if (pickJob.current) void api?.cancelConnectedFill?.(pickJob.current).catch(() => {});
     pickJob.current = null;
     setAnalyzing(false);
@@ -69,19 +73,52 @@ export function useKitAssembly(
     const parentId = previous?.parentId ?? parts[0]?.id;
     if (!parentId || child.id === parentId) return;
     cancel();
-    setDraft({ childId: child.id, parentId, method, pose: child.pose, point: previous?.point, picks: [],
+    setDraft({ childId: child.id, parentId: method === 'nearby' ? '' : parentId,
+      method, pose: child.pose, point: method === 'nearby' ? undefined : previous?.point, picks: [],
       adjustments: [0, 0, 0], preview: false });
     focusPart(child.id);
   }
 
   function selectParent(parentId: string) {
-    if (!draft || !canAttach(parts, joints, draft.childId, parentId)) return;
+    if (!draft || (!(draft.method === 'nearby' && !parentId) && !canAttach(parts, joints, draft.childId, parentId))) return;
     const picks = draft.picks.slice(0, 3);
     setDraft({ ...draft, parentId, picks, point: undefined, preview: false });
     setPicking(false);
     setIsolated(null);
     setError(null);
     if (picks.length === 3) focusPart(parentId);
+  }
+
+  async function snapNearby() {
+    if (!draft || draft.method !== 'nearby' || draft.preview || !api || snapJob.current) return;
+    const child = parts.find((part) => part.id === draft.childId);
+    if (!child) return;
+    const parents = parts.filter((part) => (!draft.parentId || part.id === draft.parentId) &&
+      canAttach(parts, joints, child.id, part.id));
+    const controller = new AbortController();
+    snapJob.current = controller;
+    setAnalyzing(true);
+    setError(null);
+    try {
+      const result = await findNearbyFit(child, parents, api.readBatch, controller.signal);
+      if (snapJob.current !== controller) return;
+      if (result.kind !== 'fit') {
+        setError(result.kind === 'ambiguous'
+          ? 'Multiple nearby fits look similar. Choose a parent or use a six-face fit.'
+          : 'No reliable nearby fit. Move the part closer or use a six-face fit.');
+        return;
+      }
+      setDraft({ ...draft, parentId: result.best.parentId, point: result.best.point,
+        pose: result.best.pose, preview: true });
+      focusPart(result.best.parentId);
+    } catch (failure) {
+      if (snapJob.current === controller) setError(failure instanceof Error ? failure.message : 'Could not search nearby surfaces.');
+    } finally {
+      if (snapJob.current === controller) {
+        snapJob.current = null;
+        setAnalyzing(false);
+      }
+    }
   }
 
   async function capture(part: KitPart, result: PickResult) {
@@ -234,7 +271,7 @@ export function useKitAssembly(
 
   return {
     joints, draft, overlay, expectedId, error, analyzing, isolated, setIsolated,
-    begin, selectParent, capture, cancel, adjust, adjustManual, back, markPoint, keepPose, confirm, reset,
+    begin, selectParent, capture, snapNearby, cancel, adjust, adjustManual, back, markPoint, keepPose, confirm, reset,
     canUndo: undo.length > 0, canRedo: redo.length > 0, picking,
     showPreview() {
       if (draft?.point && draft.method !== 'six-face') {
