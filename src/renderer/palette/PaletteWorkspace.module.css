@@ -104,6 +104,15 @@
   }
 }
 
+.dropActive {
+  outline: 2px dashed var(--pp-accent);
+  outline-offset: -2px;
+}
+
+.dropActive .emptyState {
+  background: var(--pp-accent-soft);
+}
+
 .panelHeader {
   display: flex;
   flex-wrap: wrap;

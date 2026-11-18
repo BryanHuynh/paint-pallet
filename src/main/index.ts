@@ -87,14 +87,7 @@ app.whenReady().then(() => {
     return resolved;
   });
 
-  ipcMain.handle('worker:import-stl', async (_event, filePath: string) => {
-    if (typeof filePath !== 'string') {
-      throw new Error('Unauthorized or invalid STL path');
-    }
-    const resolved = path.resolve(filePath);
-    if (!authorizedImportPaths.has(resolved)) {
-      throw new Error('STL path must be selected through the file dialog');
-    }
+  async function importStl(resolved: string): Promise<ModelSummary> {
     if (activeImportJobId) {
       throw new Error('An STL import is already in progress');
     }
@@ -109,6 +102,31 @@ app.whenReady().then(() => {
         activeImportJobId = null;
       }
     }
+  }
+
+  ipcMain.handle('worker:import-stl', async (_event, filePath: string) => {
+    if (typeof filePath !== 'string') {
+      throw new Error('Unauthorized or invalid STL path');
+    }
+    const resolved = path.resolve(filePath);
+    if (!authorizedImportPaths.has(resolved)) {
+      throw new Error('STL path must be selected through the file dialog');
+    }
+    return importStl(resolved);
+  });
+
+  // The preload derives this path from a disk-backed File before invoking IPC.
+  ipcMain.handle('worker:import-dropped-stl', async (event, filePath: string) => {
+    if (
+      !mainWindow ||
+      event.senderFrame !== mainWindow.webContents.mainFrame ||
+      typeof filePath !== 'string' ||
+      !path.isAbsolute(filePath) ||
+      path.extname(filePath).toLowerCase() !== '.stl'
+    ) {
+      throw new Error('Drop an STL file from your computer.');
+    }
+    return importStl(path.resolve(filePath));
   });
 
   ipcMain.handle('worker:commit-model', async (_event, modelId: string) => {

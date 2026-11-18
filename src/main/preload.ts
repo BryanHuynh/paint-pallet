@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type {
   ImportProgressEvent,
   PaintPalletApi,
@@ -7,6 +7,11 @@ import type {
 
 const api: PaintPalletApi = {
   selectStlFile: () => ipcRenderer.invoke('dialog:select-stl'),
+  importDroppedStl: async (file: File) => {
+    const filePath = webUtils.getPathForFile(file);
+    if (!filePath) throw new Error('Drop an STL file from your computer.');
+    return ipcRenderer.invoke('worker:import-dropped-stl', filePath);
+  },
   importStl: (filePath: string) =>
     ipcRenderer.invoke('worker:import-stl', filePath),
   commitModel: (modelId: string) =>

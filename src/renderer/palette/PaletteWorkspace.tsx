@@ -81,6 +81,7 @@ export default function PaletteWorkspace(): React.ReactElement {
   const [references, setReferences] = useState<ReferenceImage[]>([]);
   const [activeRefId, setActiveRefId] = useState<string | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
+  const [isDraggingImages, setIsDraggingImages] = useState(false);
 
   const [recipes, setRecipes] = useState<PaintRecipe[]>(() => [
     createEmptyRecipe(1),
@@ -145,17 +146,12 @@ export default function PaletteWorkspace(): React.ReactElement {
     ctx.drawImage(activeReference.element, 0, 0);
   }, [activeReference]);
 
-  async function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
-    const fileList = event.target.files;
-    if (!fileList || fileList.length === 0) {
-      return;
-    }
-    const files = Array.from(fileList);
+  async function importReferenceFiles(files: File[]) {
+    if (files.length === 0) return;
     const supported = files.filter(isSupportedImageFile);
     const unsupportedNames = files
       .filter((file) => !isSupportedImageFile(file))
       .map((file) => file.name);
-    event.target.value = '';
 
     if (supported.length === 0) {
       setImportError(
@@ -215,6 +211,32 @@ export default function PaletteWorkspace(): React.ReactElement {
       );
     }
     setImportError(feedbackParts.length > 0 ? feedbackParts.join(' ') : null);
+  }
+
+  function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.currentTarget.files ?? []);
+    event.currentTarget.value = '';
+    void importReferenceFiles(files);
+  }
+
+  function handleImageDragOver(event: React.DragEvent<HTMLElement>) {
+    if (!event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    setIsDraggingImages(true);
+  }
+
+  function handleImageDragLeave(event: React.DragEvent<HTMLElement>) {
+    if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return;
+    setIsDraggingImages(false);
+  }
+
+  function handleImageDrop(event: React.DragEvent<HTMLElement>) {
+    const { files, types } = event.dataTransfer;
+    if (!files.length && !types.includes('Files')) return;
+    event.preventDefault();
+    setIsDraggingImages(false);
+    void importReferenceFiles(Array.from(files));
   }
 
   function handleCreateRecipe() {
@@ -464,7 +486,13 @@ export default function PaletteWorkspace(): React.ReactElement {
       </header>
 
       <div className={styles.layout}>
-        <section className={styles.panel} aria-label="Reference stage">
+        <section
+          className={isDraggingImages ? `${styles.panel} ${styles.dropActive}` : styles.panel}
+          aria-label="Reference stage"
+          onDragOver={handleImageDragOver}
+          onDragLeave={handleImageDragLeave}
+          onDrop={handleImageDrop}
+        >
           <div className={styles.panelHeader}>
             <h2 className={styles.panelTitle}>Reference images</h2>
             {activeReference && (
@@ -689,7 +717,7 @@ export default function PaletteWorkspace(): React.ReactElement {
             </>
           ) : (
             <div className={styles.emptyState}>
-              Import PNG, JPEG, or WebP images to sample colors or generate tone suggestions.
+              Drop PNG, JPEG, or WebP images here, or use Import reference images.
             </div>
           )}
         </section>

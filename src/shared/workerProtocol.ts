@@ -58,6 +58,7 @@ export interface BatchBinaryData {
 
 export interface PaintPalletApi {
   selectStlFile: () => Promise<string | null>;
+  importDroppedStl?: (file: File) => Promise<ModelSummary>;
   importStl: (filePath: string) => Promise<ModelSummary>;
   commitModel?: (modelId: string) => Promise<{ committed: boolean }>;
   discardModel?: (modelId: string) => Promise<{ discarded: boolean }>;

@@ -31,6 +31,7 @@ export interface AppProps {
   api?: PaintPalletApi;
   PaletteWorkspaceComponent?: PaletteComponent | null;
   disableWebGL?: boolean;
+  stlLimitLabel?: string;
   onOrientationChange?: (orientation: ModelOrientation) => void;
 }
 
@@ -38,6 +39,7 @@ export default function App({
   api: injectedApi,
   PaletteWorkspaceComponent,
   disableWebGL = false,
+  stlLimitLabel = '2 GiB',
   onOrientationChange,
 }: AppProps) {
   const api = injectedApi ?? window.paintPallet;
@@ -53,6 +55,7 @@ export default function App({
   const [pickResult, setPickResult] = useState<PickResult | null>(null);
   const [progress, setProgress] = useState<ImportProgressEvent | null>(null);
   const [isImporting, setIsImporting] = useState(false);
+  const [isDraggingStl, setIsDraggingStl] = useState(false);
   const [isCommitting, setIsCommitting] = useState(false);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [cameraPresetRequest, setCameraPresetRequest] = useState<{
@@ -60,6 +63,7 @@ export default function App({
     seq: number;
   } | null>(null);
 
+  const importInFlight = useRef(false);
   const pendingModelRef = useRef<ModelSummary | null>(null);
   pendingModelRef.current = pendingModel;
   const activeModelIdRef = useRef<string | null>(null);
@@ -102,25 +106,29 @@ export default function App({
     updateOrientation({ upright: orientation.upright, front: nextFront });
   };
 
-  const handleOpenStl = async () => {
-    if (!api) return;
+  const importFrom = async (
+    prepareImport: () => Promise<(() => Promise<ModelSummary>) | null>,
+  ) => {
+    if (!api || importInFlight.current || pendingModelRef.current || isCommitting) return;
+    importInFlight.current = true;
     setStatusMsg(null);
-    const selectedPath = await api.selectStlFile();
-    if (!selectedPath) return;
-
-    setIsImporting(true);
-    setProgress({
-      type: 'progress',
-      jobId: 'active',
-      phase: 'reading',
-      bytesRead: 0,
-      totalBytes: 1,
-      trianglesRead: 0,
-      totalTriangles: 0,
-    });
 
     try {
-      const summary = await api.importStl(selectedPath);
+      const loadModel = await prepareImport();
+      if (!loadModel) return;
+
+      setIsImporting(true);
+      setProgress({
+        type: 'progress',
+        jobId: 'active',
+        phase: 'reading',
+        bytesRead: 0,
+        totalBytes: 1,
+        trianglesRead: 0,
+        totalTriangles: 0,
+      });
+      const summary = await loadModel();
+      pendingModelRef.current = summary;
       setPendingModel(summary);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Import failed';
@@ -138,9 +146,49 @@ export default function App({
         );
       }
     } finally {
+      importInFlight.current = false;
       setIsImporting(false);
       setProgress(null);
     }
+  };
+
+  const handleOpenStl = () => {
+    if (!api) return;
+    void importFrom(async () => {
+      const filePath = await api.selectStlFile();
+      return filePath ? () => api.importStl(filePath) : null;
+    });
+  };
+
+  const handleStlDragOver = (event: React.DragEvent<HTMLElement>) => {
+    if (!event.dataTransfer.types.includes('Files')) return;
+    event.preventDefault();
+    const canDrop = Boolean(api?.importDroppedStl) && !isBusy && !importInFlight.current;
+    event.dataTransfer.dropEffect = canDrop ? 'copy' : 'none';
+    setIsDraggingStl(canDrop);
+  };
+
+  const handleStlDragLeave = (event: React.DragEvent<HTMLElement>) => {
+    if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return;
+    setIsDraggingStl(false);
+  };
+
+  const handleStlDrop = (event: React.DragEvent<HTMLElement>) => {
+    const { files, types } = event.dataTransfer;
+    if (!files.length && !types.includes('Files')) return;
+    event.preventDefault();
+    setIsDraggingStl(false);
+    const importDroppedStl = api?.importDroppedStl;
+    if (!importDroppedStl || isBusy) return;
+
+    void importFrom(async () => {
+      const file = files[0];
+      if (files.length !== 1 || !file || !/\.stl$/i.test(file.name)) {
+        throw new Error('Drop one .stl file at a time.');
+      }
+
+      return () => importDroppedStl(file);
+    });
   };
 
   const handleCancelImport = async () => {
@@ -329,7 +377,7 @@ export default function App({
             type="button"
             className="btn btn--primary"
             onClick={handleOpenStl}
-            disabled={isBusy}
+            disabled={!api || isBusy}
           >
             Open STL
           </button>
@@ -351,6 +399,9 @@ export default function App({
           id="viewport-region"
           className="viewport-region"
           aria-label="STL surface viewport"
+          onDragOver={handleStlDragOver}
+          onDragLeave={handleStlDragLeave}
+          onDrop={handleStlDrop}
         >
           <Viewport3D
             api={api}
@@ -370,18 +421,29 @@ export default function App({
             <div className="viewport-empty">
               <div className="viewport-empty__card">
                 <h2>Binary STL surface inspector</h2>
+                {api?.importDroppedStl ? <p>Drop an STL file here to open it.</p> : null}
                 <p>
-                  Open a print-ready binary STL up to 2 GiB to inspect original triangles,
+                  Open a print-ready binary STL up to {stlLimitLabel} to inspect original triangles,
                   set upright and front axes, and pick original face IDs.
                 </p>
-                <button
-                  type="button"
-                  className="btn btn--secondary"
-                  onClick={handleOpenStl}
-                >
-                  Choose STL file
-                </button>
+                {api ? (
+                  <button
+                    type="button"
+                    className="btn btn--secondary"
+                    onClick={handleOpenStl}
+                  >
+                    Choose STL file
+                  </button>
+                ) : (
+                  <p>Open the Electron app to import and inspect STL files.</p>
+                )}
               </div>
+            </div>
+          ) : null}
+
+          {isDraggingStl && !isBusy ? (
+            <div className="stl-drop-overlay" aria-hidden="true">
+              Drop STL to open
             </div>
           ) : null}
 

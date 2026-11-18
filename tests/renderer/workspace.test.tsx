@@ -72,6 +72,45 @@ describe('UI import-orbit-orientation actions', () => {
     expect(screen.getByText('4,200')).toBeInTheDocument();
   });
 
+  it('imports a dropped STL through the model pipeline and ignores a second drop while busy', async () => {
+    const api = createMockApi();
+    const importDroppedStl = vi.fn(() => api.importStl('C:/models/test_mini.stl'));
+    api.importDroppedStl = importDroppedStl;
+    render(<App api={api} disableWebGL />);
+
+    const viewport = screen.getByRole('region', { name: /stl surface viewport/i });
+    const file = new File(['mesh'], 'test_mini.STL');
+    const dataTransfer = { types: ['Files'], files: [file], dropEffect: 'none' };
+    fireEvent.dragOver(viewport, { dataTransfer });
+    expect(dataTransfer.dropEffect).toBe('copy');
+    expect(screen.getByText('Drop STL to open')).toBeInTheDocument();
+
+    fireEvent.drop(viewport, { dataTransfer });
+    fireEvent.drop(viewport, { dataTransfer });
+
+    expect(await screen.findByText('test_mini.stl')).toBeInTheDocument();
+    expect(importDroppedStl).toHaveBeenCalledExactlyOnceWith(file);
+    expect(api.importStl).toHaveBeenCalledExactlyOnceWith('C:/models/test_mini.stl');
+    expect(api.selectStlFile).not.toHaveBeenCalled();
+    expect(screen.queryByText('Drop STL to open')).not.toBeInTheDocument();
+  });
+
+  it('rejects a non-STL or multiple dropped files before asking Electron for a path', async () => {
+    const importDroppedStl = vi.fn();
+    const api = createMockApi({ importDroppedStl });
+    render(<App api={api} disableWebGL />);
+
+    const viewport = screen.getByRole('region', { name: /stl surface viewport/i });
+    const stl = new File(['mesh'], 'mini.stl');
+    const png = new File(['image'], 'reference.png');
+    for (const files of [[png], [stl, stl]]) {
+      fireEvent.drop(viewport, { dataTransfer: { types: ['Files'], files } });
+      expect(await screen.findByRole('alert')).toHaveTextContent('Drop one .stl file at a time.');
+    }
+    expect(importDroppedStl).not.toHaveBeenCalled();
+    expect(api.importStl).not.toHaveBeenCalled();
+  });
+
   it('keeps the previous model open when a subsequent import fails or is canceled', async () => {
     const selectStlFile = vi
       .fn()

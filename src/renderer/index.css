@@ -239,6 +239,20 @@ body,
   height: 100%;
 }
 
+.stl-drop-overlay {
+  position: absolute;
+  inset: var(--s-3);
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  border: 2px dashed var(--p-accent);
+  border-radius: var(--r-md);
+  background: rgba(11, 22, 12, 0.92);
+  color: var(--p-accent);
+  font-weight: 600;
+  pointer-events: none;
+}
+
 .viewport-empty {
   position: absolute;
   inset: 0;

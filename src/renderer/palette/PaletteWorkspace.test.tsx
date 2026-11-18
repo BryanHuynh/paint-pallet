@@ -299,6 +299,23 @@ describe('PaletteWorkspace', () => {
     expect(screen.getByLabelText(/recipe name/i)).toHaveValue('Steel Armor');
   });
 
+  it('adds supported dropped images to the reference stage and reports skipped files', async () => {
+    render(<PaletteWorkspace />);
+    const stage = screen.getByRole('region', { name: /reference stage/i });
+    const png = createBitmapFixture('armor.png', 'image/png', 10, 10, () => [32, 64, 96], registry);
+    const webp = createBitmapFixture('cloak.webp', 'image/webp', 10, 10, () => [180, 40, 50], registry);
+    const text = new File(['notes'], 'notes.txt');
+    const dataTransfer = { types: ['Files'], files: [png, text, webp], dropEffect: 'none' };
+
+    expect(fireEvent.dragOver(stage, { dataTransfer })).toBe(false);
+    expect(dataTransfer.dropEffect).toBe('copy');
+    expect(fireEvent.drop(stage, { dataTransfer })).toBe(false);
+
+    expect(await screen.findByRole('button', { name: 'armor.png' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: 'cloak.webp' })).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('Skipped unsupported files (notes.txt)');
+  });
+
   it('samples exact pixels with the eyedropper into different tone slots across two reference images', async () => {
     const user = userEvent.setup();
     render(<PaletteWorkspace />);

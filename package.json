@@ -6,6 +6,7 @@
   "main": ".vite/build/index.cjs",
   "scripts": {
     "start": "electron-forge start",
+    "dev:renderer": "vite --config vite.renderer.config.ts --host 127.0.0.1 --port 5173 --strictPort",
     "package": "npm run build:worker && electron-forge package",
     "make": "npm run build:worker && electron-forge make",
     "build:worker": "powershell -ExecutionPolicy Bypass -File scripts/build-worker.ps1",
