@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Vector3 } from 'three';
+import type { ProjectState } from '../../shared/paintProject';
 import type { ModelOrientation, PaintPalletApi, Vec3 } from '../../shared/workerProtocol';
 import { computeOrientationQuaternion } from '../orientation';
 import { generateToneMask, paintToneFaces, type MaskBrushTool, type ToneMask } from './lightingState';
-import type { ShadowCoverage, SurfaceFace } from './shadowPaint';
+import type { ShadowCoverage, ShadowRegion, SurfaceFace } from './shadowPaint';
+import { packToneMask, unpackToneMask } from './projectMasks';
 
 interface ExposureResult {
   key: string;
@@ -223,6 +225,27 @@ export function useSurfaceLighting(
     writeHistory({ current: next, undo: [...current.undo, current.current], redo: current.redo.slice(0, -1) });
   }
 
+  function reset() {
+    strokeRef.current = null;
+    writeSnapshots(initialSnapshots());
+    nextSnapshotNumber.current = 2;
+    setBrushDraft(null);
+    setBrushTool(null);
+    setConfirming(false);
+    setResult(null);
+    setPreviewing(false);
+  }
+
+  function restoreProject(state: ProjectState, tones: Uint32Array[]) {
+    reset();
+    const items = state.snapshots.map(({ id, name, azimuth, elevation, midtone, highlight, applied, manual }, index) => ({
+      id, name, settings: { azimuth, elevation, midtone, highlight },
+      history: { ...emptyHistory(), current: applied ? { mask: unpackToneMask(tones[index], state.regions), manual } : null },
+    }));
+    writeSnapshots({ activeId: state.activeSnapshotId, items });
+    nextSnapshotNumber.current = Math.max(0, ...items.map((item) => Number(item.id.replace(/^snapshot-/, '')) || 0)) + 1;
+  }
+
   const applied = history.current;
   return {
     available: Boolean(api?.computeLightExposure),
@@ -264,15 +287,16 @@ export function useSurfaceLighting(
       setConfirming(false);
     },
     apply,
-    reset() {
-      strokeRef.current = null;
-      writeSnapshots(initialSnapshots());
-      nextSnapshotNumber.current = 2;
-      setBrushDraft(null);
-      setBrushTool(null);
-      setConfirming(false);
-      setResult(null);
-      setPreviewing(false);
+    exportProject(regions: ShadowRegion[]) {
+      return {
+        activeSnapshotId: snapshots.activeId,
+        snapshots: snapshots.items.map(({ id, name, settings, history }) => ({
+          id, name, ...settings, applied: Boolean(history.current), manual: Boolean(history.current?.manual),
+        })),
+        tones: snapshots.items.map(({ history }) => packToneMask(history.current?.mask ?? NO_MASK, regions)),
+      };
     },
+    restoreProject,
+    reset,
   };
 }

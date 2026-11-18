@@ -145,7 +145,7 @@ export async function prepareMeshSource(filePath: string, cacheDir: string, sign
   signal.throwIfAborted();
   const triangleCount = read >= HEADER_BYTES ? header.readUInt32LE(80) : 0;
   const expectedSize = HEADER_BYTES + triangleCount * TRIANGLE_BYTES;
-  if (triangleCount > 0 && expectedSize === stat.size) return { filePath };
+  if (triangleCount > 0 && expectedSize === stat.size) return { filePath, sourceBytes: stat.size };
   if (looksLikeAsciiStl(header.toString('utf8', 0, read))) {
     return convertTextMesh(filePath, 'ascii-stl', cacheDir, stat.size, signal);
   }

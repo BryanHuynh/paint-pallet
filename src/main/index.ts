@@ -1,6 +1,8 @@
 import { app, BrowserWindow, dialog, ipcMain } from 'electron';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import type { OpenedProject, ProjectContents, ProjectSaveRequest } from '../shared/paintProject';
+import { openProjectArchive, writeProjectArchive } from './projectArchive';
 import path from 'node:path';
 import { WorkerClient, readBatchBinary } from './workerClient';
 import type { ConnectedFillRequest, ExposureRequest, ModelSummary, Vec3 } from '../shared/workerProtocol';
@@ -8,6 +10,8 @@ import type { ConnectedFillRequest, ExposureRequest, ModelSummary, Vec3 } from '
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 declare const MAIN_WINDOW_VITE_NAME: string;
 
+const originalSources = new Map<string, { path: string; name: string; cleanup?: () => Promise<void> }>();
+let loadedModelId: string | null = null;
 let mainWindow: BrowserWindow | null = null;
 let workerClient: WorkerClient | null = null;
 const activeFillJobs = new Set<string>();
@@ -70,6 +74,48 @@ function resolveAppIconPath(): string | undefined {
   return undefined;
 }
 
+async function releaseOriginalSource(id: string) {
+  const source = originalSources.get(id);
+  originalSources.delete(id);
+  await source?.cleanup?.().catch(() => {});
+}
+
+async function validateProjectFaces(model: ModelSummary, contents: ProjectContents) {
+  const batchMap = new Map(model.batches.map((batch) => [batch.batchIndex, batch]));
+  const checked = new Map<number, { faceId: number; ordinal: number }[]>();
+  for (let i = 0; i < contents.paint.length; i += 4) {
+    const [faceId, batchIndex, ordinal, regionIndex] = contents.paint.subarray(i, i + 4);
+    const batch = batchMap.get(batchIndex);
+    if (!batch || faceId >= model.triangleCount || ordinal >= batch.triangleCount ||
+      regionIndex >= contents.state.regions.length) throw new Error('Project paint refers to an invalid original face.');
+    const list = checked.get(batchIndex) ?? [];
+    list.push({ faceId, ordinal });
+    checked.set(batchIndex, list);
+  }
+  for (const [batchIndex, list] of checked) {
+    const batch = batchMap.get(batchIndex)!;
+    const file = await fs.promises.open(batch.filePath, 'r');
+    try {
+      const offset = 16 + batch.triangleCount * 72;
+      const ids = Buffer.alloc(batch.triangleCount * 4);
+      const { bytesRead } = await file.read(ids, 0, ids.length, offset);
+      if (bytesRead !== ids.length || list.some(({ faceId, ordinal }) => ids.readUInt32LE(ordinal * 4) !== faceId)) {
+        throw new Error('Project paint does not match the rebuilt model.');
+      }
+    } finally {
+      await file.close();
+    }
+  }
+  for (const tone of contents.tones) {
+    for (let i = 0; i < tone.length; i += 4) {
+      if (tone[i] >= model.triangleCount || !batchMap.has(tone[i + 1]) ||
+          tone[i + 2] >= contents.state.regions.length || (tone[i + 3] !== 1 && tone[i + 3] !== 2)) {
+        throw new Error('Project lighting refers to an invalid original face.');
+      }
+    }
+  }
+}
+
 function createWindow(): void {
   const iconPath = resolveAppIconPath();
   mainWindow = new BrowserWindow({
@@ -112,15 +158,19 @@ app.whenReady().then(() => {
     return resolved;
   });
 
-  async function importStl(resolved: string): Promise<ModelSummary> {
+  async function importStl(
+    resolved: string,
+    original?: { name: string; cleanup: () => Promise<void> },
+  ): Promise<ModelSummary> {
     if (activeImportJobId) {
       throw new Error('An STL import is already in progress');
     }
     const jobId = crypto.randomUUID().replace(/-/g, '');
     activeImportJobId = jobId;
     try {
-      const summary = await getWorkerClient().importStl(resolved, jobId, { staged: true });
+      const summary = await getWorkerClient().importStl(resolved, jobId, { staged: true, displayName: original?.name });
       stagedBatchesByModelId.set(summary.modelId, collectBatchPaths(summary));
+      originalSources.set(summary.modelId, { path: resolved, name: original?.name ?? summary.fileName, cleanup: original?.cleanup });
       return summary;
     } finally {
       if (activeImportJobId === jobId) {
@@ -160,6 +210,9 @@ app.whenReady().then(() => {
     }
     const res = await getWorkerClient().commitModel(modelId);
     if (res.committed) {
+      const previous = loadedModelId;
+      loadedModelId = modelId;
+      if (previous && previous !== modelId) await releaseOriginalSource(previous);
       const promoted = stagedBatchesByModelId.get(modelId);
       if (promoted) {
         committedBatchPaths = promoted;
@@ -176,6 +229,7 @@ app.whenReady().then(() => {
     const res = await getWorkerClient().discardModel(modelId);
     if (res.discarded) {
       stagedBatchesByModelId.delete(modelId);
+      await releaseOriginalSource(modelId);
     }
     return res;
   });
@@ -253,6 +307,48 @@ app.whenReady().then(() => {
     return getWorkerClient().cancelImport(jobId);
   });
 
+  ipcMain.handle('project:save', async (_event, request: ProjectSaveRequest) => {
+    const source = request && originalSources.get(request.modelId);
+    if (!mainWindow || !source || request.modelId !== loadedModelId) {
+      throw new Error('Open a model before saving a paint project.');
+    }
+    const target = await dialog.showSaveDialog(mainWindow, {
+      title: 'Save Paint Pallet project',
+      defaultPath: path.parse(source.name).name + '.paintproject',
+      filters: [{ name: 'Paint Pallet projects', extensions: ['paintproject'] }],
+    });
+    if (target.canceled || !target.filePath) return false;
+    await writeProjectArchive(target.filePath, source.path, source.name, request);
+    return true;
+  });
+
+  ipcMain.handle('project:open', async (): Promise<OpenedProject | null> => {
+    if (!mainWindow) return null;
+    const selection = await dialog.showOpenDialog(mainWindow, {
+      title: 'Open Paint Pallet project',
+      properties: ['openFile'],
+      filters: [{ name: 'Paint Pallet projects', extensions: ['paintproject'] }],
+    });
+    if (selection.canceled || !selection.filePaths.length) return null;
+    if (activeImportJobId) throw new Error('Wait for the current model import.');
+    const archive = await openProjectArchive(selection.filePaths[0], path.join(app.getPath('userData'), 'project-cache'));
+    let model: ModelSummary | undefined;
+    try {
+      model = await importStl(archive.originalPath, { name: archive.sourceName, cleanup: archive.cleanup });
+      await validateProjectFaces(model, archive.contents);
+      return { model, ...archive.contents };
+    } catch (error) {
+      if (model) {
+        await getWorkerClient().discardModel(model.modelId);
+        stagedBatchesByModelId.delete(model.modelId);
+        await releaseOriginalSource(model.modelId);
+      } else {
+        await archive.cleanup();
+      }
+      throw error;
+    }
+  });
+
   createWindow();
 
   app.on('activate', () => {
@@ -269,6 +365,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  for (const id of originalSources.keys()) void releaseOriginalSource(id);
   if (workerClient) {
     void workerClient.dispose();
     workerClient = null;

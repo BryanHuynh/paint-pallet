@@ -1,4 +1,5 @@
 import { useMemo, useRef, useState } from 'react';
+import type { ProjectState } from '../../shared/paintProject';
 import type { PaintRecipe } from '../palette/types';
 import {
   commitShadowStroke,
@@ -14,6 +15,7 @@ import {
   type ShadowTool,
   type SurfaceFace,
 } from './shadowPaint';
+import { packShadowCoverage, unpackShadowCoverage } from './projectMasks';
 
 export function useShadowPainting(recipes: PaintRecipe[]) {
   const [regions, setRegions] = useState<ShadowRegion[]>([]);
@@ -99,9 +101,22 @@ export function useShadowPainting(recipes: PaintRecipe[]) {
     if (paintShadowFaces(fill, faces)) updateHistory(commitShadowStroke(history, fill));
   }
 
+  function restoreProject(state: ProjectState, paint: Uint32Array) {
+    reset();
+    setRegions(state.regions);
+    setRegionId(state.activeRegionId ?? '');
+    updateHistory({ ...emptyShadowHistory(), coverage: unpackShadowCoverage(paint, state.regions) });
+  }
+
   return {
     regions, region, recipe, colors, tool, brushSize, setBrushSize, strokePending,
     paintedFaces: committedFaceCount + (draft?.faceDelta ?? 0),
+    exportProject: () => ({
+      regions,
+      activeRegionId: region?.id ?? null,
+      paint: packShadowCoverage(historyRef.current.coverage, regions),
+    }),
+    restoreProject,
     coverage: draft?.coverage ?? history.coverage,
     committedCoverage: history.coverage,
     commitFill,

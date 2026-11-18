@@ -20,6 +20,7 @@ export interface ReferenceImage {
   width: number;
   height: number;
   element: HTMLImageElement;
+  file: File;
 }
 
 export interface PixelRect {

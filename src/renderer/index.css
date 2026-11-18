@@ -494,3 +494,30 @@ body,
 .viewport-canvas[data-painting-enabled] {
   cursor: crosshair;
 }
+
+
+.project-menu {
+  position: relative;
+}
+
+.project-menu summary {
+  list-style: none;
+}
+
+.project-menu summary::-webkit-details-marker {
+  display: none;
+}
+
+.project-menu-actions {
+  position: absolute;
+  z-index: 30;
+  inset-inline-end: 0;
+  inset-block-start: calc(100% + var(--s-1));
+  display: grid;
+  gap: var(--s-1);
+  min-width: max-content;
+  padding: var(--s-2);
+  background: var(--p-surface);
+  border: 1px solid var(--p-hairline);
+  border-radius: var(--r-md);
+}

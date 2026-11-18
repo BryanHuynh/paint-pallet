@@ -191,7 +191,7 @@ export class WorkerClient {
   async importStl(
     filePath: string,
     jobId?: string,
-    options?: { staged?: boolean },
+    options?: { staged?: boolean; displayName?: string },
   ): Promise<ModelSummary> {
     const safeJobId = jobId ?? crypto.randomUUID().replace(/-/g, '');
     if (!SAFE_JOB_ID_RE.test(safeJobId)) {
@@ -210,8 +210,8 @@ export class WorkerClient {
         filePath: prepared.filePath,
         cacheDir: this.cacheDir,
         staged: Boolean(options?.staged),
-        ...(prepared.sourceName ? {
-          sourceName: prepared.sourceName,
+        ...(options?.displayName || prepared.sourceName ? {
+          sourceName: options?.displayName ?? prepared.sourceName,
           sourceMeta: [prepared.sourceBytes],
           sourceGroups: prepared.sourceGroups,
           sourceGroupNames: prepared.sourceGroupNames,

@@ -1,4 +1,4 @@
-import React, { useDeferredValue, useEffect, useId, useMemo, useRef, useState } from 'react';
+import React, { useDeferredValue, useEffect, useId, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import {
   mapClientToCanvasPixel,
   readBoundedRegionImageData,
@@ -8,6 +8,7 @@ import {
 import styles from './PaletteWorkspace.module.css';
 import { ToneSwatchCard } from './ToneSwatchCard';
 import { createEmptyRecipe } from './recipes';
+import type { PaletteProjectHandle } from './paletteProject';
 import { MAX_SMART_PIXELS, paintSelection, selectConnectedColors } from './smartSelection';
 import { usePreviewZoom } from './usePreviewZoom';
 import type {
@@ -51,6 +52,7 @@ function loadReferenceFile(file: File, id: string): Promise<ReferenceImage> {
       resolve({
         id,
         name: file.name,
+        file,
         url,
         width: img.naturalWidth || img.width,
         height: img.naturalHeight || img.height,
@@ -68,9 +70,11 @@ function loadReferenceFile(file: File, id: string): Promise<ReferenceImage> {
 export default function PaletteWorkspace({
   recipes: sharedRecipes,
   setRecipes: setSharedRecipes,
+  projectRef,
 }: {
   recipes?: PaintRecipe[];
   setRecipes?: React.Dispatch<React.SetStateAction<PaintRecipe[]>>;
+  projectRef?: React.Ref<PaletteProjectHandle>;
 } = {}): React.ReactElement {
   const importInputId = useId();
   const recipeNameInputId = useId();
@@ -89,6 +93,7 @@ export default function PaletteWorkspace({
     scrollTop: number;
   } | null>(null);
   const nextRefId = useRef(1);
+  const projectRevision = useRef(0);
   const nextRecipeNumberRef = useRef(2);
   const isMountedRef = useRef(true);
   const urlsToRevokeRef = useRef<string[]>([]);
@@ -137,6 +142,62 @@ export default function PaletteWorkspace({
     [smartSeeds, maskTolerance],
   );
   const isUpdatingSmartSelection = smartSeeds !== null && maskTolerance !== tolerance;
+  useImperativeHandle(projectRef, () => ({
+    async exportProject() {
+      const referenceBytes: Uint8Array[] = [];
+      for (const reference of references) {
+        referenceBytes.push(new Uint8Array(await reference.file.arrayBuffer()));
+      }
+      return {
+        state: {
+          references: references.map(({ id, name, file }) => ({ id, name, mimeType: file.type })),
+          activeReferenceId: activeReference?.id ?? null,
+          activeRecipeId,
+        },
+        referenceBytes,
+      };
+    },
+    async prepareProject(state, bytes) {
+      const results = await Promise.allSettled(state.references.map((reference, index) =>
+        loadReferenceFile(new File([Uint8Array.from(bytes[index])], reference.name, { type: reference.mimeType }), reference.id),
+      ));
+      const loaded = results.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
+      let settled = false;
+      const dispose = () => {
+        if (settled) return;
+        settled = true;
+        for (const reference of loaded) URL.revokeObjectURL(reference.url);
+      };
+      if (loaded.length !== state.references.length) {
+        dispose();
+        throw new Error('A reference image in the paint project could not be decoded.');
+      }
+
+      return {
+        dispose,
+        apply() {
+          if (settled) return;
+          settled = true;
+          projectRevision.current++;
+          for (const url of urlsToRevokeRef.current) URL.revokeObjectURL(url);
+          urlsToRevokeRef.current = loaded.map((reference) => reference.url);
+          nextRefId.current = Math.max(0, ...loaded.map((reference) => Number(reference.id.replace(/^ref-/, '')) || 0)) + 1;
+          nextRecipeNumberRef.current = Math.max(0, ...state.recipes.map((recipe) => Number(recipe.id.replace(/^recipe-/, '')) || 0)) + 1;
+          setReferences(loaded);
+          setActiveRefId(state.activeReferenceId);
+          setActiveRecipeId(state.activeRecipeId);
+          setImportError(null);
+          setConfirmDeleteId(null);
+          setToolMode('eyedropper');
+          setKeyboardAnchor(null);
+          setDragStart(null);
+          updateSelection(null);
+          setCursor({ x: 0, y: 0 });
+          fit();
+        },
+      };
+    },
+  }), [references, activeReference, activeRecipeId, fit]);
   const hasSelection = Boolean(selection || smartSelection);
   const zoomReadout = zoom === null ? 'Fit' : `${Math.round(zoom * 100)}%`;
 
@@ -248,6 +309,7 @@ export default function PaletteWorkspace({
       return;
     }
 
+    const revision = projectRevision.current;
     const results = await Promise.allSettled(
       supported.map((file) =>
         loadReferenceFile(file, `ref-${nextRefId.current++}`),
@@ -269,7 +331,7 @@ export default function PaletteWorkspace({
       }
     }
 
-    if (!isMountedRef.current) {
+    if (!isMountedRef.current || revision !== projectRevision.current) {
       for (const item of loaded) {
         URL.revokeObjectURL(item.url);
       }

@@ -10,6 +10,8 @@ import type {
 } from '../shared/workerProtocol';
 import { ALL_AXES, getOrthogonalFrontOptions } from './orientation';
 import { Viewport3D, type CameraPreset, type PickGenerationToken } from './components/Viewport3D';
+import type { OpenedProject } from '../shared/paintProject';
+import type { PaletteProjectHandle, PreparedPaletteProject } from './palette/paletteProject';
 import type { PaintRecipe } from './palette/types';
 import { createEmptyRecipe } from './palette/recipes';
 import { ShadowPanel } from './paint/ShadowPanel';
@@ -56,6 +58,10 @@ export default function App({
 
   const [recipes, setRecipes] = useState<PaintRecipe[]>(() => [createEmptyRecipe(1)]);
   const shadow = useShadowPainting(recipes);
+  const paletteProject = useRef<PaletteProjectHandle | null>(null);
+  const pendingProject = useRef<{ project: OpenedProject; palette: PreparedPaletteProject } | null>(null);
+  const projectMenu = useRef<HTMLDetailsElement | null>(null);
+  const [projectAction, setProjectAction] = useState<'open' | 'save' | null>(null);
   const [activeTab, setActiveTab] = useState<'model' | 'palette'>('model');
   const [model, setModel] = useState<ModelSummary | null>(null);
   const fill = useConnectedFill(api, shadow.tool === 'fill', model?.modelId, shadow.region?.id, shadow.committedCoverage);
@@ -220,6 +226,71 @@ export default function App({
     });
   };
 
+  function takePendingProject(modelId: string) {
+    const pending = pendingProject.current;
+    if (pending?.project.model.modelId !== modelId) return null;
+    pendingProject.current = null;
+    return pending;
+  }
+
+  async function saveProject() {
+    if (!api?.saveProject || !model || !paletteProject.current) return;
+    if (projectMenu.current) projectMenu.current.open = false;
+    setProjectAction('save');
+    setStatusMsg(null);
+    try {
+      const paint = shadow.exportProject();
+      const snapshots = lighting.exportProject(paint.regions);
+      const palette = await paletteProject.current.exportProject();
+      await api.saveProject({
+        modelId: model.modelId,
+        state: {
+          orientation,
+          recipes,
+          ...palette.state,
+          regions: paint.regions,
+          activeRegionId: paint.activeRegionId,
+          snapshots: snapshots.snapshots,
+          activeSnapshotId: snapshots.activeSnapshotId,
+        },
+        referenceBytes: palette.referenceBytes,
+        paint: paint.paint,
+        tones: snapshots.tones,
+      });
+    } catch (error) {
+      setStatusMsg(error instanceof Error ? error.message : 'Unable to save the paint project.');
+    } finally {
+      setProjectAction(null);
+    }
+  }
+
+  async function openProject() {
+    if (!api?.openProject || !paletteProject.current || importInFlight.current) return;
+    const paletteHandle = paletteProject.current;
+    if (projectMenu.current) projectMenu.current.open = false;
+    importInFlight.current = true;
+    setProjectAction('open');
+    setStatusMsg(null);
+    let project: OpenedProject | null = null;
+    try {
+      project = await api.openProject();
+      if (!project) return;
+      const palette = await paletteHandle.prepareProject(project.state, project.referenceBytes);
+      pendingProject.current = { project, palette };
+      pendingModelRef.current = project.model;
+      setPendingModel(project.model);
+      setActiveTab('model');
+    } catch (error) {
+      if (project) await api.discardModel?.(project.model.modelId).catch(() => {});
+      const message = error instanceof Error ? error.message : 'Unable to open the paint project.';
+      setStatusMsg(model ? `${message} Kept ${model.fileName} open.` : message);
+    } finally {
+      importInFlight.current = false;
+      setProjectAction(null);
+      setProgress(null);
+    }
+  }
+
   const handleCancelImport = async () => {
     if (!api || isCommitting) return;
     if (isImporting) {
@@ -230,6 +301,7 @@ export default function App({
     if (staged) {
       pendingModelRef.current = null;
       setPendingModel(null);
+      takePendingProject(staged.modelId)?.palette.dispose();
       await api.discardModel?.(staged.modelId);
       setStatusMsg(
         model
@@ -252,6 +324,7 @@ export default function App({
 
         // Guard stale commit reply if staged model was superseded or cleared
         if (pendingModelRef.current?.modelId !== committed.modelId) {
+          takePendingProject(committed.modelId)?.palette.dispose();
           if (res.committed) {
             await api?.discardModel?.(committed.modelId);
           }
@@ -261,6 +334,7 @@ export default function App({
         if (!res.committed) {
           pendingModelRef.current = null;
           setPendingModel(null);
+          takePendingProject(committed.modelId)?.palette.dispose();
           await api?.discardModel?.(committed.modelId);
           setStatusMsg(
             model
@@ -273,9 +347,19 @@ export default function App({
         ++appModelGenRef.current;
         activeModelIdRef.current = committed.modelId;
         pendingModelRef.current = null;
-        shadow.reset();
+        const opened = takePendingProject(committed.modelId);
         fill.cancel();
-        lighting.reset();
+        if (opened) {
+          const { state, paint, tones } = opened.project;
+          setOrientation(state.orientation);
+          setRecipes(state.recipes);
+          shadow.restoreProject(state, paint);
+          lighting.restoreProject(state, tones);
+          opened.palette.apply();
+        } else {
+          shadow.reset();
+          lighting.reset();
+        }
         setModel(committed);
         setPendingModel(null);
         setProgress(null);
@@ -284,6 +368,7 @@ export default function App({
       } catch (err) {
         pendingModelRef.current = null;
         setPendingModel(null);
+        takePendingProject(committed.modelId)?.palette.dispose();
         await api?.discardModel?.(committed.modelId);
         const msg = err instanceof Error ? err.message : 'Replacement commit failed.';
         setStatusMsg(model ? `${msg} Kept ${model.fileName} open.` : msg);
@@ -301,6 +386,7 @@ export default function App({
       if (!staged) return;
       pendingModelRef.current = null;
       setPendingModel(null);
+      takePendingProject(staged.modelId)?.palette.dispose();
       await api?.discardModel?.(staged.modelId);
       setStatusMsg(
         model
@@ -358,7 +444,7 @@ export default function App({
       ? Math.min(100, Math.round((progress.bytesRead / progress.totalBytes) * 100))
       : 0;
 
-  const isBusy = isImporting || Boolean(pendingModel) || isCommitting;
+  const isBusy = isImporting || Boolean(pendingModel) || isCommitting || projectAction !== null;
 
   return (
     <div className="app-shell">
@@ -404,7 +490,20 @@ export default function App({
         </nav>
 
         <div className="header-actions">
-          {isBusy ? (
+          {api?.openProject && api.saveProject && (
+            <details className="project-menu" ref={projectMenu}>
+              <summary className="btn btn--secondary">Project</summary>
+              <div className="project-menu-actions">
+                <button type="button" className="btn btn--secondary" disabled={isBusy} onClick={openProject}>
+                  Open project
+                </button>
+                <button type="button" className="btn btn--secondary" disabled={isBusy || !model} onClick={saveProject}>
+                  Save project
+                </button>
+              </div>
+            </details>
+          )}
+          {(isImporting || pendingModel || isCommitting) ? (
             <button
               type="button"
               className="btn btn--secondary"
@@ -431,7 +530,7 @@ export default function App({
           data-testid="palette-host"
           hidden={activeTab !== 'palette'}
         >
-          <ResolvedPalette recipes={recipes} setRecipes={setRecipes} />
+          <ResolvedPalette recipes={recipes} setRecipes={setRecipes} projectRef={paletteProject} />
         </main>
       ) : null}
 
@@ -509,6 +608,10 @@ export default function App({
                 Dismiss
               </button>
             </div>
+          ) : null}
+
+          {projectAction && !progress ? (
+            <div className="progress-overlay" role="status">{projectAction === 'open' ? 'Opening project…' : 'Saving project…'}</div>
           ) : null}
 
           {progress ? (

@@ -1,3 +1,4 @@
+import type { ProjectSaveRequest } from '../shared/paintProject';
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type {
   ConnectedFillRequest,
@@ -29,6 +30,8 @@ const api: PaintPalletApi = {
   cancelConnectedFill: (jobId: string) => ipcRenderer.invoke('worker:cancel-fill', jobId),
   computeLightExposure: (request: ExposureRequest) => ipcRenderer.invoke('worker:light-exposure', request),
   cancelLightExposure: (jobId: string) => ipcRenderer.invoke('worker:cancel-light', jobId),
+  saveProject: (request: ProjectSaveRequest) => ipcRenderer.invoke('project:save', request),
+  openProject: () => ipcRenderer.invoke('project:open'),
   onImportProgress: (listener: (event: ImportProgressEvent) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, payload: ImportProgressEvent) => {
       listener(payload);
