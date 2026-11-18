@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type {
+  BatchDescriptor,
   ModelOrientation,
   ModelSummary,
   PaintPalletApi,
@@ -17,21 +18,35 @@ export interface Viewport3DProps {
   pendingModel: ModelSummary | null;
   orientation: ModelOrientation;
   cameraPresetRequest: { preset: CameraPreset; seq: number } | null;
-  onSurfacePick: (origin: Vec3, direction: Vec3) => void;
+  onSurfacePick: (origin: Vec3, direction: Vec3, batchIndices?: number[]) => void;
   onPendingModelCommit: (committed: ModelSummary) => void;
   onPendingModelError: (error: Error) => void;
   disableWebGL?: boolean;
 }
 
-const MAX_DETAIL_BATCHES = 16;
+export const MAX_DETAIL_BATCHES = 16;
 
-function selectBoundedBatches(model: ModelSummary) {
-  const modelCenter = new THREE.Vector3(
-    (model.bounds.min[0] + model.bounds.max[0]) * 0.5,
-    (model.bounds.min[1] + model.bounds.max[1]) * 0.5,
-    (model.bounds.min[2] + model.bounds.max[2]) * 0.5,
-  );
-  return [...model.batches]
+function distanceSqToBounds(p: THREE.Vector3, b: BatchDescriptor['bounds']): number {
+  const dx = Math.max(b.min[0] - p.x, 0, p.x - b.max[0]);
+  const dy = Math.max(b.min[1] - p.y, 0, p.y - b.max[1]);
+  const dz = Math.max(b.min[2] - p.z, 0, p.z - b.max[2]);
+  return dx * dx + dy * dy + dz * dz;
+}
+
+export function selectCameraVisibleBatchIndices(
+  batches: BatchDescriptor[],
+  cameraLocalPos: Vec3,
+  targetLocalPos: Vec3,
+  maxBatches = MAX_DETAIL_BATCHES,
+): number[] {
+  if (batches.length <= maxBatches) {
+    return batches.map((b) => b.batchIndex);
+  }
+  const cam = new THREE.Vector3(...cameraLocalPos);
+  const tgt = new THREE.Vector3(...targetLocalPos);
+  const viewDir = new THREE.Vector3().subVectors(tgt, cam).normalize();
+
+  return [...batches]
     .sort((a, b) => {
       const ac = new THREE.Vector3(
         (a.bounds.min[0] + a.bounds.max[0]) * 0.5,
@@ -43,9 +58,48 @@ function selectBoundedBatches(model: ModelSummary) {
         (b.bounds.min[1] + b.bounds.max[1]) * 0.5,
         (b.bounds.min[2] + b.bounds.max[2]) * 0.5,
       );
-      return ac.distanceToSquared(modelCenter) - bc.distanceToSquared(modelCenter);
+      const aFront = new THREE.Vector3().subVectors(ac, cam).dot(viewDir) >= 0 ? 0 : 1;
+      const bFront = new THREE.Vector3().subVectors(bc, cam).dot(viewDir) >= 0 ? 0 : 1;
+      if (aFront !== bFront) return aFront - bFront;
+      return distanceSqToBounds(tgt, a.bounds) + distanceSqToBounds(cam, a.bounds) * 0.25 -
+             (distanceSqToBounds(tgt, b.bounds) + distanceSqToBounds(cam, b.bounds) * 0.25);
     })
-    .slice(0, MAX_DETAIL_BATCHES);
+    .slice(0, maxBatches)
+    .map((b) => b.batchIndex);
+}
+
+export function findRayIntersectingBatchIndices(
+  batches: BatchDescriptor[],
+  origin: Vec3,
+  direction: Vec3,
+): number[] {
+  const hits: { batchIndex: number; tMin: number }[] = [];
+  const invDir: Vec3 = [
+    Math.abs(direction[0]) > 1e-12 ? 1 / direction[0] : 1e30,
+    Math.abs(direction[1]) > 1e-12 ? 1 / direction[1] : 1e30,
+    Math.abs(direction[2]) > 1e-12 ? 1 / direction[2] : 1e30,
+  ];
+  for (const b of batches) {
+    let tmin = 0;
+    let tmax = Infinity;
+    let hit = true;
+    for (let i = 0; i < 3; i++) {
+      let t1 = (b.bounds.min[i] - origin[i]) * invDir[i];
+      let t2 = (b.bounds.max[i] - origin[i]) * invDir[i];
+      if (t1 > t2) [t1, t2] = [t2, t1];
+      tmin = Math.max(tmin, t1);
+      tmax = Math.min(tmax, t2);
+      if (tmin > tmax) {
+        hit = false;
+        break;
+      }
+    }
+    if (hit) {
+      hits.push({ batchIndex: b.batchIndex, tMin: tmin });
+    }
+  }
+  hits.sort((a, b) => a.tMin - b.tMin);
+  return hits.map((h) => h.batchIndex);
 }
 
 function disposeGroupMeshes(group: THREE.Group): void {
@@ -74,6 +128,14 @@ export function Viewport3D({
   onCommitRef.current = onPendingModelCommit;
   const onErrorRef = useRef(onPendingModelError);
   onErrorRef.current = onPendingModelError;
+  const activeModelRef = useRef<ModelSummary | null>(model);
+  activeModelRef.current = model;
+  const apiRef = useRef<PaintPalletApi | undefined>(api);
+  apiRef.current = api;
+
+  const detailCacheRef = useRef<Map<number, { mesh: THREE.Mesh; lastUsed: number }>>(new Map());
+  const lruTickRef = useRef(0);
+  const streamGenerationRef = useRef(0);
 
   const sceneRefs = useRef<{
     scene: THREE.Scene;
@@ -83,8 +145,87 @@ export function Viewport3D({
     modelGroup: THREE.Group;
     previewGroup: THREE.Group;
     detailGroup: THREE.Group;
+    material: THREE.MeshStandardMaterial;
     radius: number;
   } | null>(null);
+
+  const ensureDetailBatchesLoaded = async (
+    targetModel: ModelSummary,
+    desiredIndices: number[],
+    generation: number,
+  ): Promise<void> => {
+    const refs = sceneRefs.current;
+    const currentApi = apiRef.current;
+    if (!refs || !currentApi) return;
+
+    const batchByIndex = new Map(targetModel.batches.map((b) => [b.batchIndex, b]));
+    const cache = detailCacheRef.current;
+
+    // Touch already-cached batches
+    for (const idx of desiredIndices) {
+      const existing = cache.get(idx);
+      if (existing) {
+        existing.lastUsed = ++lruTickRef.current;
+      }
+    }
+
+    // Stream in missing batches progressively
+    for (const idx of desiredIndices) {
+      if (streamGenerationRef.current !== generation) return;
+      if (cache.has(idx)) continue;
+      const desc = batchByIndex.get(idx);
+      if (!desc) continue;
+
+      const bin = await currentApi.readBatch(desc.filePath);
+      if (streamGenerationRef.current !== generation) return;
+
+      // Evict least-recently-used batch if at capacity (and not in desiredIndices)
+      while (cache.size >= MAX_DETAIL_BATCHES) {
+        let victimKey: number | null = null;
+        let oldestTick = Infinity;
+        for (const [k, entry] of cache.entries()) {
+          if (entry.lastUsed < oldestTick) {
+            oldestTick = entry.lastUsed;
+            victimKey = k;
+          }
+        }
+        if (victimKey === null) break;
+        const victim = cache.get(victimKey)!;
+        refs.detailGroup.remove(victim.mesh);
+        victim.mesh.geometry.dispose();
+        cache.delete(victimKey);
+      }
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(bin.positions, 3));
+      geo.setAttribute('normal', new THREE.BufferAttribute(bin.normals, 3));
+      const mesh = new THREE.Mesh(geo, refs.material);
+      refs.detailGroup.add(mesh);
+      cache.set(idx, { mesh, lastUsed: ++lruTickRef.current });
+    }
+  };
+
+  const streamForCurrentCamera = async (targetModel: ModelSummary) => {
+    const refs = sceneRefs.current;
+    if (!refs) return;
+    const gen = ++streamGenerationRef.current;
+    refs.modelGroup.updateMatrixWorld(true);
+    const invMat = new THREE.Matrix4().copy(refs.modelGroup.matrixWorld).invert();
+    const camLocal = refs.camera.position.clone().applyMatrix4(invMat);
+    const tgtLocal = refs.controls.target.clone().applyMatrix4(invMat);
+
+    const desired = selectCameraVisibleBatchIndices(
+      targetModel.batches,
+      [camLocal.x, camLocal.y, camLocal.z],
+      [tgtLocal.x, tgtLocal.y, tgtLocal.z],
+      MAX_DETAIL_BATCHES,
+    );
+    await ensureDetailBatchesLoaded(targetModel, desired, gen);
+    if (streamGenerationRef.current === gen && refs.detailGroup.children.length > 0) {
+      refs.previewGroup.visible = false;
+      refs.detailGroup.visible = true;
+    }
+  };
 
   useEffect(() => {
     const container = containerRef.current;
@@ -131,6 +272,12 @@ export function Viewport3D({
     const grid = new THREE.GridHelper(4, 16, 0x2f4d31, 0x1b311d);
     scene.add(grid);
 
+    const material = new THREE.MeshStandardMaterial({
+      color: 0xd4d9d2,
+      roughness: 0.62,
+      metalness: 0.08,
+    });
+
     const modelGroup = new THREE.Group();
     const previewGroup = new THREE.Group();
     const detailGroup = new THREE.Group();
@@ -146,24 +293,25 @@ export function Viewport3D({
       modelGroup,
       previewGroup,
       detailGroup,
+      material,
       radius: 1,
     };
 
     let settleTimer: number | null = null;
     const onControlStart = () => {
       if (settleTimer !== null) window.clearTimeout(settleTimer);
+      ++streamGenerationRef.current;
       if (previewGroup.children.length > 0) {
         previewGroup.visible = true;
         detailGroup.visible = false;
       }
     };
     const onControlEnd = () => {
-      if (previewGroup.children.length > 0 && detailGroup.children.length > 0) {
-        settleTimer = window.setTimeout(() => {
-          previewGroup.visible = false;
-          detailGroup.visible = true;
-        }, 120);
-      }
+      const m = activeModelRef.current;
+      if (!m) return;
+      settleTimer = window.setTimeout(() => {
+        void streamForCurrentCamera(m);
+      }, 120);
     };
     controls.addEventListener('start', onControlStart);
     controls.addEventListener('end', onControlEnd);
@@ -174,10 +322,13 @@ export function Viewport3D({
       downX = e.clientX;
       downY = e.clientY;
     };
-    const onPointerUp = (e: PointerEvent) => {
+    const onPointerUp = async (e: PointerEvent) => {
       if (e.button !== 0) return;
       const dist = Math.hypot(e.clientX - downX, e.clientY - downY);
       if (dist > 4) return;
+      const currentModel = activeModelRef.current;
+      if (!currentModel) return;
+
       const rect = renderer.domElement.getBoundingClientRect();
       const ndc = new THREE.Vector2(
         ((e.clientX - rect.left) / rect.width) * 2 - 1,
@@ -191,10 +342,25 @@ export function Viewport3D({
       const localRay = raycaster.ray.clone().applyMatrix4(invMat);
       localRay.direction.normalize();
 
-      onPickRef.current(
-        [localRay.origin.x, localRay.origin.y, localRay.origin.z],
-        [localRay.direction.x, localRay.direction.y, localRay.direction.z],
+      const orig: Vec3 = [localRay.origin.x, localRay.origin.y, localRay.origin.z];
+      const dir: Vec3 = [localRay.direction.x, localRay.direction.y, localRay.direction.z];
+
+      // Ensure exact ray-intersected detail batches are loaded & rendered before resolving pick
+      const rayBatches = findRayIntersectingBatchIndices(currentModel.batches, orig, dir).slice(
+        0,
+        MAX_DETAIL_BATCHES,
       );
+      if (rayBatches.length > 0) {
+        const gen = ++streamGenerationRef.current;
+        await ensureDetailBatchesLoaded(currentModel, rayBatches, gen);
+        if (streamGenerationRef.current === gen) {
+          previewGroup.visible = false;
+          detailGroup.visible = true;
+        }
+      }
+
+      const renderedBatchIndices = Array.from(detailCacheRef.current.keys());
+      onPickRef.current(orig, dir, renderedBatchIndices);
     };
     renderer.domElement.addEventListener('pointerdown', onPointerDown);
     renderer.domElement.addEventListener('pointerup', onPointerUp);
@@ -224,6 +390,10 @@ export function Viewport3D({
       controls.removeEventListener('end', onControlEnd);
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       renderer.domElement.removeEventListener('pointerup', onPointerUp);
+      disposeGroupMeshes(previewGroup);
+      disposeGroupMeshes(detailGroup);
+      detailCacheRef.current.clear();
+      material.dispose();
       controls.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode === container) {
@@ -240,7 +410,7 @@ export function Viewport3D({
     let cancelled = false;
 
     const stagedPreviewGeos: THREE.BufferGeometry[] = [];
-    const stagedDetailGeos: THREE.BufferGeometry[] = [];
+    const stagedDetailEntries: { batchIndex: number; geo: THREE.BufferGeometry }[] = [];
 
     const stageBatches = async () => {
       try {
@@ -253,49 +423,60 @@ export function Viewport3D({
           stagedPreviewGeos.push(geo);
         }
 
-        const boundedBatches = selectBoundedBatches(pendingModel);
-        for (const batch of boundedBatches) {
+        const center: Vec3 = [
+          (pendingModel.bounds.min[0] + pendingModel.bounds.max[0]) * 0.5,
+          (pendingModel.bounds.min[1] + pendingModel.bounds.max[1]) * 0.5,
+          (pendingModel.bounds.min[2] + pendingModel.bounds.max[2]) * 0.5,
+        ];
+        const initialIndices = selectCameraVisibleBatchIndices(
+          pendingModel.batches,
+          [center[0], center[1], center[2] + 100],
+          center,
+          MAX_DETAIL_BATCHES,
+        );
+        const batchByIndex = new Map(pendingModel.batches.map((b) => [b.batchIndex, b]));
+
+        for (const idx of initialIndices) {
+          const batch = batchByIndex.get(idx);
+          if (!batch) continue;
           const bin = await api.readBatch(batch.filePath);
           if (cancelled) return;
           const geo = new THREE.BufferGeometry();
           geo.setAttribute('position', new THREE.BufferAttribute(bin.positions, 3));
           geo.setAttribute('normal', new THREE.BufferAttribute(bin.normals, 3));
-          stagedDetailGeos.push(geo);
+          stagedDetailEntries.push({ batchIndex: idx, geo });
         }
 
         const refs = sceneRefs.current;
         if (refs) {
-          const mat = new THREE.MeshStandardMaterial({
-            color: 0xd4d9d2,
-            roughness: 0.62,
-            metalness: 0.08,
-          });
+          ++streamGenerationRef.current;
           disposeGroupMeshes(refs.previewGroup);
           disposeGroupMeshes(refs.detailGroup);
+          detailCacheRef.current.clear();
 
           for (const geo of stagedPreviewGeos) {
-            refs.previewGroup.add(new THREE.Mesh(geo, mat));
+            refs.previewGroup.add(new THREE.Mesh(geo, refs.material));
           }
-          for (const geo of stagedDetailGeos) {
-            refs.detailGroup.add(new THREE.Mesh(geo, mat));
+          for (const entry of stagedDetailEntries) {
+            const mesh = new THREE.Mesh(entry.geo, refs.material);
+            refs.detailGroup.add(mesh);
+            detailCacheRef.current.set(entry.batchIndex, {
+              mesh,
+              lastUsed: ++lruTickRef.current,
+            });
           }
 
-          if (pendingModel.batches.length <= MAX_DETAIL_BATCHES || !pendingModel.previewFilePath) {
-            refs.previewGroup.visible = false;
-            refs.detailGroup.visible = true;
-          } else {
-            refs.previewGroup.visible = true;
-            refs.detailGroup.visible = false;
-          }
+          refs.previewGroup.visible = false;
+          refs.detailGroup.visible = true;
         } else {
           for (const g of stagedPreviewGeos) g.dispose();
-          for (const g of stagedDetailGeos) g.dispose();
+          for (const e of stagedDetailEntries) e.geo.dispose();
         }
 
         onCommitRef.current(pendingModel);
       } catch (err) {
         for (const g of stagedPreviewGeos) g.dispose();
-        for (const g of stagedDetailGeos) g.dispose();
+        for (const e of stagedDetailEntries) e.geo.dispose();
         if (!cancelled) {
           onErrorRef.current(
             err instanceof Error ? err : new Error('Failed loading replacement geometry batches'),
@@ -308,7 +489,7 @@ export function Viewport3D({
     return () => {
       cancelled = true;
       for (const g of stagedPreviewGeos) g.dispose();
-      for (const g of stagedDetailGeos) g.dispose();
+      for (const e of stagedDetailEntries) e.geo.dispose();
     };
   }, [api, pendingModel]);
 
@@ -337,6 +518,8 @@ export function Viewport3D({
     refs.camera.far = Math.max(500, radius * 40);
     refs.camera.updateProjectionMatrix();
     refs.controls.update();
+
+    void streamForCurrentCamera(model);
   }, [model, orientation]);
 
   // Camera view presets
@@ -362,7 +545,10 @@ export function Viewport3D({
         break;
     }
     refs.controls.update();
-  }, [cameraPresetRequest]);
+    if (model) {
+      void streamForCurrentCamera(model);
+    }
+  }, [cameraPresetRequest, model]);
 
   return (
     <div

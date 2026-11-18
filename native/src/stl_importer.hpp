@@ -94,7 +94,8 @@ PickResult pickModelFace(
     const ModelRecord& model,
     const std::array<float, 3>& origin,
     const std::array<float, 3>& direction,
-    PickBatchCache& cache);
+    PickBatchCache& cache,
+    const std::vector<uint32_t>* allowedBatchIndices = nullptr);
 
 bool cleanupJobDir(const std::string& jobDirUtf8, std::string* outError = nullptr);
 

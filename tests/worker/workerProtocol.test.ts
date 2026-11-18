@@ -262,4 +262,70 @@ describe('Worker import/batch/pick protocol', () => {
     expect(pick.originalFaceId).toBe(1);
     expect(pick.distance).toBeCloseTo(8, 4);
   });
+
+  it('preserves active model on staged replacement discard and releases discarded job dir', async () => {
+    const firstPath = path.join(tempDir, 'first_staged.stl');
+    writeBinaryStl(firstPath, [{ v1: [0, 0, 0], v2: [1, 0, 0], v3: [0, 1, 0] }]);
+    const first = await client.importStl(firstPath, 'job_active_1');
+
+    const secondPath = path.join(tempDir, 'second_staged.stl');
+    writeBinaryStl(secondPath, [{ v1: [5, 0, 0], v2: [6, 0, 0], v3: [5, 1, 0] }]);
+    const second = await client.importStl(secondPath, 'job_staged_2', { staged: true });
+
+    // Active model must still be first until commitModel is called
+    expect((await client.getActiveModel())?.modelId).toBe(first.modelId);
+    const activePick = await client.pickFace(first.modelId, [0.2, 0.2, 5], [0, 0, -1]);
+    expect(activePick.hit).toBe(true);
+    expect(activePick.originalFaceId).toBe(0);
+
+    // Discard staged replacement -> removes second's job dir, keeps first active
+    const disc = await client.discardModel(second.modelId);
+    expect(disc.discarded).toBe(true);
+    expect(fs.existsSync(path.dirname(second.batches[0].filePath))).toBe(false);
+    expect((await client.getActiveModel())?.modelId).toBe(first.modelId);
+
+    // Commit a third staged replacement -> promotes third and cleans up first's job dir
+    const third = await client.importStl(secondPath, 'job_staged_3', { staged: true });
+    const comm = await client.commitModel(third.modelId);
+    expect(comm.committed).toBe(true);
+    expect((await client.getActiveModel())?.modelId).toBe(third.modelId);
+    expect(fs.existsSync(path.dirname(first.batches[0].filePath))).toBe(false);
+  });
+
+  it('restricts pickFace to rendered batchIndices when provided', async () => {
+    const stlPath = path.join(tempDir, 'two_regions.stl');
+    const tris = [];
+    for (let i = 0; i < 3000; i++) {
+      const base = i < 1500 ? 0 : 100;
+      tris.push({
+        v1: [base, 0, 0] as [number, number, number],
+        v2: [base + 1, 0, 0] as [number, number, number],
+        v3: [base, 1, 0] as [number, number, number],
+      });
+    }
+    writeBinaryStl(stlPath, tris);
+    const summary = await client.importStl(stlPath, 'job_batch_filter');
+    expect(summary.batches.length).toBeGreaterThanOrEqual(2);
+
+    const farBatch = summary.batches.find((b) => b.bounds.min[0] > 50)!;
+    const nearBatch = summary.batches.find((b) => b.bounds.max[0] < 50)!;
+
+    // Ray aimed at far region [100.2, 0.2, 5] only hits when farBatch is included
+    const missUnrendered = await client.pickFace(
+      summary.modelId,
+      [100.2, 0.2, 5],
+      [0, 0, -1],
+      [nearBatch.batchIndex],
+    );
+    expect(missUnrendered.hit).toBe(false);
+
+    const hitRendered = await client.pickFace(
+      summary.modelId,
+      [100.2, 0.2, 5],
+      [0, 0, -1],
+      [farBatch.batchIndex],
+    );
+    expect(hitRendered.hit).toBe(true);
+    expect(hitRendered.originalFaceId).toBeGreaterThanOrEqual(1500);
+  });
 });

@@ -5,6 +5,10 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react';
 import * as THREE from 'three';
 import App from '../../src/renderer/App';
+import {
+  findRayIntersectingBatchIndices,
+  selectCameraVisibleBatchIndices,
+} from '../../src/renderer/components/Viewport3D';
 import { computeOrientationQuaternion } from '../../src/renderer/orientation';
 import type { ModelSummary, PaintPalletApi } from '../../src/shared/workerProtocol';
 
@@ -202,16 +206,24 @@ describe('UI import-orbit-orientation actions', () => {
       .mockResolvedValueOnce(secondModel)
       .mockResolvedValueOnce(secondModel);
 
-    const api = createMockApi({ selectStlFile, importStl, readBatch });
+    const api = createMockApi({
+      selectStlFile,
+      importStl,
+      readBatch,
+      commitModel: vi.fn().mockResolvedValue({ committed: true }),
+      discardModel: vi.fn().mockResolvedValue({ discarded: true }),
+    });
     render(<App api={api} disableWebGL />);
 
     // Commit first.stl
     fireEvent.click(screen.getByRole('button', { name: /open stl/i }));
     expect(await screen.findByText('first.stl')).toBeInTheDocument();
+    expect(api.commitModel).toHaveBeenCalledWith('model_first');
 
-    // Fail readBatch on second.stl -> keeps first.stl open with visible alert
+    // Fail readBatch on second.stl -> discards secondModel and keeps first.stl open
     fireEvent.click(screen.getByRole('button', { name: /open stl/i }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/Disk batch read failed.*Kept first\.stl open/i);
+    expect(api.discardModel).toHaveBeenCalledWith('model_second');
     expect(screen.getByText('first.stl')).toBeInTheDocument();
 
     // Start third attempt where readBatch is pending, then cancel geometry swap
@@ -220,7 +232,29 @@ describe('UI import-orbit-orientation actions', () => {
     fireEvent.click(cancelBtn);
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/Canceled geometry swap; kept first\.stl open/i);
+    expect(api.discardModel).toHaveBeenCalledTimes(2);
     expect(screen.getByText('first.stl')).toBeInTheDocument();
     resolvePendingBatch?.(emptyBatch);
+  });
+
+  it('selects camera-visible and ray-intersected batches across peripheral areas', () => {
+    const batches = Array.from({ length: 24 }, (_, idx) => ({
+      batchIndex: idx,
+      filePath: `b_${idx}.bin`,
+      triangleCount: 100,
+      bounds: {
+        min: [idx * 10, 0, 0] as [number, number, number],
+        max: [idx * 10 + 5, 5, 5] as [number, number, number],
+      },
+    }));
+
+    // Camera focused on far peripheral batch 22 ([222, 2, 2])
+    const selected = selectCameraVisibleBatchIndices(batches, [222, 2, 25], [222, 2, 2], 4);
+    expect(selected).toContain(22);
+    expect(selected.length).toBe(4);
+
+    // Ray aimed at batch 20
+    const rayHits = findRayIntersectingBatchIndices(batches, [202, 2, 20], [0, 0, -1]);
+    expect(rayHits).toEqual([20]);
   });
 });

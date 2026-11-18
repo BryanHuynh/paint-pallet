@@ -103,4 +103,29 @@ inline std::optional<std::vector<double>> extractJsonNumberArray(const std::stri
   return vals;
 }
 
+inline std::optional<bool> extractJsonBool(const std::string& json, const std::string& key) {
+  std::string pattern = "\"" + key + "\"";
+  size_t pos = json.find(pattern);
+  if (pos == std::string::npos) return std::nullopt;
+  size_t colon = json.find(':', pos + pattern.size());
+  if (colon == std::string::npos) return std::nullopt;
+  size_t valStart = colon + 1;
+  while (valStart < json.size() && std::isspace(static_cast<unsigned char>(json[valStart]))) ++valStart;
+  if (json.compare(valStart, 4, "true") == 0) return true;
+  if (json.compare(valStart, 5, "false") == 0) return false;
+  return std::nullopt;
+}
+
+inline std::optional<std::vector<uint32_t>> extractJsonUIntArray(const std::string& json, const std::string& key) {
+  auto nums = extractJsonNumberArray(json, key);
+  if (!nums) return std::nullopt;
+  std::vector<uint32_t> out;
+  out.reserve(nums->size());
+  for (double d : *nums) {
+    if (d < 0.0) continue;
+    out.push_back(static_cast<uint32_t>(d));
+  }
+  return out;
+}
+
 }  // namespace pp

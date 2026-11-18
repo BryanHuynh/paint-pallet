@@ -164,6 +164,10 @@ export class WorkerClient {
         entry.reject(err);
       } else if (msg.type === 'cancel_ack') {
         entry.resolve({ canceled: Boolean(msg.canceled) });
+      } else if (msg.type === 'commit_ack') {
+        entry.resolve({ committed: Boolean(msg.committed) });
+      } else if (msg.type === 'discard_ack') {
+        entry.resolve({ discarded: Boolean(msg.discarded) });
       } else if (msg.type === 'pick_result') {
         entry.resolve({
           hit: Boolean(msg.hit),
@@ -212,7 +216,11 @@ export class WorkerClient {
     };
   }
 
-  async importStl(filePath: string, jobId?: string): Promise<ModelSummary> {
+  async importStl(
+    filePath: string,
+    jobId?: string,
+    options?: { staged?: boolean },
+  ): Promise<ModelSummary> {
     const safeJobId = jobId ?? crypto.randomUUID().replace(/-/g, '');
     if (!SAFE_JOB_ID_RE.test(safeJobId)) {
       throw new Error(`Invalid jobId: ${safeJobId}`);
@@ -223,6 +231,21 @@ export class WorkerClient {
       jobId: safeJobId,
       filePath,
       cacheDir: this.cacheDir,
+      staged: Boolean(options?.staged),
+    });
+  }
+
+  async commitModel(modelId: string): Promise<{ committed: boolean }> {
+    return this.sendRequest<{ committed: boolean }>({
+      cmd: 'commit_model',
+      modelId,
+    });
+  }
+
+  async discardModel(modelId: string): Promise<{ discarded: boolean }> {
+    return this.sendRequest<{ discarded: boolean }>({
+      cmd: 'discard_model',
+      modelId,
     });
   }
 
@@ -242,12 +265,18 @@ export class WorkerClient {
     });
   }
 
-  async pickFace(modelId: string, origin: Vec3, direction: Vec3): Promise<PickResult> {
+  async pickFace(
+    modelId: string,
+    origin: Vec3,
+    direction: Vec3,
+    batchIndices?: number[],
+  ): Promise<PickResult> {
     return this.sendRequest<PickResult>({
       cmd: 'pick',
       modelId,
       origin,
       direction,
+      ...(batchIndices ? { batchIndices } : {}),
     });
   }
 

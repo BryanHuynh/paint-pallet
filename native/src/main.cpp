@@ -111,6 +111,7 @@ int main() {
         const std::string jobId = pp::extractJsonString(line, "jobId").value_or("");
         const std::string filePath = pp::extractJsonString(line, "filePath").value_or("");
         const std::string cacheDir = pp::extractJsonString(line, "cacheDir").value_or(".");
+        const bool staged = pp::extractJsonBool(line, "staged").value_or(false);
 
         if (!isValidJobId(jobId)) {
           std::lock_guard<std::mutex> lock(state.jobsMutex);
@@ -142,12 +143,28 @@ int main() {
         }
 
         {
-          std::lock_guard<std::mutex> lock(state.jobsMutex);
-          state.pendingOrRunningJobs.erase(jobId);
-          if (outcome.ok) {
-            state.models[outcome.model.modelId] = outcome.model;
-            state.activeModelId = outcome.model.modelId;
-            state.pickCache.clear();
+          std::vector<std::string> dirsToCleanup;
+          {
+            std::lock_guard<std::mutex> lock(state.jobsMutex);
+            state.pendingOrRunningJobs.erase(jobId);
+            if (outcome.ok) {
+              if (!staged) {
+                for (auto it = state.models.begin(); it != state.models.end();) {
+                  if (it->first != outcome.model.modelId) {
+                    dirsToCleanup.push_back(it->second.jobDir);
+                    it = state.models.erase(it);
+                  } else {
+                    ++it;
+                  }
+                }
+                state.activeModelId = outcome.model.modelId;
+                state.pickCache.clear();
+              }
+              state.models[outcome.model.modelId] = outcome.model;
+            }
+          }
+          for (const auto& d : dirsToCleanup) {
+            pp::cleanupJobDir(d);
           }
         }
 
@@ -163,10 +180,56 @@ int main() {
                    "\",\"jobId\":\"" + pp::jsonEscape(jobId) +
                    "\",\"error\":\"" + pp::jsonEscape(outcome.errorMessage) + "\"}");
         }
+      } else if (cmd == "commit_model") {
+        const std::string modelId = pp::extractJsonString(line, "modelId").value_or("");
+        bool committed = false;
+        std::vector<std::string> dirsToCleanup;
+        {
+          std::lock_guard<std::mutex> lock(state.jobsMutex);
+          if (state.models.find(modelId) != state.models.end()) {
+            for (auto it = state.models.begin(); it != state.models.end();) {
+              if (it->first != modelId) {
+                dirsToCleanup.push_back(it->second.jobDir);
+                it = state.models.erase(it);
+              } else {
+                ++it;
+              }
+            }
+            state.activeModelId = modelId;
+            state.pickCache.clear();
+            committed = true;
+          }
+        }
+        for (const auto& d : dirsToCleanup) {
+          pp::cleanupJobDir(d);
+        }
+        emitLine("{\"type\":\"commit_ack\",\"reqId\":\"" + pp::jsonEscape(reqId) +
+                 "\",\"committed\":" + (committed ? "true" : "false") + "}");
+      } else if (cmd == "discard_model") {
+        const std::string modelId = pp::extractJsonString(line, "modelId").value_or("");
+        bool discarded = false;
+        std::string dirToCleanup;
+        {
+          std::lock_guard<std::mutex> lock(state.jobsMutex);
+          if (modelId != state.activeModelId) {
+            auto it = state.models.find(modelId);
+            if (it != state.models.end()) {
+              dirToCleanup = it->second.jobDir;
+              state.models.erase(it);
+              discarded = true;
+            }
+          }
+        }
+        if (!dirToCleanup.empty()) {
+          pp::cleanupJobDir(dirToCleanup);
+        }
+        emitLine("{\"type\":\"discard_ack\",\"reqId\":\"" + pp::jsonEscape(reqId) +
+                 "\",\"discarded\":" + (discarded ? "true" : "false") + "}");
       } else if (cmd == "pick") {
         const std::string modelId = pp::extractJsonString(line, "modelId").value_or("");
         auto originOpt = pp::extractJsonNumberArray(line, "origin");
         auto dirOpt = pp::extractJsonNumberArray(line, "direction");
+        auto batchIndicesOpt = pp::extractJsonUIntArray(line, "batchIndices");
 
         pp::ModelRecord modelCopy;
         bool found = false;
@@ -196,7 +259,12 @@ int main() {
             static_cast<float>((*dirOpt)[2]),
         };
 
-        auto res = pp::pickModelFace(modelCopy, orig, dir, state.pickCache);
+        auto res = pp::pickModelFace(
+            modelCopy,
+            orig,
+            dir,
+            state.pickCache,
+            batchIndicesOpt ? &(*batchIndicesOpt) : nullptr);
         if (!res.hit) {
           emitLine("{\"type\":\"pick_result\",\"reqId\":\"" + pp::jsonEscape(reqId) +
                    "\",\"hit\":false,\"partId\":null,\"originalFaceId\":null,\"distance\":null,\"point\":null,\"normal\":null}");

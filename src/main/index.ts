@@ -11,16 +11,18 @@ let mainWindow: BrowserWindow | null = null;
 let workerClient: WorkerClient | null = null;
 let activeImportJobId: string | null = null;
 const authorizedImportPaths = new Set<string>();
-const authorizedBatchPaths = new Set<string>();
+let committedBatchPaths = new Set<string>();
+let stagedBatchPaths = new Set<string>();
 
-function registerAuthorizedBatches(summary: ModelSummary): void {
-  authorizedBatchPaths.clear();
+function collectBatchPaths(summary: ModelSummary): Set<string> {
+  const paths = new Set<string>();
   if (summary.previewFilePath) {
-    authorizedBatchPaths.add(path.resolve(summary.previewFilePath));
+    paths.add(path.resolve(summary.previewFilePath));
   }
   for (const b of summary.batches) {
-    authorizedBatchPaths.add(path.resolve(b.filePath));
+    paths.add(path.resolve(b.filePath));
   }
+  return paths;
 }
 
 function getWorkerClient(): WorkerClient {
@@ -91,14 +93,29 @@ app.whenReady().then(() => {
     const jobId = crypto.randomUUID().replace(/-/g, '');
     activeImportJobId = jobId;
     try {
-      const summary = await getWorkerClient().importStl(resolved, jobId);
-      registerAuthorizedBatches(summary);
+      const summary = await getWorkerClient().importStl(resolved, jobId, { staged: true });
+      stagedBatchPaths = collectBatchPaths(summary);
       return summary;
     } finally {
       if (activeImportJobId === jobId) {
         activeImportJobId = null;
       }
     }
+  });
+
+  ipcMain.handle('worker:commit-model', async (_event, modelId: string) => {
+    const res = await getWorkerClient().commitModel(modelId);
+    if (res.committed) {
+      committedBatchPaths = stagedBatchPaths;
+      stagedBatchPaths = new Set<string>();
+    }
+    return res;
+  });
+
+  ipcMain.handle('worker:discard-model', async (_event, modelId: string) => {
+    const res = await getWorkerClient().discardModel(modelId);
+    stagedBatchPaths = new Set<string>();
+    return res;
   });
 
   ipcMain.handle('worker:cancel-import', async () => {
@@ -117,7 +134,7 @@ app.whenReady().then(() => {
       throw new Error('Invalid batch path');
     }
     const resolved = path.resolve(filePath);
-    if (!authorizedBatchPaths.has(resolved)) {
+    if (!committedBatchPaths.has(resolved) && !stagedBatchPaths.has(resolved)) {
       throw new Error('Unauthorized batch file path');
     }
     return readBatchBinary(resolved);
@@ -125,8 +142,8 @@ app.whenReady().then(() => {
 
   ipcMain.handle(
     'worker:pick-face',
-    async (_event, modelId: string, origin: Vec3, direction: Vec3) => {
-      return getWorkerClient().pickFace(modelId, origin, direction);
+    async (_event, modelId: string, origin: Vec3, direction: Vec3, batchIndices?: number[]) => {
+      return getWorkerClient().pickFace(modelId, origin, direction, batchIndices);
     },
   );
 

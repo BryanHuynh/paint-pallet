@@ -140,7 +140,9 @@ export default function App({
       return;
     }
     if (pendingModel) {
+      const discardedId = pendingModel.modelId;
       setPendingModel(null);
+      await api.discardModel?.(discardedId);
       setStatusMsg(
         model
           ? `Canceled geometry swap; kept ${model.fileName} open.`
@@ -149,28 +151,36 @@ export default function App({
     }
   };
 
-  const handlePendingModelCommit = useCallback((committed: ModelSummary) => {
-    setModel(committed);
-    setPendingModel(null);
-    setPickResult(null);
-  }, []);
+  const handlePendingModelCommit = useCallback(
+    async (committed: ModelSummary) => {
+      await api?.commitModel?.(committed.modelId);
+      setModel(committed);
+      setPendingModel(null);
+      setPickResult(null);
+    },
+    [api],
+  );
 
   const handlePendingModelError = useCallback(
-    (err: Error) => {
+    async (err: Error) => {
+      const discardedId = pendingModel?.modelId;
       setPendingModel(null);
+      if (discardedId) {
+        await api?.discardModel?.(discardedId);
+      }
       setStatusMsg(
         model
           ? `${err.message} Kept ${model.fileName} open.`
           : err.message,
       );
     },
-    [model],
+    [api, model, pendingModel],
   );
 
   const handleSurfacePick = useCallback(
-    async (origin: Vec3, direction: Vec3) => {
+    async (origin: Vec3, direction: Vec3, batchIndices?: number[]) => {
       if (!api || !model) return;
-      const result = await api.pickFace(model.modelId, origin, direction);
+      const result = await api.pickFace(model.modelId, origin, direction, batchIndices);
       setPickResult(result);
     },
     [api, model],
