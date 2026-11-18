@@ -9,6 +9,10 @@ import type {
   Vec3,
 } from '../../shared/workerProtocol';
 import { computeOrientationQuaternion } from '../orientation';
+import { disposeDetailMesh, setShadowOverlay } from '../paint/shadowOverlay';
+import type { ShadowCoverage, SurfaceFace } from '../paint/shadowPaint';
+import { SurfaceBrush } from '../paint/surfaceBrush';
+import { SurfaceBrushPreview } from '../paint/surfaceBrushPreview';
 
 export type CameraPreset = 'reset' | 'front' | 'top' | 'right';
 
@@ -30,6 +34,15 @@ export interface Viewport3DProps {
     batchIndices: number[],
     token: PickGenerationToken,
   ) => void;
+  shadowPaint?: {
+    enabled: boolean;
+    coverage: ShadowCoverage;
+    colors: ReadonlyMap<string, string>;
+    diameter: number;
+    onFaces: (faces: SurfaceFace[]) => void;
+    onStart: () => boolean;
+    onEnd: (commit: boolean) => void;
+  };
   onPickNeedsDetail?: (message: string) => void;
   onViewChange?: () => void;
   onPendingModelCommit: (committed: ModelSummary) => Promise<boolean> | boolean;
@@ -152,7 +165,7 @@ export function disposeGroupMeshes(group: THREE.Group): void {
   while (group.children.length > 0) {
     const child = group.children[0] as THREE.Mesh;
     group.remove(child);
-    child.geometry.dispose();
+    disposeDetailMesh(child);
   }
 }
 
@@ -250,6 +263,7 @@ export function Viewport3D({
   orientation,
   cameraPresetRequest,
   onSurfacePick,
+  shadowPaint,
   onPickNeedsDetail,
   onViewChange,
   onPendingModelCommit,
@@ -259,6 +273,8 @@ export function Viewport3D({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const onPickRef = useRef(onSurfacePick);
   onPickRef.current = onSurfacePick;
+  const shadowPaintRef = useRef(shadowPaint);
+  shadowPaintRef.current = shadowPaint;
   const onPickNeedsDetailRef = useRef(onPickNeedsDetail);
   onPickNeedsDetailRef.current = onPickNeedsDetail;
   const onViewChangeRef = useRef(onViewChange);
@@ -272,7 +288,7 @@ export function Viewport3D({
   const apiRef = useRef<PaintPalletApi | undefined>(api);
   apiRef.current = api;
 
-  const detailCacheRef = useRef<Map<number, { mesh: THREE.Mesh; triangleCount: number; lastUsed: number }>>(new Map());
+  const detailCacheRef = useRef<Map<number, { mesh: THREE.Mesh; triangleCount: number; faceIds: Uint32Array; lastUsed: number }>>(new Map());
   const detailTrianglesRef = useRef(0);
   const lruTickRef = useRef(0);
   const streamGenerationRef = useRef(0);
@@ -289,8 +305,28 @@ export function Viewport3D({
     previewGroup: THREE.Group;
     detailGroup: THREE.Group;
     material: THREE.MeshStandardMaterial;
+    previewMaterial: THREE.MeshStandardMaterial;
+    shadowMaterial: THREE.MeshBasicMaterial;
     radius: number;
   } | null>(null);
+
+  function applyShadow(mesh: THREE.Mesh, batchIndex: number, faceIds: Uint32Array) {
+    const material = sceneRefs.current?.shadowMaterial;
+    const paint = shadowPaintRef.current;
+    if (material && paint) {
+      setShadowOverlay(mesh, faceIds, {
+        material,
+        hits: paint.coverage.get(batchIndex),
+        colors: paint.colors,
+      });
+    }
+  }
+
+  useEffect(() => {
+    for (const [index, entry] of detailCacheRef.current) {
+      applyShadow(entry.mesh, index, entry.faceIds);
+    }
+  }, [shadowPaint?.coverage, shadowPaint?.colors]);
 
   const updateSettledLayerVisibility = (
     refs: NonNullable<typeof sceneRefs.current>,
@@ -365,7 +401,7 @@ export function Viewport3D({
           if (victimKey === null) break;
           const victim = cache.get(victimKey)!;
           refs.detailGroup.remove(victim.mesh);
-          victim.mesh.geometry.dispose();
+          disposeDetailMesh(victim.mesh);
           detailTrianglesRef.current = Math.max(0, detailTrianglesRef.current - victim.triangleCount);
           cache.delete(victimKey);
         }
@@ -379,8 +415,10 @@ export function Viewport3D({
         cache.set(idx, {
           mesh,
           triangleCount: bin.triangleCount,
+          faceIds: bin.faceIds,
           lastUsed: ++lruTickRef.current,
         });
+        applyShadow(mesh, idx, bin.faceIds);
       }
 
       updateSettledLayerVisibility(refs, targetModel);
@@ -459,6 +497,20 @@ export function Viewport3D({
       metalness: 0.08,
     });
 
+    const shadowMaterial = new THREE.MeshBasicMaterial({
+      vertexColors: true,
+      side: THREE.DoubleSide,
+      toneMapped: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -1,
+      polygonOffsetUnits: -1,
+    });
+
+    const previewMaterial = material.clone();
+    const brushPreview = new SurfaceBrushPreview();
+    brushPreview.attach(material);
+    brushPreview.attach(shadowMaterial);
+
     const modelGroup = new THREE.Group();
     const previewGroup = new THREE.Group();
     const detailGroup = new THREE.Group();
@@ -496,23 +548,17 @@ export function Viewport3D({
       previewGroup,
       detailGroup,
       material,
+      previewMaterial,
+      shadowMaterial,
       radius: 1,
     };
 
-    let downX = 0;
-    let downY = 0;
-    const onPointerDown = (e: PointerEvent) => {
-      downX = e.clientX;
-      downY = e.clientY;
-    };
-    const onPointerUp = (e: PointerEvent) => {
-      if (e.button !== 0) return;
-      const dist = Math.hypot(e.clientX - downX, e.clientY - downY);
-      if (dist > 4) return;
+    const pickAt = (e: PointerEvent) => {
       const currentModel = activeModelRef.current;
       if (!currentModel) return;
 
       const rect = renderer.domElement.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
       const ndc = new THREE.Vector2(
         ((e.clientX - rect.left) / rect.width) * 2 - 1,
         -((e.clientY - rect.top) / rect.height) * 2 + 1,
@@ -564,10 +610,120 @@ export function Viewport3D({
         viewGen: viewGenRef.current,
       });
     };
-    renderer.domElement.addEventListener('pointerdown', onPointerDown);
-    renderer.domElement.addEventListener('pointerup', onPointerUp);
+
+    let downX = 0;
+    let downY = 0;
+    let strokePointer: number | null = null;
+    let strokeView = 0;
+    let lastSample = { x: 0, y: 0 };
+    let sampleFrame = 0;
+    let pendingPoint = lastSample;
+    const canvas = renderer.domElement;
+    const brush = new SurfaceBrush();
+
+    let hoverPoint: { x: number; y: number } | null = null;
+    const clearBrushHover = () => {
+      hoverPoint = null;
+    };
+    const moveBrushHover = (event: PointerEvent) => {
+      hoverPoint = event.altKey || event.pointerType === 'touch'
+        ? null
+        : { x: event.clientX, y: event.clientY };
+    };
+    const endStroke = (commit: boolean) => {
+      window.cancelAnimationFrame(sampleFrame);
+      sampleFrame = 0;
+      strokePointer = null;
+      brush.clear();
+      shadowPaintRef.current?.onEnd(commit);
+    };
+    const sampleBrush = (next: { x: number; y: number }) => {
+      const paint = shadowPaintRef.current;
+      if (!paint?.enabled || strokeView !== viewGenRef.current) {
+        endStroke(false);
+        return;
+      }
+      paint.onFaces(brush.sample(renderer, lastSample, next, paint.diameter));
+      lastSample = next;
+    };
+    const onPointerDown = (e: PointerEvent) => {
+      if (e.button !== 0) return;
+      downX = e.clientX;
+      downY = e.clientY;
+      const paint = shadowPaintRef.current;
+      if (!paint?.enabled || e.altKey) return;
+
+      e.stopImmediatePropagation();
+      e.preventDefault();
+      if (strokePointer !== null || !paint.onStart()) return;
+      if (!detailGroup.visible || detailCacheRef.current.size === 0) {
+        const currentModel = activeModelRef.current;
+        if (currentModel) void streamForCurrentCamera(currentModel);
+        onPickNeedsDetailRef.current?.('Loading original surface detail. Try the brush again once it appears.');
+        endStroke(false);
+        return;
+      }
+
+      const details = [...detailCacheRef.current.entries()].map(([index, entry]) => ({
+        index, mesh: entry.mesh, faceIds: entry.faceIds,
+      }));
+      const preview = previewGroup.visible ? previewGroup.children : [];
+      if (!brush.capture(renderer, camera, canvas.getBoundingClientRect(), preview, details)) {
+        endStroke(false);
+        return;
+      }
+
+      strokePointer = e.pointerId;
+      strokeView = viewGenRef.current;
+      lastSample = { x: e.clientX, y: e.clientY };
+      canvas.setPointerCapture(e.pointerId);
+      moveBrushHover(e);
+      sampleBrush(lastSample);
+    };
+    const onPointerMove = (e: PointerEvent) => {
+      moveBrushHover(e);
+      if (e.pointerId !== strokePointer) return;
+      e.stopImmediatePropagation();
+      pendingPoint = { x: e.clientX, y: e.clientY };
+      if (sampleFrame) return;
+      sampleFrame = window.requestAnimationFrame(() => {
+        sampleFrame = 0;
+        if (strokePointer !== null && Math.hypot(pendingPoint.x - lastSample.x, pendingPoint.y - lastSample.y) >= 4) {
+          sampleBrush(pendingPoint);
+        }
+      });
+    };
+    const onPointerUp = (e: PointerEvent) => {
+      if (e.pointerId === strokePointer) {
+        e.stopImmediatePropagation();
+        if (e.clientX !== lastSample.x || e.clientY !== lastSample.y) {
+          sampleBrush({ x: e.clientX, y: e.clientY });
+        }
+        if (strokePointer !== null) endStroke(true);
+        return;
+      }
+      if (e.button !== 0 || e.altKey || shadowPaintRef.current?.enabled) return;
+      if (Math.hypot(e.clientX - downX, e.clientY - downY) <= 4) pickAt(e);
+    };
+    const onPointerCancel = (e: PointerEvent) => {
+      if (e.pointerId === strokePointer) endStroke(false);
+      clearBrushHover();
+    };
+    const onStrokeWheel = (event: WheelEvent) => {
+      if (strokePointer === null) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    };
+    canvas.addEventListener('pointerdown', onPointerDown, true);
+    canvas.addEventListener('pointermove', onPointerMove, true);
+    canvas.addEventListener('pointerup', onPointerUp, true);
+    canvas.addEventListener('pointercancel', onPointerCancel, true);
+    canvas.addEventListener('lostpointercapture', onPointerCancel);
+    canvas.addEventListener('pointerleave', clearBrushHover);
+    canvas.addEventListener('wheel', onStrokeWheel, { capture: true, passive: false });
 
     const resizeObserver = new ResizeObserver(() => {
+      if (strokePointer !== null) endStroke(false);
       const w = container.clientWidth || 800;
       const h = container.clientHeight || 600;
       camera.aspect = w / h;
@@ -580,6 +736,8 @@ export function Viewport3D({
     const animate = () => {
       rafId = window.requestAnimationFrame(animate);
       controls.update();
+      const paint = shadowPaintRef.current;
+      brushPreview.update(renderer, paint?.enabled && detailGroup.visible ? hoverPoint : null, paint?.diameter ?? 1);
       renderer.render(scene, camera);
     };
     animate();
@@ -588,13 +746,22 @@ export function Viewport3D({
       window.cancelAnimationFrame(rafId);
       resizeObserver.disconnect();
       orbitLifecycle.dispose();
-      renderer.domElement.removeEventListener('pointerdown', onPointerDown);
-      renderer.domElement.removeEventListener('pointerup', onPointerUp);
+      canvas.removeEventListener('pointerdown', onPointerDown, true);
+      canvas.removeEventListener('pointermove', onPointerMove, true);
+      canvas.removeEventListener('pointerup', onPointerUp, true);
+      canvas.removeEventListener('pointercancel', onPointerCancel, true);
+      canvas.removeEventListener('lostpointercapture', onPointerCancel);
+      canvas.removeEventListener('pointerleave', clearBrushHover);
+      canvas.removeEventListener('wheel', onStrokeWheel, true);
+      if (strokePointer !== null) endStroke(false);
+      brush.dispose();
       disposeGroupMeshes(previewGroup);
       disposeGroupMeshes(detailGroup);
       detailCacheRef.current.clear();
       detailTrianglesRef.current = 0;
       material.dispose();
+      previewMaterial.dispose();
+      shadowMaterial.dispose();
       controls.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode === container) {
@@ -611,7 +778,7 @@ export function Viewport3D({
     let cancelled = false;
 
     const stagedPreviewGeos: THREE.BufferGeometry[] = [];
-    const stagedDetailEntries: { batchIndex: number; triangleCount: number; geo: THREE.BufferGeometry }[] = [];
+    const stagedDetailEntries: { batchIndex: number; triangleCount: number; faceIds: Uint32Array; geo: THREE.BufferGeometry }[] = [];
 
     const disposeStaged = () => {
       for (const g of stagedPreviewGeos) g.dispose();
@@ -656,7 +823,7 @@ export function Viewport3D({
           const geo = new THREE.BufferGeometry();
           geo.setAttribute('position', new THREE.BufferAttribute(bin.positions, 3));
           geo.setAttribute('normal', new THREE.BufferAttribute(bin.normals, 3));
-          stagedDetailEntries.push({ batchIndex: idx, triangleCount: bin.triangleCount, geo });
+          stagedDetailEntries.push({ batchIndex: idx, triangleCount: bin.triangleCount, faceIds: bin.faceIds, geo });
         }
 
         const committed = await onCommitRef.current(pendingModel);
@@ -675,7 +842,7 @@ export function Viewport3D({
           detailTrianglesRef.current = 0;
 
           for (const geo of stagedPreviewGeos) {
-            refs.previewGroup.add(new THREE.Mesh(geo, refs.material));
+            refs.previewGroup.add(new THREE.Mesh(geo, refs.previewMaterial));
           }
           for (const entry of stagedDetailEntries) {
             const mesh = new THREE.Mesh(entry.geo, refs.material);
@@ -684,11 +851,14 @@ export function Viewport3D({
             detailCacheRef.current.set(entry.batchIndex, {
               mesh,
               triangleCount: entry.triangleCount,
+              faceIds: entry.faceIds,
               lastUsed: ++lruTickRef.current,
             });
           }
 
           updateSettledLayerVisibility(refs, pendingModel);
+          stagedPreviewGeos.length = 0;
+          stagedDetailEntries.length = 0;
         } else {
           disposeStaged();
         }
@@ -779,6 +949,7 @@ export function Viewport3D({
     <div
       ref={containerRef}
       className="viewport-canvas"
+      data-painting-enabled={shadowPaint?.enabled || undefined}
       data-testid="viewport-canvas"
       aria-label="3D miniature viewport"
     />

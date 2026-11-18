@@ -272,6 +272,8 @@ int main() {
           emitLine("{\"type\":\"pick_result\",\"reqId\":\"" + pp::jsonEscape(reqId) +
                    "\",\"hit\":true,\"partId\":\"" + pp::jsonEscape(res.partId) +
                    "\",\"originalFaceId\":" + std::to_string(res.originalFaceId) +
+                   ",\"batchIndex\":" + std::to_string(res.batchIndex) +
+                   ",\"triangleIndex\":" + std::to_string(res.triangleIndex) +
                    ",\"distance\":" + std::to_string(res.distance) +
                    ",\"point\":" + formatVec3(res.point.data()) +
                    ",\"normal\":" + formatVec3(res.normal.data()) + "}");

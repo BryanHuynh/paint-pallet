@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useRef, useState } from 'react';
+import React, { useDeferredValue, useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
   mapClientToCanvasPixel,
   readBoundedRegionImageData,
@@ -7,6 +7,9 @@ import {
 } from './colorMath';
 import styles from './PaletteWorkspace.module.css';
 import { ToneSwatchCard } from './ToneSwatchCard';
+import { createEmptyRecipe } from './recipes';
+import { MAX_SMART_PIXELS, paintSelection, selectConnectedColors } from './smartSelection';
+import { usePreviewZoom } from './usePreviewZoom';
 import type {
   PaintRecipe,
   PixelRect,
@@ -22,7 +25,6 @@ const TONE_SLOTS: { slot: ToneSlot; label: string }[] = [
   { slot: 'highlight', label: 'Highlight' },
 ];
 
-const ZOOM_LEVELS = [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8];
 const MAGNIFIER_RADIUS = 7;
 const MAGNIFIER_GRID = MAGNIFIER_RADIUS * 2 + 1;
 const MAGNIFIER_CELL_PX = 8;
@@ -63,21 +65,19 @@ function loadReferenceFile(file: File, id: string): Promise<ReferenceImage> {
   });
 }
 
-function createEmptyRecipe(index: number): PaintRecipe {
-  return {
-    id: `recipe-${index}`,
-    name: `Recipe ${index}`,
-    swatches: {
-      shadow: { hex: '#2B303A', brand: '', bottleName: '', mixNotes: '' },
-      midtone: { hex: '#6B7280', brand: '', bottleName: '', mixNotes: '' },
-      highlight: { hex: '#D1D5DB', brand: '', bottleName: '', mixNotes: '' },
-    },
-  };
-}
-
-export default function PaletteWorkspace(): React.ReactElement {
+export default function PaletteWorkspace({
+  recipes: sharedRecipes,
+  setRecipes: setSharedRecipes,
+}: {
+  recipes?: PaintRecipe[];
+  setRecipes?: React.Dispatch<React.SetStateAction<PaintRecipe[]>>;
+} = {}): React.ReactElement {
   const importInputId = useId();
   const recipeNameInputId = useId();
+  const workspaceRef = useRef<HTMLElement | null>(null);
+  const zoomMenuRef = useRef<HTMLDetailsElement | null>(null);
+  const smartOverlayRef = useRef<HTMLCanvasElement | null>(null);
+  const smartImageRef = useRef<ImageData | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -98,14 +98,16 @@ export default function PaletteWorkspace(): React.ReactElement {
   const [importError, setImportError] = useState<string | null>(null);
   const [isDraggingImages, setIsDraggingImages] = useState(false);
 
-  const [recipes, setRecipes] = useState<PaintRecipe[]>(() => [
-    createEmptyRecipe(1),
-  ]);
+  const [localRecipes, setLocalRecipes] = useState<PaintRecipe[]>(() => [createEmptyRecipe(1)]);
+  const recipes = sharedRecipes ?? localRecipes;
+  const setRecipes = setSharedRecipes ?? setLocalRecipes;
+
   const [activeRecipeId, setActiveRecipeId] = useState<string | null>('recipe-1');
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [activeTone, setActiveTone] = useState<ToneSlot>('shadow');
-  const [toolMode, setToolMode] = useState<'eyedropper' | 'select'>('eyedropper');
-  const [zoom, setZoom] = useState<number | null>(null);
+  const [toolMode, setToolMode] = useState<'eyedropper' | 'select' | 'smart'>('eyedropper');
+  const [smartSeeds, setSmartSeeds] = useState<{ image: ImageData; seeds: number[] } | null>(null);
+  const [tolerance, setTolerance] = useState(20);
   const [isPanning, setIsPanning] = useState(false);
   const [selection, setSelection] = useState<PixelRect | null>(null);
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
@@ -125,6 +127,24 @@ export default function PaletteWorkspace(): React.ReactElement {
 
   const activeReference =
     references.find((ref) => ref.id === activeRefId) ?? references[0] ?? null;
+
+  const { zoom, zoomTo, stepZoom, fit, atMin, atMax } = usePreviewZoom(
+    workspaceRef, stageRef, canvasRef, Boolean(activeReference),
+  );
+  const maskTolerance = useDeferredValue(tolerance);
+  const smartSelection = useMemo(
+    () => smartSeeds ? selectConnectedColors(smartSeeds.image, smartSeeds.seeds, maskTolerance) : null,
+    [smartSeeds, maskTolerance],
+  );
+  const isUpdatingSmartSelection = smartSeeds !== null && maskTolerance !== tolerance;
+  const hasSelection = Boolean(selection || smartSelection);
+  const zoomReadout = zoom === null ? 'Fit' : `${Math.round(zoom * 100)}%`;
+
+  useEffect(() => {
+    if (smartSelection && smartOverlayRef.current) {
+      paintSelection(smartOverlayRef.current, smartSelection);
+    }
+  }, [smartSelection]);
 
   const activeRecipe = activeRecipeId
     ? (recipes.find((recipe) => recipe.id === activeRecipeId) ?? recipes[0] ?? null)
@@ -163,6 +183,7 @@ export default function PaletteWorkspace(): React.ReactElement {
     if (!canvas || !activeReference) {
       return;
     }
+    smartImageRef.current = null;
     canvas.width = activeReference.width;
     canvas.height = activeReference.height;
     const ctx = canvas.getContext('2d');
@@ -377,45 +398,13 @@ export default function PaletteWorkspace(): React.ReactElement {
     );
   }
 
-  function getFitScale(): number {
-    const stage = stageRef.current;
-    if (
-      !stage ||
-      !activeReference ||
-      stage.clientWidth === 0 ||
-      stage.clientHeight === 0
-    ) {
-      return 1;
-    }
-    const availW = Math.max(1, stage.clientWidth - 24);
-    const availH = Math.max(1, stage.clientHeight - 24);
-    return Math.min(
-      1,
-      availW / activeReference.width,
-      availH / activeReference.height,
-    );
-  }
-
-  function handleZoomIn() {
-    const current = zoom ?? getFitScale();
-    const next =
-      ZOOM_LEVELS.find((level) => level > current + 0.01) ??
-      ZOOM_LEVELS[ZOOM_LEVELS.length - 1];
-    setZoom(next);
-  }
-
-  function handleZoomOut() {
-    const current = zoom ?? getFitScale();
-    const prevLevels = ZOOM_LEVELS.filter((level) => level < current - 0.01);
-    const next = prevLevels.length > 0 ? prevLevels[prevLevels.length - 1] : ZOOM_LEVELS[0];
-    setZoom(next);
-  }
-
-  function handleResetZoom() {
-    setZoom(null);
-    if (stageRef.current) {
-      stageRef.current.scrollLeft = 0;
-      stageRef.current.scrollTop = 0;
+  function chooseZoom(level: number | null) {
+    if (level === null) fit();
+    else zoomTo(level);
+    const menu = zoomMenuRef.current;
+    if (menu) {
+      menu.open = false;
+      menu.querySelector('summary')?.focus();
     }
   }
 
@@ -481,6 +470,30 @@ export default function PaletteWorkspace(): React.ReactElement {
 
   function updateSelection(next: PixelRect | null) {
     setSelection(next);
+    setSmartSeeds(null);
+    setSuggestionPreview(null);
+  }
+
+  function selectSimilarPixels(x: number, y: number, add = false) {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const image = smartImageRef.current ?? readBoundedRegionImageData(canvas, {
+      x: 0, y: 0, width: canvas.width, height: canvas.height,
+    }, MAX_SMART_PIXELS);
+    if (!image) return;
+    smartImageRef.current = image;
+
+    const column = Math.min(image.width - 1, Math.floor((x + 0.5) * image.width / canvas.width));
+    const row = Math.min(image.height - 1, Math.floor((y + 0.5) * image.height / canvas.height));
+    const seed = row * image.width + column;
+    const previous = add && smartSeeds?.image === image ? smartSeeds : null;
+    if (previous?.seeds.includes(seed)) return;
+    const opaque = image.data[seed * 4 + 3] >= 128;
+    if (!opaque && previous) return;
+
+    setSelection(null);
+    setKeyboardAnchor(null);
+    setSmartSeeds(opaque ? { image, seeds: [...(previous?.seeds ?? []), seed] } : null);
     setSuggestionPreview(null);
   }
 
@@ -504,7 +517,7 @@ export default function PaletteWorkspace(): React.ReactElement {
   }
 
   function handleCanvasPointerDown(event: React.PointerEvent<HTMLCanvasElement>) {
-    if (event.button === 1 || event.altKey) {
+    if (event.button !== 0 || event.altKey) {
       return;
     }
     const canvas = canvasRef.current;
@@ -528,7 +541,8 @@ export default function PaletteWorkspace(): React.ReactElement {
       return;
     }
 
-    samplePixelAt(x, y);
+    if (toolMode === 'smart') selectSimilarPixels(x, y, event.shiftKey);
+    else samplePixelAt(x, y);
   }
 
   function handleCanvasPointerMove(event: React.PointerEvent<HTMLCanvasElement>) {
@@ -600,6 +614,8 @@ export default function PaletteWorkspace(): React.ReactElement {
       event.preventDefault();
       if (toolMode === 'eyedropper') {
         samplePixelAt(cursor.x, cursor.y);
+      } else if (toolMode === 'smart') {
+        selectSimilarPixels(cursor.x, cursor.y, event.shiftKey);
       } else {
         toggleKeyboardSelection();
       }
@@ -630,11 +646,11 @@ export default function PaletteWorkspace(): React.ReactElement {
       width: canvas.width,
       height: canvas.height,
     };
-    const imageData = readBoundedRegionImageData(canvas, rect);
+    const imageData = smartSelection?.image ?? readBoundedRegionImageData(canvas, rect);
     if (!imageData) {
       return;
     }
-    const suggested = suggestTonesFromImageData(imageData);
+    const suggested = suggestTonesFromImageData(imageData, smartSelection ?? undefined);
     if (suggested) {
       setSuggestionPreview(suggested);
     }
@@ -671,7 +687,7 @@ export default function PaletteWorkspace(): React.ReactElement {
   }
 
   return (
-    <section className={styles.workspace} aria-label="Reference palette workspace">
+    <section ref={workspaceRef} className={styles.workspace} aria-label="Reference palette workspace">
       <header className={styles.header}>
         <div className={styles.titleGroup}>
           <h1 className={styles.title}>Reference palette</h1>
@@ -732,18 +748,14 @@ export default function PaletteWorkspace(): React.ReactElement {
                   aria-pressed={ref.id === activeReference?.id}
                   onClick={() => {
                     setActiveRefId(ref.id);
-                    setSelection(null);
+                    updateSelection(null);
                     setKeyboardAnchor(null);
                     setCursor({ x: 0, y: 0 });
                     setSuggestionPreview(null);
-                    setZoom(null);
+                    fit();
                     setMagnifier((prev) =>
                       prev.visible ? { ...prev, visible: false } : prev,
                     );
-                    if (stageRef.current) {
-                      stageRef.current.scrollLeft = 0;
-                      stageRef.current.scrollTop = 0;
-                    }
                   }}
                 >
                   <img className={styles.thumbImg} src={ref.url} alt="" />
@@ -779,12 +791,25 @@ export default function PaletteWorkspace(): React.ReactElement {
                 </button>
                 <button
                   type="button"
+                  className={`${styles.btn} ${styles.btnSecondary}`}
+                  aria-pressed={toolMode === 'smart'}
+                  onClick={() => {
+                    setToolMode('smart');
+                    setMagnifier((prev) => ({ ...prev, visible: false }));
+                    setKeyboardAnchor(null);
+                  }}
+                >
+                  Smart select
+                </button>
+                <button
+                  type="button"
                   className={`${styles.btn} ${styles.btnPrimary}`}
+                  disabled={isUpdatingSmartSelection}
                   onClick={handleSuggestTones}
                 >
                   Suggest tones
                 </button>
-                {selection && (
+                {hasSelection && (
                   <button
                     type="button"
                     className={`${styles.btn} ${styles.btnSecondary}`}
@@ -794,135 +819,167 @@ export default function PaletteWorkspace(): React.ReactElement {
                   </button>
                 )}
               </div>
-              <div className={styles.zoomBar} role="group" aria-label="Zoom controls">
-                <button
-                  type="button"
-                  className={`${styles.btn} ${styles.btnSecondary}`}
-                  disabled={zoom !== null && zoom <= ZOOM_LEVELS[0]}
-                  onClick={handleZoomOut}
-                >
-                  Zoom out
-                </button>
-                <span className={styles.zoomReadout} data-testid="zoom-readout">
-                  {zoom === null ? 'Fit' : `${Math.round(zoom * 100)}%`}
-                </span>
-                <button
-                  type="button"
-                  className={`${styles.btn} ${styles.btnSecondary}`}
-                  disabled={zoom !== null && zoom >= ZOOM_LEVELS[ZOOM_LEVELS.length - 1]}
-                  onClick={handleZoomIn}
-                >
-                  Zoom in
-                </button>
-                <button
-                  type="button"
-                  className={`${styles.btn} ${styles.btnSecondary}`}
-                  disabled={zoom === null}
-                  onClick={handleResetZoom}
-                >
-                  Fit / Reset
-                </button>
-              </div>
-              <div
-                ref={stageRef}
-                data-testid="canvas-stage"
-                className={`${styles.canvasStage} ${isPanning ? styles.canvasStagePanning : ''}`}
-                onPointerDown={handleStagePointerDown}
-                onPointerMove={handleStagePointerMove}
-                onPointerUp={handleStagePointerUp}
-                onPointerCancel={handleStagePointerUp}
-              >
-                <div
-                  className={`${styles.canvasWrap} ${zoom !== null ? styles.canvasWrapZoomed : ''}`}
-                >
-                  <canvas
-                    ref={canvasRef}
-                    data-testid="reference-canvas"
-                    className={styles.canvas}
-                    width={activeReference.width}
-                    height={activeReference.height}
-                    style={
-                      zoom !== null
-                        ? {
-                            width: `${Math.round(activeReference.width * zoom)}px`,
-                            height: `${Math.round(activeReference.height * zoom)}px`,
-                            maxWidth: 'none',
-                            maxHeight: 'none',
-                            imageRendering: zoom >= 2 ? 'pixelated' : 'auto',
-                          }
-                        : undefined
-                    }
-                    tabIndex={0}
-                    aria-label={`Reference canvas for ${activeReference.name}. Use arrow keys to move cursor and Enter or Space to ${toolMode === 'eyedropper' ? 'sample pixel' : 'set selection corner'}.`}
-                    onKeyDown={handleCanvasKeyDown}
-                    onPointerDown={handleCanvasPointerDown}
-                    onPointerMove={handleCanvasPointerMove}
-                    onPointerUp={handleCanvasPointerUp}
-                    onPointerCancel={handleCanvasPointerUp}
-                    onPointerLeave={handleCanvasPointerLeave}
-                  />
-                  <div
-                    className={styles.cursorMarker}
-                    aria-hidden="true"
-                    style={{
-                      left: `${((cursor.x + 0.5) / activeReference.width) * 100}%`,
-                      top: `${((cursor.y + 0.5) / activeReference.height) * 100}%`,
-                    }}
-                  />
-                  {selection && (
-                    <div
-                      className={styles.selectionOverlay}
-                      aria-hidden="true"
-                      style={{
-                        left: `${(selection.x / activeReference.width) * 100}%`,
-                        top: `${(selection.y / activeReference.height) * 100}%`,
-                        width: `${(selection.width / activeReference.width) * 100}%`,
-                        height: `${(selection.height / activeReference.height) * 100}%`,
+              {toolMode === 'smart' && (
+                <div className={styles.smartControls}>
+                  <label>
+                    Tolerance
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      value={tolerance}
+                      onChange={(event) => {
+                        setTolerance(Number(event.target.value));
+                        if (smartSeeds) setSuggestionPreview(null);
                       }}
                     />
-                  )}
-                  {toolMode === 'select' && magnifier.visible && (
+                    <output>{tolerance}</output>
+                  </label>
+                  <span>Click a color. Shift-click to add.</span>
+                </div>
+              )}
+              <div className={styles.previewFrame}>
+                <div
+                  ref={stageRef}
+                  data-testid="canvas-stage"
+                  className={`${styles.canvasStage} ${isPanning ? styles.canvasStagePanning : ''}`}
+                  onPointerDown={handleStagePointerDown}
+                  onPointerMove={handleStagePointerMove}
+                  onPointerUp={handleStagePointerUp}
+                  onPointerCancel={handleStagePointerUp}
+                >
+                  <div
+                    className={`${styles.canvasWrap} ${zoom !== null ? styles.canvasWrapZoomed : ''}`}
+                  >
+                    <canvas
+                      ref={canvasRef}
+                      data-testid="reference-canvas"
+                      className={styles.canvas}
+                      width={activeReference.width}
+                      height={activeReference.height}
+                      style={
+                        zoom !== null
+                          ? {
+                              width: `${Math.max(1, Math.round(activeReference.width * zoom))}px`,
+                              height: `${Math.max(1, Math.round(activeReference.height * zoom))}px`,
+                              maxWidth: 'none',
+                              maxHeight: 'none',
+                              imageRendering: zoom >= 2 ? 'pixelated' : 'auto',
+                            }
+                          : undefined
+                      }
+                      tabIndex={0}
+                      aria-label={`Reference canvas for ${activeReference.name}. Use arrow keys to move cursor and Enter or Space to ${toolMode === 'eyedropper' ? 'sample pixel' : toolMode === 'smart' ? 'select connected color' : 'set selection corner'}.`}
+                      onKeyDown={handleCanvasKeyDown}
+                      onPointerDown={handleCanvasPointerDown}
+                      onPointerMove={handleCanvasPointerMove}
+                      onPointerUp={handleCanvasPointerUp}
+                      onPointerCancel={handleCanvasPointerUp}
+                      onPointerLeave={handleCanvasPointerLeave}
+                    />
                     <div
-                      data-testid="region-magnifier"
-                      className={styles.magnifier}
+                      className={styles.cursorMarker}
                       aria-hidden="true"
                       style={{
-                        left:
-                          magnifier.x / activeReference.width > 0.68
-                            ? `calc(${((magnifier.x + 0.5) / activeReference.width) * 100}% - 150px)`
-                            : `calc(${((magnifier.x + 0.5) / activeReference.width) * 100}% + 16px)`,
-                        top:
-                          magnifier.y / activeReference.height > 0.68
-                            ? `calc(${((magnifier.y + 0.5) / activeReference.height) * 100}% - 160px)`
-                            : `calc(${((magnifier.y + 0.5) / activeReference.height) * 100}% + 16px)`,
+                        left: `${((cursor.x + 0.5) / activeReference.width) * 100}%`,
+                        top: `${((cursor.y + 0.5) / activeReference.height) * 100}%`,
                       }}
-                    >
-                      <div className={styles.magnifierViewport}>
-                        <canvas
-                          ref={magnifierCanvasRef}
-                          data-testid="region-magnifier-canvas"
-                          className={styles.magnifierCanvas}
-                          width={MAGNIFIER_SIZE}
-                          height={MAGNIFIER_SIZE}
-                        />
-                        <div
-                          data-testid="magnifier-crosshair"
-                          className={styles.magnifierCrosshair}
-                        />
-                        <div className={styles.magnifierCenterBox} />
+                    />
+                    {selection && (
+                      <div
+                        className={styles.selectionOverlay}
+                        aria-hidden="true"
+                        style={{
+                          left: `${(selection.x / activeReference.width) * 100}%`,
+                          top: `${(selection.y / activeReference.height) * 100}%`,
+                          width: `${(selection.width / activeReference.width) * 100}%`,
+                          height: `${(selection.height / activeReference.height) * 100}%`,
+                        }}
+                      />
+                    )}
+                    {smartSelection && (
+                      <canvas
+                        ref={smartOverlayRef}
+                        className={styles.smartOverlay}
+                        width={smartSelection.image.width}
+                        height={smartSelection.image.height}
+                        aria-hidden="true"
+                        data-testid="smart-selection-mask"
+                      />
+                    )}
+                    {toolMode === 'select' && magnifier.visible && (
+                      <div
+                        data-testid="region-magnifier"
+                        className={styles.magnifier}
+                        aria-hidden="true"
+                        style={{
+                          left:
+                            magnifier.x / activeReference.width > 0.68
+                              ? `calc(${((magnifier.x + 0.5) / activeReference.width) * 100}% - 150px)`
+                              : `calc(${((magnifier.x + 0.5) / activeReference.width) * 100}% + 16px)`,
+                          top:
+                            magnifier.y / activeReference.height > 0.68
+                              ? `calc(${((magnifier.y + 0.5) / activeReference.height) * 100}% - 160px)`
+                              : `calc(${((magnifier.y + 0.5) / activeReference.height) * 100}% + 16px)`,
+                        }}
+                      >
+                        <div className={styles.magnifierViewport}>
+                          <canvas
+                            ref={magnifierCanvasRef}
+                            data-testid="region-magnifier-canvas"
+                            className={styles.magnifierCanvas}
+                            width={MAGNIFIER_SIZE}
+                            height={MAGNIFIER_SIZE}
+                          />
+                          <div
+                            data-testid="magnifier-crosshair"
+                            className={styles.magnifierCrosshair}
+                          />
+                          <div className={styles.magnifierCenterBox} />
+                        </div>
+                        <div className={styles.magnifierMeta}>
+                          <span>
+                            {magnifier.x}, {magnifier.y}
+                          </span>
+                          <span
+                            className={styles.magnifierSwatch}
+                            style={{ backgroundColor: magnifier.hex }}
+                          />
+                          <span>{magnifier.hex}</span>
+                        </div>
                       </div>
-                      <div className={styles.magnifierMeta}>
-                        <span>
-                          {magnifier.x}, {magnifier.y}
-                        </span>
-                        <span
-                          className={styles.magnifierSwatch}
-                          style={{ backgroundColor: magnifier.hex }}
-                        />
-                        <span>{magnifier.hex}</span>
-                      </div>
+                    )}
+                  </div>
+                </div>
+                <div className={styles.zoomDock} role="group" aria-label="Preview zoom">
+                  <button type="button" className={styles.zoomStep} aria-label="Zoom out" title="Zoom out (Ctrl+−)"
+                    disabled={atMin} onClick={() => stepZoom(-1)}>−</button>
+                  <details
+                    ref={zoomMenuRef}
+                    className={styles.zoomMenu}
+                    onBlur={(event) => {
+                      if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false;
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Escape' && event.currentTarget.open) {
+                        event.currentTarget.open = false;
+                        event.currentTarget.querySelector('summary')?.focus();
+                      }
+                    }}
+                  >
+                    <summary aria-label="Zoom presets" aria-describedby={`${importInputId}-zoom`}>
+                      <span id={`${importInputId}-zoom`} data-testid="zoom-readout">{zoomReadout}</span>
+                      <span className={styles.zoomCaret} aria-hidden="true" />
+                    </summary>
+                    <div className={styles.zoomPresets}>
+                      <button type="button" onClick={() => chooseZoom(null)}>Fit to window <kbd>Ctrl 0</kbd></button>
+                      <button type="button" onClick={() => chooseZoom(1)}>Actual size <kbd>Ctrl 1</kbd></button>
+                      <button type="button" onClick={() => chooseZoom(2)}>200%</button>
+                      <button type="button" onClick={() => chooseZoom(4)}>400%</button>
                     </div>
-                  )}
+                  </details>
+                  <button type="button" className={styles.zoomStep} aria-label="Zoom in" title="Zoom in (Ctrl++)"
+                    disabled={atMax} onClick={() => stepZoom(1)}>+</button>
                 </div>
               </div>
               <div className={styles.coordBar}>
@@ -984,9 +1041,12 @@ export default function PaletteWorkspace(): React.ReactElement {
                   <button
                     type="button"
                     className={`${styles.btn} ${styles.btnSecondary}`}
-                    onClick={toggleKeyboardSelection}
+                    onClick={() => {
+                      if (toolMode === 'smart') selectSimilarPixels(cursor.x, cursor.y);
+                      else toggleKeyboardSelection();
+                    }}
                   >
-                    {keyboardAnchor ? 'Finish selection' : 'Start selection'}
+                    {toolMode === 'smart' ? 'Select color' : keyboardAnchor ? 'Finish selection' : 'Start selection'}
                   </button>
                 )}
               </div>
@@ -998,7 +1058,7 @@ export default function PaletteWorkspace(): React.ReactElement {
                   <div className={styles.panelHeader}>
                     <h3 className={styles.panelTitle}>Suggested tones</h3>
                     <span className={styles.subtitle}>
-                      {selection ? 'From selected region' : 'From whole image'}
+                      {hasSelection ? 'From selected region' : 'From whole image'}
                     </span>
                   </div>
                   <div className={styles.previewSwatches}>

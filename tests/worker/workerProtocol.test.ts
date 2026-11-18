@@ -69,6 +69,10 @@ describe('Worker import/batch/pick protocol', () => {
     expect(hitFront.hit).toBe(true);
     expect(hitFront.partId).toBe(summary.partId);
     expect(hitFront.originalFaceId).toBe(1);
+    const pickedBatch = summary.batches.find((batch) => batch.batchIndex === hitFront.batchIndex);
+    expect(pickedBatch).toBeDefined();
+    const pickedData = await readBatchBinary(pickedBatch!.filePath);
+    expect(pickedData.faceIds[hitFront.triangleIndex!]).toBe(hitFront.originalFaceId);
     expect(hitFront.distance).toBeCloseTo(5, 4);
 
     const hitOffset = await client.pickFace(summary.modelId, [10.25, 0.25, 10], [0, 0, -1]);

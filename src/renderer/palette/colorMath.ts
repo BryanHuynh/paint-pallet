@@ -74,17 +74,20 @@ function rgbToOklabSample(r: number, g: number, bl: number): OklabSample {
 
 export function suggestTonesFromImageData(
   imageData: ImageData,
+  selection?: { mask: Uint8Array; count: number },
 ): ToneSuggestions | null {
   const totalPixels = imageData.width * imageData.height;
   if (totalPixels === 0) {
     return null;
   }
 
-  const stride = Math.max(1, Math.floor(totalPixels / 12000));
+  const stride = Math.max(1, selection ? Math.ceil(selection.count / 12000) : Math.floor(totalPixels / 12000));
   const samples: OklabSample[] = [];
   const data = imageData.data;
 
-  for (let i = 0; i < totalPixels; i += stride) {
+  let selectedIndex = 0;
+  for (let i = 0; i < totalPixels; i += selection ? 1 : stride) {
+    if (selection && (!selection.mask[i] || selectedIndex++ % stride !== 0)) continue;
     const offset = i * 4;
     if (data[offset + 3] < 128) {
       continue;
@@ -200,17 +203,18 @@ const MAX_AREA_SAMPLE_PIXELS = 65536;
 export function readBoundedRegionImageData(
   sourceCanvas: HTMLCanvasElement,
   rect: PixelRect,
+  maxSamplePixels = MAX_AREA_SAMPLE_PIXELS,
 ): ImageData | null {
   const area = rect.width * rect.height;
   if (area <= 0) {
     return null;
   }
-  if (area <= MAX_AREA_SAMPLE_PIXELS) {
+  if (area <= maxSamplePixels) {
     const ctx = sourceCanvas.getContext('2d');
     return ctx ? ctx.getImageData(rect.x, rect.y, rect.width, rect.height) : null;
   }
 
-  const scale = Math.sqrt(MAX_AREA_SAMPLE_PIXELS / area);
+  const scale = Math.sqrt(maxSamplePixels / area);
   const sampleW = Math.max(1, Math.floor(rect.width * scale));
   const sampleH = Math.max(1, Math.floor(rect.height * scale));
   const sampleCanvas = document.createElement('canvas');

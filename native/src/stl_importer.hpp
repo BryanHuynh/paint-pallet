@@ -58,6 +58,8 @@ struct PickResult {
   bool hit = false;
   std::string partId;
   uint32_t originalFaceId = 0;
+  uint32_t batchIndex = 0;
+  uint32_t triangleIndex = 0;
   float distance = 0.0f;
   std::array<float, 3> point{0.0f, 0.0f, 0.0f};
   std::array<float, 3> normal{0.0f, 0.0f, 0.0f};

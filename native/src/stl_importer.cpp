@@ -929,6 +929,8 @@ PickResult pickModelFace(
             best.hit = true;
             best.partId = model.partId;
             best.originalFaceId = data->faceIds[i];
+            best.batchIndex = batch.batchIndex;
+            best.triangleIndex = i;
             best.distance = t;
             best.point = {origin[0] + dir[0] * t, origin[1] + dir[1] * t, origin[2] + dir[2] * t};
             computeFaceNormal(v0, best.normal.data());

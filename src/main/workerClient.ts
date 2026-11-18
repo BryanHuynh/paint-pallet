@@ -173,6 +173,8 @@ export class WorkerClient {
           hit: Boolean(msg.hit),
           partId: (msg.partId as string | null) ?? null,
           originalFaceId: typeof msg.originalFaceId === 'number' ? msg.originalFaceId : null,
+          batchIndex: typeof msg.batchIndex === 'number' ? msg.batchIndex : undefined,
+          triangleIndex: typeof msg.triangleIndex === 'number' ? msg.triangleIndex : undefined,
           distance: typeof msg.distance === 'number' ? msg.distance : null,
           point: (msg.point as Vec3 | null) ?? null,
           normal: (msg.normal as Vec3 | null) ?? null,

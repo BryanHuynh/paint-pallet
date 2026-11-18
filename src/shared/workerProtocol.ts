@@ -37,6 +37,8 @@ export interface PickResult {
   hit: boolean;
   partId: string | null;
   originalFaceId: number | null;
+  batchIndex?: number;
+  triangleIndex?: number;
   distance: number | null;
   point: Vec3 | null;
   normal: Vec3 | null;

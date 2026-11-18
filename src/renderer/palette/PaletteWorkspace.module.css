@@ -530,37 +530,159 @@
   border: 1px solid var(--pp-line);
 }
 
-.zoomBar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
+.previewFrame {
+  --preview-height: clamp(280px, 49vh, 540px);
+  position: relative;
+  min-width: 0;
 }
 
-.zoomReadout {
-  min-width: 58px;
-  text-align: center;
-  font-family: var(--font-mono, 'JetBrains Mono', 'Cascadia Code', Consolas, monospace);
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--pp-ink);
-  padding: 6px 10px;
-  border-radius: var(--pp-r-sm);
+.zoomDock {
+  position: absolute;
+  z-index: 21;
+  inset-inline-end: 14px;
+  inset-block-end: 14px;
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--pp-line-strong);
+  border-radius: var(--pp-r-md);
   background: var(--pp-bg);
-  border: 1px solid var(--pp-line);
+  box-shadow: 0 5px 20px rgb(0 0 0 / 32%);
+}
+
+.zoomDock button,
+.zoomMenu summary {
+  min-height: 44px;
+  border: 0;
+  background: transparent;
+  color: var(--pp-ink);
+  font: inherit;
+  cursor: pointer;
+  transition: background-color 150ms var(--pp-ease);
+}
+
+.zoomDock button:hover:not(:disabled),
+.zoomMenu summary:hover,
+.zoomMenu[open] summary {
+  background: var(--pp-accent-soft);
+}
+
+.zoomDock button:focus-visible,
+.zoomMenu summary:focus-visible {
+  outline: 2px solid var(--pp-accent);
+  outline-offset: -3px;
+}
+
+.zoomDock button:disabled {
+  color: var(--pp-muted);
+  opacity: 0.55;
+  cursor: default;
+}
+
+.zoomStep {
+  width: 44px;
+  border-radius: var(--pp-r-sm);
+}
+
+.zoomMenu summary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 83px;
+  padding: 0 8px;
+  border-inline: 1px solid var(--pp-line);
+  list-style: none;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.zoomMenu summary::-webkit-details-marker {
+  display: none;
+}
+
+.zoomCaret {
+  width: 6px;
+  height: 6px;
+  transform: translateY(1px) rotate(45deg);
+  border-inline-start: 1px solid currentColor;
+  border-block-start: 1px solid currentColor;
+}
+
+.zoomPresets {
+  position: absolute;
+  inset-inline-end: 0;
+  inset-block-end: calc(100% + 8px);
+  width: 190px;
+  padding: 4px;
+  border: 1px solid var(--pp-line-strong);
+  border-radius: var(--pp-r-md);
+  background: var(--pp-bg);
+  box-shadow: 0 5px 20px rgb(0 0 0 / 32%);
+}
+
+.zoomPresets button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 0 10px;
+  border-radius: var(--pp-r-sm);
+  font-size: 14px;
+  text-align: start;
+}
+
+.zoomPresets kbd {
+  color: var(--pp-muted);
+  font-size: 12px;
+}
+
+.smartControls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  color: var(--pp-muted);
+  font-size: 13px;
+}
+
+.smartControls label {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 8px;
+  color: var(--pp-ink);
+}
+
+.smartControls input {
+  width: clamp(72px, 20vw, 110px);
+  accent-color: var(--pp-accent);
+}
+
+.smartControls output {
+  min-width: 3ch;
+  font-variant-numeric: tabular-nums;
+}
+
+.smartOverlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  image-rendering: pixelated;
+  pointer-events: none;
 }
 
 .canvasStage {
   position: relative;
   display: flex;
   width: 100%;
-  min-height: 280px;
-  max-height: 540px;
+  height: var(--preview-height);
   padding: 12px;
   border-radius: var(--pp-r-md);
   border: 1px solid var(--pp-line);
   background: var(--pp-surface-alt);
   overflow: auto;
+  overflow-anchor: none;
 }
 
 .canvasStagePanning {
@@ -583,7 +705,7 @@
 .canvas {
   display: block;
   max-width: 100%;
-  max-height: 520px;
+  max-height: calc(var(--preview-height) - 26px);
   width: auto;
   height: auto;
   cursor: crosshair;

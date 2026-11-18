@@ -216,6 +216,12 @@ function installCanvasAndImageHarness() {
           });
         }
       },
+      createImageData: (width: number, height: number) => ({
+        width, height, data: new Uint8ClampedArray(width * height * 4),
+      }),
+      putImageData: (image: FixtureBitmap) => {
+        canvasBuffers.set(canvas, image);
+      },
       getImageData: (sx: number, sy: number, sw: number, sh: number) => {
         const buf = canvasBuffers.get(canvas);
         const out = new Uint8ClampedArray(sw * sh * 4);
@@ -912,7 +918,6 @@ describe('PaletteWorkspace', () => {
 
     const zoomInBtn = screen.getByRole('button', { name: /zoom in/i });
     const zoomOutBtn = screen.getByRole('button', { name: /zoom out/i });
-    const fitResetBtn = screen.getByRole('button', { name: /fit \/ reset/i });
 
     expect(screen.getByTestId('zoom-readout')).toHaveTextContent(/fit/i);
 
@@ -921,9 +926,9 @@ describe('PaletteWorkspace', () => {
     expect(screen.getByTestId('zoom-readout')).toHaveTextContent('150%');
     expect(canvas.style.width).toBe('60px');
 
-    await user.click(zoomInBtn);
-    await user.click(zoomInBtn);
-    await user.click(zoomInBtn);
+    fireEvent.keyDown(window, { key: '=', ctrlKey: true });
+    fireEvent.keyDown(window, { key: '+', ctrlKey: true });
+    fireEvent.keyDown(window, { key: '=', ctrlKey: true });
     expect(screen.getByTestId('zoom-readout')).toHaveTextContent('400%');
     expect(canvas.style.width).toBe('160px');
     expect(canvas.style.height).toBe('160px');
@@ -967,11 +972,99 @@ describe('PaletteWorkspace', () => {
     await user.click(zoomOutBtn);
     expect(screen.getByTestId('zoom-readout')).toHaveTextContent('300%');
 
-    await user.click(fitResetBtn);
+    await user.click(screen.getByLabelText('Zoom presets'));
+    await user.click(screen.getByRole('button', { name: /actual size/i }));
+    expect(screen.getByTestId('zoom-readout')).toHaveTextContent('100%');
+
+    fireEvent.keyDown(window, { key: '0', ctrlKey: true });
     expect(screen.getByTestId('zoom-readout')).toHaveTextContent(/fit/i);
     expect(canvas.style.width).toBe('');
     expect(stage.scrollLeft).toBe(0);
     expect(stage.scrollTop).toBe(0);
+  });
+
+  it('masks connected pixels, leaves separated colors out, and suggests tones from the mask', async () => {
+    const user = userEvent.setup();
+    render(<PaletteWorkspace />);
+    const image = createBitmapFixture('mask.png', 'image/png', 5, 2, (x) =>
+      x === 2 ? [0, 0, 200] : [240, 0, 0],
+    registry);
+    fireEvent.change(screen.getByLabelText(/import reference images/i), { target: { files: [image] } });
+    const canvas = await screen.findByTestId('reference-canvas');
+
+    await user.click(screen.getByRole('button', { name: /smart select/i }));
+    fireEvent.pointerDown(canvas, { button: 0, clientX: 0, clientY: 0 });
+
+    const mask = screen.getByTestId('smart-selection-mask') as HTMLCanvasElement;
+    const alphaAt = (x: number) => mask.getContext('2d')!.getImageData(x, 0, 1, 1).data[3];
+    expect(alphaAt(0)).toBeGreaterThan(0);
+    expect(alphaAt(2)).toBe(0);
+    expect(alphaAt(4)).toBe(0);
+
+    await user.click(screen.getByRole('button', { name: /suggest tones/i }));
+    const preview = screen.getByRole('region', { name: /tone suggestion preview/i });
+    expect(preview).toHaveTextContent('#F00000');
+    expect(preview).not.toHaveTextContent('#0000C8');
+
+    fireEvent.pointerDown(canvas, { button: 0, clientX: 4, clientY: 0, shiftKey: true });
+    expect(alphaAt(0)).toBeGreaterThan(0);
+    expect(alphaAt(4)).toBeGreaterThan(0);
+    await user.click(screen.getByRole('button', { name: /clear selection/i }));
+    expect(mask).not.toBeInTheDocument();
+  });
+
+  it('reapplies tolerance changes to all selected color seeds without another click', async () => {
+    const user = userEvent.setup();
+    render(<PaletteWorkspace />);
+    const colors: [number, number, number][] = [
+      [180, 0, 0], [145, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 110], [0, 0, 180],
+    ];
+    const image = createBitmapFixture('tolerance.png', 'image/png', colors.length, 2, (x) => colors[x], registry);
+    fireEvent.change(screen.getByLabelText(/import reference images/i), { target: { files: [image] } });
+    const canvas = await screen.findByTestId('reference-canvas');
+    await user.click(screen.getByRole('button', { name: /smart select/i }));
+
+    const tolerance = screen.getByRole('slider', { name: /tolerance/i });
+    fireEvent.input(tolerance, { target: { value: '0' } });
+    fireEvent.pointerDown(canvas, { button: 0, clientX: 0, clientY: 0 });
+    fireEvent.pointerDown(canvas, { button: 0, clientX: 5, clientY: 0, shiftKey: true });
+
+    const overlay = screen.getByTestId('smart-selection-mask') as HTMLCanvasElement;
+    const included = (x: number) => overlay.getContext('2d')!.getImageData(x, 0, 1, 1).data[3] > 0;
+    expect(colors.map((_, x) => included(x))).toEqual([true, false, false, false, false, true]);
+
+    fireEvent.input(tolerance, { target: { value: '25' } });
+    await waitFor(() => expect(colors.map((_, x) => included(x))).toEqual([true, true, false, false, true, true]));
+
+    fireEvent.input(tolerance, { target: { value: '0' } });
+    await waitFor(() => expect(colors.map((_, x) => included(x))).toEqual([true, false, false, false, false, true]));
+  });
+
+  it('includes enclosed islands and leaves pixels connected to the outside unselected', async () => {
+    const user = userEvent.setup();
+    render(<PaletteWorkspace />);
+    const image = createBitmapFixture('island.png', 'image/png', 9, 7, (x, y) => {
+      const ring = x >= 1 && x <= 5 && y >= 1 && y <= 5
+        && (x === 1 || x === 5 || y === 1 || y === 5);
+      if (ring) return [240, 0, 0];
+      if (x >= 2 && x <= 4 && y >= 2 && y <= 4) return [0, 0, 200];
+      return [0, 200, 0];
+    }, registry);
+    fireEvent.change(screen.getByLabelText(/import reference images/i), { target: { files: [image] } });
+    const canvas = await screen.findByTestId('reference-canvas');
+
+    await user.click(screen.getByRole('button', { name: /smart select/i }));
+    fireEvent.pointerDown(canvas, { button: 0, clientX: 1, clientY: 1 });
+
+    const mask = screen.getByTestId('smart-selection-mask') as HTMLCanvasElement;
+    const alphaAt = (x: number, y: number) => mask.getContext('2d')!.getImageData(x, y, 1, 1).data[3];
+    expect(alphaAt(3, 3)).toBeGreaterThan(0);
+    expect(alphaAt(6, 3)).toBe(0);
+
+    await user.click(screen.getByRole('button', { name: /suggest tones/i }));
+    const preview = screen.getByRole('region', { name: /tone suggestion preview/i });
+    expect(preview).toHaveTextContent('#0000C8');
+    expect(preview).not.toHaveTextContent('#00C800');
   });
 
   it('shows a live cursor magnifier with crosshair and source pixels during region selection, works at edges, and clears when leaving/switching tools', async () => {

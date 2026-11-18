@@ -10,6 +10,10 @@ import type {
 } from '../shared/workerProtocol';
 import { ALL_AXES, getOrthogonalFrontOptions } from './orientation';
 import { Viewport3D, type CameraPreset, type PickGenerationToken } from './components/Viewport3D';
+import type { PaintRecipe } from './palette/types';
+import { createEmptyRecipe } from './palette/recipes';
+import { ShadowPanel } from './paint/ShadowPanel';
+import { useShadowPainting } from './paint/useShadowPainting';
 import appLogoUrl from '../../assets/paint-pallet-logo.png';
 
 type PaletteComponent = React.ComponentType<Record<string, unknown>>;
@@ -46,6 +50,8 @@ export default function App({
   const api = injectedApi ?? window.paintPallet;
   const ResolvedPalette = PaletteWorkspaceComponent ?? resolveDiscoveredPalette();
 
+  const [recipes, setRecipes] = useState<PaintRecipe[]>(() => [createEmptyRecipe(1)]);
+  const shadow = useShadowPainting(recipes);
   const [activeTab, setActiveTab] = useState<'model' | 'palette'>('model');
   const [model, setModel] = useState<ModelSummary | null>(null);
   const [pendingModel, setPendingModel] = useState<ModelSummary | null>(null);
@@ -245,6 +251,7 @@ export default function App({
         ++appModelGenRef.current;
         activeModelIdRef.current = committed.modelId;
         pendingModelRef.current = null;
+        shadow.reset();
         setModel(committed);
         setPendingModel(null);
         setProgress(null);
@@ -288,32 +295,28 @@ export default function App({
     setStatusMsg(message);
   }, []);
 
-  const handleSurfacePick = useCallback(
-    async (
-      origin: Vec3,
-      direction: Vec3,
-      batchIndices: number[],
-      token: PickGenerationToken,
-    ) => {
-      if (!api || !model || token.modelId !== model.modelId) return;
-      const mySeq = ++pickSeqRef.current;
-      const startAppModelGen = appModelGenRef.current;
-      const startAppViewGen = appViewGenRef.current;
-      const result = await api.pickFace(model.modelId, origin, direction, batchIndices);
+  const handleSurfacePick = async (
+    origin: Vec3,
+    direction: Vec3,
+    batchIndices: number[],
+    token: PickGenerationToken,
+  ) => {
+    if (!api || !model || token.modelId !== model.modelId) return;
+    const startAppModelGen = appModelGenRef.current;
+    const startAppViewGen = appViewGenRef.current;
+    const isCurrent = () =>
+      activeModelIdRef.current === token.modelId &&
+      appModelGenRef.current === startAppModelGen &&
+      appViewGenRef.current === startAppViewGen;
 
-      // Discard stale response if model, view, or a newer pick occurred while awaiting
-      if (
-        mySeq !== pickSeqRef.current ||
-        activeModelIdRef.current !== token.modelId ||
-        appModelGenRef.current !== startAppModelGen ||
-        appViewGenRef.current !== startAppViewGen
-      ) {
-        return;
-      }
-      setPickResult(result);
-    },
-    [api, model],
-  );
+    try {
+      const sequence = ++pickSeqRef.current;
+      const result = await api.pickFace(model.modelId, origin, direction, batchIndices);
+      if (sequence === pickSeqRef.current && isCurrent()) setPickResult(result);
+    } catch (error) {
+      if (isCurrent()) setStatusMsg(error instanceof Error ? error.message : 'Surface pick failed.');
+    }
+  };
 
   const triggerCameraPreset = (preset: CameraPreset) => {
     setCameraPresetRequest((prev) => ({ preset, seq: (prev?.seq ?? 0) + 1 }));
@@ -397,7 +400,7 @@ export default function App({
           data-testid="palette-host"
           hidden={activeTab !== 'palette'}
         >
-          <ResolvedPalette />
+          <ResolvedPalette recipes={recipes} setRecipes={setRecipes} />
         </main>
       ) : null}
 
@@ -417,6 +420,15 @@ export default function App({
             orientation={orientation}
             cameraPresetRequest={cameraPresetRequest}
             onSurfacePick={handleSurfacePick}
+            shadowPaint={{
+              enabled: Boolean(model && shadow.tool && shadow.recipe && !isBusy),
+              coverage: shadow.coverage,
+              colors: shadow.colors,
+              diameter: shadow.brushSize,
+              onFaces: shadow.paintFaces,
+              onStart: shadow.beginStroke,
+              onEnd: shadow.endStroke,
+            }}
             onPickNeedsDetail={handlePickNeedsDetail}
             onViewChange={handleViewChange}
             onPendingModelCommit={handlePendingModelCommit}
@@ -498,6 +510,7 @@ export default function App({
         </section>
 
         <aside className="inspector-panel" aria-label="Model inspector">
+          {model && <ShadowPanel paint={shadow} recipes={recipes} busy={isBusy} />}
           <section className="inspector-section">
             <h2>Model summary</h2>
             {model ? (

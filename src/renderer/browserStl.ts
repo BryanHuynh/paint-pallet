@@ -165,6 +165,8 @@ export function createBrowserStlApi(): PaintPalletApi {
         hit: true,
         partId: active.summary.partId,
         originalFaceId: hit.faceIndex,
+        batchIndex: 0,
+        triangleIndex: hit.faceIndex,
         distance: hit.distance,
         point: hit.point.toArray(),
         normal: hit.face.normal.toArray(),
