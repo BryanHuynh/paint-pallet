@@ -667,4 +667,75 @@ describe('PaletteWorkspace', () => {
     expect(preview).toHaveTextContent('#8C2828');
     expect(preview).toHaveTextContent('#F0B4B4');
   });
+
+  it('ends selection drag when pointer is released outside the canvas and invalidates stale suggestion preview when selection scope changes', async () => {
+    const user = userEvent.setup();
+    render(<PaletteWorkspace />);
+
+    const img = createBitmapFixture(
+      'scope-invalidation.png',
+      'image/png',
+      20,
+      20,
+      (x, y) => {
+        if (x < 10) return [20, 40, 60];
+        if (y < 10) return [120, 140, 160];
+        return [220, 230, 240];
+      },
+      registry,
+    );
+
+    const fileInput = screen.getByLabelText(/import reference images/i);
+    fireEvent.change(fileInput, { target: { files: [img] } });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('reference-canvas')).toBeInTheDocument();
+    });
+
+    const canvas = screen.getByTestId('reference-canvas') as HTMLCanvasElement;
+    vi.spyOn(canvas, 'getBoundingClientRect').mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 100,
+      height: 100,
+      right: 100,
+      bottom: 100,
+      x: 0,
+      y: 0,
+      toJSON: () => {},
+    });
+
+    // Generate whole-image suggestion preview, then start a selection rectangle:
+    // changing the scope must invalidate the stale preview.
+    await user.click(screen.getByRole('button', { name: /suggest tones/i }));
+    expect(
+      screen.getByRole('region', { name: /tone suggestion preview/i }),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /select region/i }));
+    fireEvent.pointerDown(canvas, { clientX: 10, clientY: 10 });
+    fireEvent.pointerMove(canvas, { clientX: 40, clientY: 40 });
+
+    expect(
+      screen.queryByRole('region', { name: /tone suggestion preview/i }),
+    ).not.toBeInTheDocument();
+
+    // Release pointer outside canvas (on window): subsequent pointerMove must not resize selection.
+    fireEvent(window, new Event('pointerup'));
+    fireEvent.pointerMove(canvas, { clientX: 90, clientY: 90 });
+
+    // Generate suggestion from the 10..40% selection (x < 10 -> #14283C), not 90%:
+    await user.click(screen.getByRole('button', { name: /suggest tones/i }));
+    const preview = screen.getByRole('region', {
+      name: /tone suggestion preview/i,
+    });
+    expect(preview).toHaveTextContent('#14283C');
+    expect(preview).not.toHaveTextContent('#DCE6F0');
+
+    // Clearing selection also invalidates the preview.
+    await user.click(screen.getByRole('button', { name: /clear selection/i }));
+    expect(
+      screen.queryByRole('region', { name: /tone suggestion preview/i }),
+    ).not.toBeInTheDocument();
+  });
 });

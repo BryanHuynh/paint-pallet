@@ -105,6 +105,21 @@ export default function PaletteWorkspace(): React.ReactElement {
     recipes.find((recipe) => recipe.id === activeRecipeId) ?? recipes[0];
 
   useEffect(() => {
+    if (!dragStart) {
+      return;
+    }
+    const endDrag = () => {
+      setDragStart(null);
+    };
+    window.addEventListener('pointerup', endDrag);
+    window.addEventListener('pointercancel', endDrag);
+    return () => {
+      window.removeEventListener('pointerup', endDrag);
+      window.removeEventListener('pointercancel', endDrag);
+    };
+  }, [dragStart]);
+
+  useEffect(() => {
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
@@ -259,6 +274,11 @@ export default function PaletteWorkspace(): React.ReactElement {
     };
   }
 
+  function updateSelection(next: PixelRect | null) {
+    setSelection(next);
+    setSuggestionPreview(null);
+  }
+
   function samplePixelAt(x: number, y: number) {
     const canvas = canvasRef.current;
     if (!canvas) {
@@ -283,9 +303,10 @@ export default function PaletteWorkspace(): React.ReactElement {
     setCursor({ x, y });
 
     if (toolMode === 'select') {
+      event.currentTarget.setPointerCapture?.(event.pointerId);
       setKeyboardAnchor(null);
       setDragStart({ x, y });
-      setSelection({ x, y, width: 1, height: 1 });
+      updateSelection({ x, y, width: 1, height: 1 });
       return;
     }
 
@@ -299,10 +320,16 @@ export default function PaletteWorkspace(): React.ReactElement {
     }
     const { x, y } = mapClientToCanvasPixel(canvas, event.clientX, event.clientY);
     setCursor({ x, y });
-    setSelection(makeRectFromPoints(dragStart, { x, y }));
+    updateSelection(makeRectFromPoints(dragStart, { x, y }));
   }
 
-  function handleCanvasPointerUp() {
+  function handleCanvasPointerUp(event?: React.PointerEvent<HTMLCanvasElement>) {
+    if (
+      event &&
+      event.currentTarget.hasPointerCapture?.(event.pointerId)
+    ) {
+      event.currentTarget.releasePointerCapture?.(event.pointerId);
+    }
     if (dragStart) {
       setDragStart(null);
     }
@@ -311,10 +338,10 @@ export default function PaletteWorkspace(): React.ReactElement {
   function toggleKeyboardSelection() {
     if (!keyboardAnchor) {
       setKeyboardAnchor(cursor);
-      setSelection({ x: cursor.x, y: cursor.y, width: 1, height: 1 });
+      updateSelection({ x: cursor.x, y: cursor.y, width: 1, height: 1 });
       return;
     }
-    setSelection(makeRectFromPoints(keyboardAnchor, cursor));
+    updateSelection(makeRectFromPoints(keyboardAnchor, cursor));
     setKeyboardAnchor(null);
   }
 
@@ -351,7 +378,7 @@ export default function PaletteWorkspace(): React.ReactElement {
       event.preventDefault();
       setCursor(nextCursor);
       if (toolMode === 'select' && keyboardAnchor) {
-        setSelection(makeRectFromPoints(keyboardAnchor, nextCursor));
+        updateSelection(makeRectFromPoints(keyboardAnchor, nextCursor));
       }
     }
   }
@@ -506,7 +533,7 @@ export default function PaletteWorkspace(): React.ReactElement {
                   <button
                     type="button"
                     className={`${styles.btn} ${styles.btnSecondary}`}
-                    onClick={() => setSelection(null)}
+                    onClick={() => updateSelection(null)}
                   >
                     Clear selection
                   </button>
@@ -526,6 +553,7 @@ export default function PaletteWorkspace(): React.ReactElement {
                     onPointerDown={handleCanvasPointerDown}
                     onPointerMove={handleCanvasPointerMove}
                     onPointerUp={handleCanvasPointerUp}
+                    onPointerCancel={handleCanvasPointerUp}
                   />
                   <div
                     className={styles.cursorMarker}
@@ -568,7 +596,7 @@ export default function PaletteWorkspace(): React.ReactElement {
                       );
                       setCursor(next);
                       if (toolMode === 'select' && keyboardAnchor) {
-                        setSelection(makeRectFromPoints(keyboardAnchor, next));
+                        updateSelection(makeRectFromPoints(keyboardAnchor, next));
                       }
                     }}
                   />
@@ -591,7 +619,7 @@ export default function PaletteWorkspace(): React.ReactElement {
                       );
                       setCursor(next);
                       if (toolMode === 'select' && keyboardAnchor) {
-                        setSelection(makeRectFromPoints(keyboardAnchor, next));
+                        updateSelection(makeRectFromPoints(keyboardAnchor, next));
                       }
                     }}
                   />
