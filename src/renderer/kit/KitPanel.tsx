@@ -54,7 +54,8 @@ export function KitPanel({ parts, selected, busy, choose, add, confirmPlacement,
         )}
         {staged.length > 0 && !placementSelection && (
           <button type="button" className="btn btn--primary btn--small" disabled={busy}
-            onClick={() => setPlacementSelection(new Set(staged.filter((part) => !part.hidden).map((part) => part.id)))}>
+            onClick={() => setPlacementSelection(new Set(staged.filter((part) =>
+              !part.hidden && (!isolated || part.id === selected?.id)).map((part) => part.id)))}>
             Confirm current assembly
           </button>
         )}
@@ -67,7 +68,7 @@ export function KitPanel({ parts, selected, busy, choose, add, confirmPlacement,
       {placementSelection && staged.length > 0 && (
         <fieldset className="assembly-confirmation">
           <legend>Parts to confirm</legend>
-          <p className="hint-text">Accept the current positions. Leave alternatives unchecked. Installation steps appear after joints are recorded.</p>
+          <p className="hint-text">Keep the selected parts in their current positions and include them in painting guides. Leave alternatives unchecked.</p>
           <div className="assembly-confirmation__parts">
             {staged.map((part) => (
               <label key={part.id}>

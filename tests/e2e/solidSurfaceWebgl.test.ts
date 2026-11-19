@@ -233,7 +233,7 @@ describe('End-to-end WebGL solid surface coverage on dense STL', () => {
   const hasBuiltApp = fs.existsSync(MAIN_ENTRY) && fs.existsSync(WORKER_BIN);
 
   it.skipIf(!hasBuiltApp)(
-    'renders solid whole-model surface across head, torso, legs, and base in settled WebGL view and picks peripheral surfaces',
+    'renders the settled model across the viewport and supports peripheral picks, fills, and undo',
     { timeout: 60000 },
     async () => {
       const stlPath = path.join(tmpDir, 'dense_figure.stl');
@@ -321,6 +321,21 @@ describe('End-to-end WebGL solid surface coverage on dense STL', () => {
           );
           const baseFaceId = Number(await faceIdLocator.innerText());
           expect(Number.isInteger(baseFaceId) && baseFaceId >= 0 && baseFaceId !== headFaceId).toBe(true);
+
+          await page.getByRole('button', { name: 'Add region' }).click();
+          await page.getByRole('button', { name: 'Fill', exact: true }).click();
+          const paintedFaces = page.getByLabel('Painted faces');
+          await page.mouse.click(pickBox.x + orbitedMetrics.head[0], pickBox.y + orbitedMetrics.head[1]);
+          await page.waitForFunction(() => {
+            const text = document.querySelector('[aria-label="Painted faces"]')?.textContent;
+            return text && text !== '0 painted faces';
+          });
+          const afterHead = await paintedFaces.innerText();
+          await page.mouse.click(pickBox.x + orbitedMetrics.base[0], pickBox.y + orbitedMetrics.base[1]);
+          await page.waitForFunction((previous) => document.querySelector('[aria-label="Painted faces"]')?.textContent !== previous, afterHead);
+          expect(await page.getByRole('button', { name: 'Apply fill' }).count()).toBe(0);
+          await page.getByRole('button', { name: 'Undo stroke' }).click();
+          expect(await paintedFaces.innerText()).toBe(afterHead);
         }
       } finally {
         await electronApp.close().catch(() => {});

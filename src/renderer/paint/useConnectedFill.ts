@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useEffectEvent, useMemo, useState } from 'react';
 import { ANCHOR_ADDRESS, type PartAddress } from '../../shared/kit';
 import type { PaintPalletApi } from '../../shared/workerProtocol';
 import { paintShadowFaces, startShadowStroke, type ShadowCoverage, type SurfaceFace } from './shadowPaint';
@@ -23,15 +23,17 @@ export function useConnectedFill(
   modelId: string | undefined,
   regionId: string | undefined,
   coverage: ShadowCoverage,
-  part?: PartAddress & { faceCount: number },
-  previewBeforeFill = false,
+  part: (PartAddress & { faceCount: number }) | undefined,
+  previewBeforeFill: boolean,
+  commit: (faces: Iterable<SurfaceFace>) => void,
 ) {
-  const [seed, setSeed] = useState<FillSeed | null>(null);
+  const [seeds, setSeeds] = useState<FillSeed[]>([]);
+  const seed = seeds[0];
   const [creaseDegrees, setCreaseDegrees] = useState(35);
   const query = useMemo(() => {
     if (!enabled || !seed || seed.modelId !== modelId || seed.regionId !== regionId) return null;
-    return { seed, creaseDegrees, coverage, part };
-  }, [enabled, seed, modelId, regionId, creaseDegrees, coverage, part]);
+    return { seed, creaseDegrees, coverage, part, previewBeforeFill };
+  }, [enabled, seed, modelId, regionId, creaseDegrees, coverage, part, previewBeforeFill]);
   const [result, setResult] = useState<{
     query: NonNullable<typeof query>;
     packed?: Uint32Array;
@@ -39,6 +41,29 @@ export function useConnectedFill(
     added?: number;
     error?: string;
   } | null>(null);
+  const [error, setError] = useState<string>();
+
+  const finish = useEffectEvent((completed: NonNullable<typeof query>, packed: Uint32Array) => {
+    if (query !== completed) return;
+    if (completed.previewBeforeFill) {
+      const draft = startShadowStroke(completed.coverage, FILL_PREVIEW_REGION, 'brush');
+      paintShadowFaces(draft, unpackFillFaces(packed, completed.part));
+      setResult({ query: completed, packed, coverage: draft.coverage, added: draft.edit.added.length });
+    } else {
+      commit(unpackFillFaces(packed, completed.part));
+      setSeeds((previous) => previous.slice(1));
+    }
+  });
+
+  const fail = useEffectEvent((completed: NonNullable<typeof query>, failure: unknown) => {
+    if (query !== completed) return;
+    const message = failure instanceof Error ? failure.message : 'Could not prepare the connected fill.';
+    if (completed.previewBeforeFill) setResult({ query: completed, error: message });
+    else {
+      setError(message);
+      setSeeds((previous) => previous.slice(1));
+    }
+  });
 
   useEffect(() => {
     const preview = api?.previewConnectedFill;
@@ -46,7 +71,7 @@ export function useConnectedFill(
     let active = true;
     let started = false;
     const jobId = crypto.randomUUID();
-    const timeout = window.setTimeout(async () => {
+    const run = async () => {
       started = true;
       const blockedFaces: number[] = [];
       for (const batch of query.coverage.values()) {
@@ -64,28 +89,30 @@ export function useConnectedFill(
           maxCreaseDegrees: query.creaseDegrees,
           blockedFaces,
         });
-        if (!active) return;
-        if (previewBeforeFill) {
-          const draft = startShadowStroke(query.coverage, FILL_PREVIEW_REGION, 'brush');
-          paintShadowFaces(draft, unpackFillFaces(packed, query.part));
-          setResult({ query, packed, coverage: draft.coverage, added: draft.edit.added.length });
-        } else {
-          setResult({ query, packed });
-        }
+        if (active) finish(query, packed);
       } catch (error) {
-        if (active) {
-          setResult({ query, error: error instanceof Error ? error.message : 'Could not preview the connected fill.' });
-        }
+        if (active) fail(query, error);
       } finally {
         started = false;
       }
-    }, 120);
+    };
+    const timeout = window.setTimeout(run, query.previewBeforeFill ? 120 : 0);
     return () => {
       active = false;
       window.clearTimeout(timeout);
       if (started) void api?.cancelConnectedFill?.(jobId).catch(() => {});
     };
-  }, [api, query, previewBeforeFill]);
+  }, [api, query]);
+
+  const cancel = useCallback(() => {
+    setSeeds([]);
+    setResult(null);
+    setError(undefined);
+  }, []);
+
+  useEffect(() => {
+    if (!enabled) cancel();
+  }, [cancel, enabled]);
 
   const ready = result?.query === query ? result : null;
   return {
@@ -95,13 +122,13 @@ export function useConnectedFill(
     previewCoverage: ready?.coverage,
     packed: ready?.packed,
     added: ready?.added ?? 0,
-    error: ready?.error,
+    error: ready?.error ?? error,
     creaseDegrees,
     setCreaseDegrees,
-    select: setSeed,
-    cancel: () => {
-      setSeed(null);
-      setResult(null);
+    select(next: FillSeed) {
+      setError(undefined);
+      setSeeds((previous) => previewBeforeFill ? [next] : [...previous, next]);
     },
+    cancel,
   };
 }

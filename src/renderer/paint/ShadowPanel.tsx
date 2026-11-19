@@ -6,6 +6,7 @@ export function ShadowPanel({
   paint,
   fill,
   onApplyFill,
+  onCancelFill,
   previewBeforeFill,
   setPreviewBeforeFill,
   onToolChange,
@@ -15,6 +16,7 @@ export function ShadowPanel({
   paint: ReturnType<typeof useShadowPainting>;
   fill: ReturnType<typeof useConnectedFill>;
   onApplyFill: () => void;
+  onCancelFill: () => void;
   previewBeforeFill: boolean;
   setPreviewBeforeFill: (value: boolean) => void;
   onToolChange: ReturnType<typeof useShadowPainting>['setTool'];
@@ -33,7 +35,7 @@ export function ShadowPanel({
             <label htmlFor="paint-region">Region</label>
             <select id="paint-region" className="select-input" value={region.id}
               disabled={locked} onChange={(event) => {
-                fill.cancel();
+                onCancelFill();
                 paint.setRegionId(event.target.value);
               }}>
               {paint.regions.map((item) => (
@@ -49,14 +51,17 @@ export function ShadowPanel({
           <div className="field-row">
             <label htmlFor="paint-region-recipe">Recipe</label>
             <select id="paint-region-recipe" className="select-input" value={recipe?.id ?? ''}
-              disabled={locked} onChange={(event) => paint.updateRegion({ recipeId: event.target.value })}>
+              disabled={locked} onChange={(event) => {
+                onCancelFill();
+                paint.updateRegion({ recipeId: event.target.value });
+              }}>
               <option value="">Choose a recipe</option>
               {recipes.map((item) => <option key={item.id} value={item.id}>{item.name || 'Untitled recipe'}</option>)}
             </select>
           </div>
         </>
       ) : <p className="hint-text">Add a region and choose its paint recipe.</p>}
-      <button type="button" className="btn btn--secondary btn--small" disabled={locked} onClick={() => { fill.cancel(); paint.createRegion(); }}>
+      <button type="button" className="btn btn--secondary btn--small" disabled={locked} onClick={() => { onCancelFill(); paint.createRegion(); }}>
         Add region
       </button>
 
@@ -64,11 +69,11 @@ export function ShadowPanel({
         <>
           <div className="shadow-tools" role="group" aria-label="Shadow tools">
             <button type="button" className="btn btn--secondary btn--small" aria-pressed={paint.tool === null}
-              disabled={locked} onClick={() => { fill.cancel(); onToolChange(null); }}>Inspect</button>
+              disabled={locked} onClick={() => { onCancelFill(); onToolChange(null); }}>Inspect</button>
             <button type="button" className="btn btn--secondary btn--small" aria-pressed={paint.tool === 'brush'}
-              disabled={locked || !recipe} onClick={() => { fill.cancel(); onToolChange('brush'); }}>Brush</button>
+              disabled={locked || !recipe} onClick={() => { onCancelFill(); onToolChange('brush'); }}>Brush</button>
             <button type="button" className="btn btn--secondary btn--small" aria-pressed={paint.tool === 'erase'}
-              disabled={locked || !recipe} onClick={() => { fill.cancel(); onToolChange('erase'); }}>Erase</button>
+              disabled={locked || !recipe} onClick={() => { onCancelFill(); onToolChange('erase'); }}>Erase</button>
             {fill.available && (
               <button type="button" className="btn btn--secondary btn--small" aria-pressed={paint.tool === 'fill'}
                 disabled={locked || !recipe} onClick={() => onToolChange('fill')}>Fill</button>
@@ -88,7 +93,7 @@ export function ShadowPanel({
                 Preview before filling
               </label>
               <p className="hint-text" role="status">
-                {fill.loading ? 'Preparing connected surface preview…'
+                {fill.loading ? previewBeforeFill ? 'Preparing connected surface preview…' : 'Filling connected surface…'
                   : fill.error ?? (fill.seeded && previewBeforeFill
                     ? `${fill.added.toLocaleString()} new faces in preview`
                     : previewBeforeFill ? 'Click a surface to preview the fill.' : 'Click a surface to fill it. Undo reverses the fill.')}
@@ -98,7 +103,7 @@ export function ShadowPanel({
                   {previewBeforeFill && <button type="button" className="btn btn--primary btn--small"
                     disabled={locked || !fill.added || fill.loading} onClick={onApplyFill}>Apply fill</button>}
                   <button type="button" className="btn btn--secondary btn--small"
-                    onClick={fill.cancel}>Cancel fill</button>
+                    onClick={onCancelFill}>Cancel fill</button>
                 </div>
               )}
             </>
@@ -124,9 +129,9 @@ export function ShadowPanel({
           )}
           <div className="shadow-tools">
             <button type="button" className="btn btn--secondary btn--small"
-              disabled={locked || !paint.canUndo} onClick={paint.undo}>Undo stroke</button>
+              disabled={locked || !paint.canUndo} onClick={() => { onCancelFill(); paint.undo(); }}>Undo stroke</button>
             <button type="button" className="btn btn--secondary btn--small"
-              disabled={locked || !paint.canRedo} onClick={paint.redo}>Redo stroke</button>
+              disabled={locked || !paint.canRedo} onClick={() => { onCancelFill(); paint.redo(); }}>Redo stroke</button>
           </div>
           <output className="hint-text" aria-label="Painted faces">{paint.paintedFaces.toLocaleString()} painted faces</output>
         </>
