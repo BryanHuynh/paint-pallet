@@ -7,11 +7,18 @@ import { ANCHOR_ADDRESS, restoreKitAddresses } from '../shared/kit';
 import type { OpenedProject, ProjectContents, ProjectSaveRequest } from '../shared/paintProject';
 import { openProjectArchive, writeProjectArchive } from './projectArchive';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { generateVisionRecipes } from './visionRecipes';
 import { WorkerClient, readBatchBinary } from './workerClient';
 import type { ConnectedFillRequest, ExposureRequest, RidgeBandRequest, KitImportResult, ModelSummary, Vec3 } from '../shared/workerProtocol';
 
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
 declare const MAIN_WINDOW_VITE_NAME: string;
+
+const palettePagePath = path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`);
+const palettePageUrl = MAIN_WINDOW_VITE_DEV_SERVER_URL
+  ? new URL(MAIN_WINDOW_VITE_DEV_SERVER_URL).href
+  : pathToFileURL(palettePagePath).href;
 
 const originalSources = new Map<string, { path: string; name: string; cleanup?: () => Promise<void> }>();
 let loadedModelId: string | null = null;
@@ -161,13 +168,19 @@ function createWindow(): void {
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
     void mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
   } else {
-    void mainWindow.loadFile(
-      path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`),
-    );
+    void mainWindow.loadFile(palettePagePath);
   }
 }
 
 app.whenReady().then(() => {
+  ipcMain.handle('palette:generate-vision-recipes', (event, request: unknown) => {
+    if (event.sender !== mainWindow?.webContents || event.senderFrame !== event.sender.mainFrame ||
+        event.senderFrame?.url.split('#', 1)[0] !== palettePageUrl) {
+      return { ok: false, message: 'Vision recipes are available from the Paint Pallet window.' };
+    }
+    return generateVisionRecipes(request);
+  });
+
   ipcMain.handle('dialog:select-stl', async () => {
     if (!mainWindow) return null;
     const result = await dialog.showOpenDialog(mainWindow, {

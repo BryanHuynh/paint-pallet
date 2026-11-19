@@ -218,6 +218,37 @@
   gap: 8px;
 }
 
+.visionForm {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--pp-line);
+  border-radius: var(--pp-r-md);
+}
+
+.visionReferences {
+  min-width: 0;
+  max-height: 180px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px 0 0;
+  border: 0;
+  font-size: 14px;
+}
+
+.visionReference {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  overflow-wrap: anywhere;
+}
+
+.visionReference input {
+  flex: none;
+  accent-color: var(--pp-accent);
+}
+
 .confirmBox {
   display: flex;
   flex-wrap: wrap;

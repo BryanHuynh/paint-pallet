@@ -1,4 +1,5 @@
 import React, { useDeferredValue, useEffect, useId, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import { MAX_VISION_IMAGE_DIMENSION, MAX_VISION_REFERENCES } from '../../shared/visionRecipes';
 import {
   mapClientToCanvasPixel,
   readBoundedRegionImageData,
@@ -79,11 +80,14 @@ export default function PaletteWorkspace({
 } = {}): React.ReactElement {
   const importInputId = useId();
   const recipeNameInputId = useId();
+  const visionFormId = useId();
+  const visionDisclosureId = useId();
   const workspaceRef = useRef<HTMLElement | null>(null);
   const zoomMenuRef = useRef<HTMLDetailsElement | null>(null);
   const smartOverlayRef = useRef<HTMLCanvasElement | null>(null);
   const smartImageRef = useRef<ImageData | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const visionKeyRef = useRef<HTMLInputElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const magnifierCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -103,6 +107,8 @@ export default function PaletteWorkspace({
   const [activeRefId, setActiveRefId] = useState<string | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
   const [recipeGenerationMessage, setRecipeGenerationMessage] = useState<string | null>(null);
+  const [visionSelection, setVisionSelection] = useState<string[] | null>(null);
+  const [isGeneratingVision, setIsGeneratingVision] = useState(false);
   const [isDraggingImages, setIsDraggingImages] = useState(false);
 
   const [localRecipes, setLocalRecipes] = useState<PaintRecipe[]>(() => [createEmptyRecipe(1)]);
@@ -134,6 +140,7 @@ export default function PaletteWorkspace({
 
   const activeReference =
     references.find((ref) => ref.id === activeRefId) ?? references[0] ?? null;
+  const generateVisionRecipes = window.paintPallet?.generateVisionRecipes;
 
   const { zoom, zoomTo, stepZoom, fit, atMin, atMax } = usePreviewZoom(
     workspaceRef, stageRef, canvasRef, Boolean(activeReference),
@@ -189,6 +196,8 @@ export default function PaletteWorkspace({
           setActiveRefId(state.activeReferenceId);
           setActiveRecipeId(state.activeRecipeId);
           setImportError(null);
+          setVisionSelection(null);
+          setRecipeGenerationMessage(null);
           setConfirmDeleteId(null);
           setToolMode('eyedropper');
           setKeyboardAnchor(null);
@@ -391,6 +400,21 @@ export default function PaletteWorkspace({
     void importReferenceFiles(Array.from(files));
   }
 
+  function appendGeneratedRecipes(generated: PaintRecipe[]) {
+    setRecipes((previous) => {
+      const names = new Set(previous.map((recipe) => recipe.name));
+      const named = generated.map((recipe) => {
+        let name = recipe.name;
+        for (let suffix = 2; names.has(name); suffix++) name = `${recipe.name} ${suffix}`;
+        names.add(name);
+        return { ...recipe, name };
+      });
+      return [...previous, ...named];
+    });
+    setActiveRecipeId(generated[0].id);
+    setConfirmDeleteId(null);
+  }
+
   function handleGenerateRecipes() {
     if (!references.length) return;
     const sample = document.createElement('canvas');
@@ -410,22 +434,71 @@ export default function PaletteWorkspace({
         setRecipeGenerationMessage('No visible colors were found in the references.');
         return;
       }
-      const names = new Set(recipes.map((recipe) => recipe.name));
       const generated = result.map(({ name, tones }) => {
         const recipe = createEmptyRecipe(nextRecipeNumberRef.current++);
-        let candidate = name;
-        for (let suffix = 2; names.has(candidate); suffix++) candidate = name + ' ' + suffix;
-        names.add(candidate);
-        recipe.name = candidate;
+        recipe.name = name;
         for (const { slot } of TONE_SLOTS) recipe.swatches[slot].hex = tones[slot];
         return recipe;
       });
-      setRecipes((previous) => [...previous, ...generated]);
-      setActiveRecipeId(generated[0].id);
-      setConfirmDeleteId(null);
+      appendGeneratedRecipes(generated);
       setRecipeGenerationMessage('Created ' + generated.length + (generated.length === 1 ? ' recipe.' : ' recipes.'));
     } catch {
       setRecipeGenerationMessage('Could not analyze the reference images.');
+    }
+  }
+
+  async function handleGenerateVisionRecipes(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const keyInput = visionKeyRef.current;
+    if (!generateVisionRecipes || !visionSelection?.length || !keyInput || isGeneratingVision) return;
+    const apiKey = keyInput.value.trim();
+    if (!apiKey) {
+      setRecipeGenerationMessage('Enter an OpenAI API key.');
+      return;
+    }
+    const revision = projectRevision.current;
+    const currentProject = () => isMountedRef.current && revision === projectRevision.current;
+    const selected = references.filter((reference) => visionSelection.includes(reference.id));
+    let images: string[];
+    try {
+      const canvas = document.createElement('canvas');
+      const context = canvas.getContext('2d');
+      if (!context) throw new Error('Canvas unavailable');
+      images = selected.map((reference) => {
+        const scale = Math.min(1, MAX_VISION_IMAGE_DIMENSION / Math.max(reference.width, reference.height));
+        canvas.width = Math.max(1, Math.round(reference.width * scale));
+        canvas.height = Math.max(1, Math.round(reference.height * scale));
+        context.drawImage(reference.element, 0, 0, canvas.width, canvas.height);
+        return canvas.toDataURL('image/png');
+      });
+    } catch {
+      setRecipeGenerationMessage('Could not prepare the selected references for AI analysis.');
+      return;
+    }
+
+    keyInput.value = '';
+    setIsGeneratingVision(true);
+    setRecipeGenerationMessage('OpenAI is analyzing the selected references…');
+    try {
+      const result = await generateVisionRecipes({ apiKey, images });
+      if (!currentProject()) return;
+      if (!result.ok) {
+        setRecipeGenerationMessage(result.message);
+        return;
+      }
+      const generated = result.recipes.map(({ name, swatches }) => {
+        const recipe = createEmptyRecipe(nextRecipeNumberRef.current++);
+        recipe.name = name;
+        for (const { slot } of TONE_SLOTS) Object.assign(recipe.swatches[slot], swatches[slot]);
+        return recipe;
+      });
+      appendGeneratedRecipes(generated);
+      setVisionSelection(null);
+      setRecipeGenerationMessage(`Created ${generated.length} AI ${generated.length === 1 ? 'recipe' : 'recipes'}.`);
+    } catch {
+      if (currentProject()) setRecipeGenerationMessage('Could not complete AI recipe generation. Try again.');
+    } finally {
+      if (isMountedRef.current) setIsGeneratingVision(false);
     }
   }
 
@@ -1220,8 +1293,23 @@ export default function PaletteWorkspace({
             <div className={styles.recipeActions}>
               <button type="button" className={`${styles.btn} ${styles.btnSecondary}`}
                 disabled={!references.length} onClick={handleGenerateRecipes}>
-                Generate recipes
+                Extract colors offline
               </button>
+              {generateVisionRecipes && (
+                <button
+                  type="button"
+                  className={`${styles.btn} ${styles.btnSecondary}`}
+                  disabled={!activeReference || isGeneratingVision}
+                  aria-expanded={visionSelection !== null}
+                  aria-controls={visionSelection !== null ? visionFormId : undefined}
+                  onClick={() => {
+                    setRecipeGenerationMessage(null);
+                    setVisionSelection(visionSelection === null && activeReference ? [activeReference.id] : null);
+                  }}
+                >
+                  Generate AI recipes
+                </button>
+              )}
               <button
                 type="button"
                 className={`${styles.btn} ${styles.btnSecondary}`}
@@ -1240,7 +1328,60 @@ export default function PaletteWorkspace({
             </div>
           </div>
 
-          {recipeGenerationMessage && <p className={styles.workspaceIntro} role="status">{recipeGenerationMessage}</p>}
+          {visionSelection !== null && (
+            <form
+              id={visionFormId}
+              className={styles.visionForm}
+              aria-describedby={visionDisclosureId}
+              onSubmit={handleGenerateVisionRecipes}
+            >
+              <p id={visionDisclosureId} className={styles.subtitle}>
+                Sends the selected reference images to OpenAI for analysis. OpenAI API charges and data policies apply.
+                Paint Pallet clears the API key after each submission.
+              </p>
+              <fieldset className={styles.visionReferences} disabled={isGeneratingVision}>
+                <legend>Select up to {MAX_VISION_REFERENCES} reference images</legend>
+                {references.map(({ id, name }) => {
+                  const checked = visionSelection.includes(id);
+                  return (
+                    <label key={id} className={styles.visionReference}>
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        disabled={!checked && visionSelection.length >= MAX_VISION_REFERENCES}
+                        onChange={(event) => {
+                          setVisionSelection(event.target.checked
+                            ? [...visionSelection, id]
+                            : visionSelection.filter((selected) => selected !== id));
+                        }}
+                      />
+                      <span>{name}</span>
+                    </label>
+                  );
+                })}
+              </fieldset>
+              <label className={styles.field}>
+                <span className={styles.label}>OpenAI API key</span>
+                <input
+                  ref={visionKeyRef}
+                  className={styles.input}
+                  type="password"
+                  autoComplete="off"
+                  maxLength={512}
+                  required
+                  disabled={isGeneratingVision}
+                />
+              </label>
+              <button
+                type="submit"
+                className={`${styles.btn} ${styles.btnPrimary}`}
+                disabled={isGeneratingVision || !visionSelection.length}
+              >
+                Send to OpenAI and generate
+              </button>
+            </form>
+          )}
+          {recipeGenerationMessage && <p className={styles.subtitle} role="status">{recipeGenerationMessage}</p>}
 
           {confirmDeleteId && activeRecipe && confirmDeleteId === activeRecipe.id && (
             <div className={styles.confirmBox} role="alertdialog" aria-label="Confirm delete recipe">
