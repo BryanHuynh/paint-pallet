@@ -25,9 +25,14 @@ vi.mock('../../src/renderer/components/Viewport3D', async (importOriginal) => {
   };
 });
 
-vi.mock('../../src/renderer/guide/renderGuideViews', () => ({
-  renderGuideViews: vi.fn().mockResolvedValue({ shadow: Array(4).fill('data:image/png;base64,') }),
-}));
+vi.mock('../../src/renderer/guide/renderGuideViews', () => {
+  const views = Array<string>(4).fill('data:image/png;base64,');
+  const result: Awaited<ReturnType<typeof renderGuideViews>> = {
+    images: { shadow: views, midtone: views, highlight: views },
+    details: {},
+  };
+  return { renderGuideViews: vi.fn().mockResolvedValue(result) };
+});
 
 afterEach(() => {
   cleanup();
