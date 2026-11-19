@@ -31,7 +31,7 @@ const pinPosition = (value: number) => Math.min(0.96, Math.max(0.04, value));
 export default function PaintingGuideDialog({ api, model, orientation, coverage, tones, edges, rows, snapshot, unapplied, callouts, setCallouts, close, parts, joints, installation, setInstallation }: Props) {
   const dialog = useRef<HTMLDialogElement>(null);
   const request = useRef<AbortController | null>(null);
-  const [focusPasses, setFocusPasses] = useState(true);
+  const [includeDetails, setIncludeDetails] = useState(true);
   const [paper, setPaper] = useState<GuidePaper>('Letter');
   const [region, setRegion] = useState(rows[0]?.id ?? '');
   const [previews, setPreviews] = useState<string[] | null>(null);
@@ -59,7 +59,7 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
   useEffect(() => {
     const controller = new AbortController();
     void renderGuideViews({ readBatch, model, parts: printParts, orientation, coverage, tones, rows, preview: true, signal: controller.signal })
-      .then((images) => {
+      .then(({ images }) => {
         if (!controller.signal.aborted) setPreviews(images.shadow);
       }, (error: unknown) => {
         if (!controller.signal.aborted) setMessage({ text: error instanceof Error ? error.message : 'Unable to render the guide preview.', error: true });
@@ -81,13 +81,9 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
     setMessage(null);
     try {
       const options = { readBatch, model, orientation, coverage, tones, edges, rows, preview: false, signal: controller.signal };
-      const passCallouts: NonNullable<GuideExport['passCallouts']> = {};
-      const images = await renderGuideViews({ ...options, parts: printParts, focusPasses,
-        mapCallouts: (pass, remap) => {
-          passCallouts[pass] = callouts.flatMap((callout) => remap(callout) ?? []);
-        },
+      const { images, details } = await renderGuideViews({ ...options, parts: printParts,
+        detailCallouts: includeDetails ? callouts : undefined,
       });
-      const installationViews = focusPasses && installation.order.length ? previews ?? undefined : undefined;
       const byId = new Map(printParts.map((part) => [part.id, part]));
       const jointByChild = new Map(joints.map((joint) => [joint.childId, joint]));
       const steps = installation.order.flatMap((id) => {
@@ -107,13 +103,12 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
         const part = byId.get(id);
         if (!part) continue;
         controller.signal.throwIfAborted();
-        isolatedSheets.push({ partName: part.name || 'Untitled part',
-          images: await renderGuideViews({ ...options, parts: [part], focusPasses }) });
+        const { images } = await renderGuideViews({ ...options, parts: [part] });
+        isolatedSheets.push({ partName: part.name || 'Untitled part', images });
       }
       controller.signal.throwIfAborted();
       const saved = await api.exportPaintingGuide({
-        paper, modelName: model.fileName, snapshot, rows, callouts, images, installation: steps, isolatedSheets,
-        focusedPasses: focusPasses, passCallouts: focusPasses ? passCallouts : undefined, installationViews,
+        paper, modelName: model.fileName, snapshot, rows, callouts, images, details, installation: steps, isolatedSheets,
       });
       if (!controller.signal.aborted && saved) setMessage({ text: 'Painting guide saved.', error: false });
     } catch (error) {
@@ -146,10 +141,10 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
           </select>
         </label>
         <label>Paint views
-          <select value={focusPasses ? 'painted' : 'full'} disabled={exporting}
-            onChange={(event) => setFocusPasses(event.target.value === 'painted')}>
-            <option value="painted">Painted surfaces</option>
-            <option value="full">Full model</option>
+          <select value={includeDetails ? 'painted' : 'full'} disabled={exporting}
+            onChange={(event) => setIncludeDetails(event.target.value === 'painted')}>
+            <option value="painted">Painted surface close-ups</option>
+            <option value="full">Full model only</option>
           </select>
         </label>
         <label>Callout region

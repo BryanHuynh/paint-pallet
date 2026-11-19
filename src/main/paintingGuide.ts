@@ -18,9 +18,12 @@ function imagePasses(images: GuideImages | undefined): GuidePass[] {
   return images?.edge ? [...GUIDE_PASSES, 'edge'] : [...GUIDE_PASSES];
 }
 
+function validImage(image: unknown): image is string {
+  return typeof image === 'string' && /^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(image);
+}
+
 function validViewImages(views: unknown): views is string[] {
-  return Array.isArray(views) && views.length === GUIDE_VIEWS.length &&
-    views.every((image) => typeof image === 'string' && /^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(image));
+  return Array.isArray(views) && views.length === GUIDE_VIEWS.length && views.every(validImage);
 }
 
 function validImages(images: GuideImages | undefined) {
@@ -42,8 +45,9 @@ export function renderGuideDocument(guide: GuideExport) {
       !Array.isArray(guide.rows) || !Array.isArray(guide.callouts) ||
       !validImages(guide.images) ||
       (guide.installationViews !== undefined && !validViewImages(guide.installationViews)) ||
-      (guide.passCallouts !== undefined && (!guide.passCallouts ||
-        !Object.values(guide.passCallouts).every(Array.isArray))) ||
+      (guide.details !== undefined && (!guide.details || !Object.values(guide.details).every((cards) =>
+        Array.isArray(cards) && cards.every((card) => card && typeof card.regionId === 'string' && validImage(card.image) &&
+          (card.view === 'Top' || card.view === 'Bottom' || GUIDE_VIEWS.includes(card.view)) && validPosition(card.x) && validPosition(card.y))))) ||
       (guide.isolatedSheets !== undefined && (!Array.isArray(guide.isolatedSheets) ||
         !guide.isolatedSheets.every((sheet) => typeof sheet.partName === 'string' && validImages(sheet.images)))) ||
       (guide.installation !== undefined && (!Array.isArray(guide.installation) ||
@@ -72,24 +76,41 @@ export function renderGuideDocument(guide: GuideExport) {
     '<h2>Paint recipes by region</h2><table><thead><tr><th scope="col">Region</th>' + heads.join('') +
     '</tr></thead><tbody>' + swatches.join('') + '</tbody></table></section>';
 
+  const rows = new Map(guide.rows.map((row, index) => [row.id, { name: row.name, number: index + 1 }]));
+  function detailSheets(pass: GuidePass) {
+    const figures = guide.details?.[pass]?.flatMap(({ regionId, view, image, x, y }) => {
+      const row = rows.get(regionId);
+      if (!row) return [];
+      return '<figure><figcaption>' + escapeText(row.name) + ' · ' + view + '</figcaption>' +
+        '<div class="view"><img src="' + image + '" alt="">' + guidePin(x, y, row.number) + '</div></figure>';
+    }) ?? [];
+    const pages: string[] = [];
+    for (let start = 0; start < figures.length; start += 4) {
+      pages.push('<section class="pass"><h1>' + label(pass) + ' close-ups</h1>' + description +
+        '<div class="views details">' + figures.slice(start, start + 4).join('') + '</div></section>');
+    }
+    return pages.join('');
+  }
+
   function paintSheets(images: GuideImages, partName?: string) {
     return imagePasses(images).map((pass) => {
+      const paintedRegions = guide.details && new Set(guide.details[pass]?.map((card) => card.regionId));
       const views = GUIDE_VIEWS.map((view, index) => {
-        const pins = partName ? [] : (guide.passCallouts?.[pass] ?? guide.callouts).flatMap((callout) => {
-          const row = guide.rows.findIndex((item) => item.id === callout.regionId);
-          if (callout.view !== view || row < 0 || !validPosition(callout.x) || !validPosition(callout.y)) return [];
-          return guidePin(callout.x, callout.y, row + 1);
+        const pins = partName ? [] : guide.callouts.flatMap((callout) => {
+          const row = rows.get(callout.regionId);
+          if (callout.view !== view || !row || (paintedRegions && !paintedRegions.has(callout.regionId)) ||
+            !validPosition(callout.x) || !validPosition(callout.y)) return [];
+          return guidePin(callout.x, callout.y, row.number);
         });
         return '<figure><figcaption>' + view + '</figcaption><div class="view"><img src="' +
           images[pass]![index] + '" alt="">' + pins.join('') + '</div></figure>';
       });
       const heading = partName ? escapeText(partName) + ' · ' + label(pass) : label(pass);
-      const legend = guide.focusedPasses ? 'Only surfaces painted in this pass are shown.' +
-        (partName ? '' : ' Callout numbers match the recipe table.') :
-        partName ? 'Isolated part view. Gray shows surfaces outside this pass.' :
+      const legend = partName ? 'Isolated part view. Gray shows surfaces outside this pass.' :
         'Gray shows surfaces outside this pass. Callout numbers match the recipe table.';
       return '<section class="pass"><h1>' + heading + '</h1>' + description +
-        '<p class="legend">' + legend + '</p><div class="views">' + views.join('') + '</div></section>';
+        '<p class="legend">' + legend + '</p><div class="views">' + views.join('') + '</div></section>' +
+        (partName ? '' : detailSheets(pass));
     }).join('');
   }
 
@@ -125,8 +146,9 @@ export function renderGuideDocument(guide: GuideExport) {
   .pass { break-before: page; }
   .legend { color: #52635b; margin: 3mm 0 4mm; }
   .views { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4mm; }
+  .details { margin-top: 4mm; }
   figure { margin: 0; border: 1px solid #cdd8d0; border-radius: 2mm; overflow: hidden; break-inside: avoid; }
-  figcaption { text-align: center; background: #edf1ec; font-weight: 600; padding: 1.5mm 0; }
+  figcaption { text-align: center; background: #edf1ec; font-weight: 600; padding: 1.5mm 2mm; overflow-wrap: anywhere; }
   .view { position: relative; }
   img { width: 100%; aspect-ratio: 1; display: block; }
   .number { display: inline-flex; min-width: 5mm; height: 5mm; padding: 0 0.9mm; align-items: center; justify-content: center;

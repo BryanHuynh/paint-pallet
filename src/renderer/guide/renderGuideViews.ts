@@ -6,13 +6,9 @@ import { poseMatrix } from '../kit/jointMath';
 import { computeOrientationQuaternion } from '../orientation';
 import type { ToneAssignment, ToneMask } from '../paint/lightingState';
 import type { ShadowCoverage, ShadowHit } from '../paint/shadowPaint';
+import { frameGuideDetail, GUIDE_DIRECTIONS, measureGuideDetail } from './guideDetailFrame';
 
-const pinPosition = (value: number) => THREE.MathUtils.clamp(value, .04, .96);
-
-const DIRECTIONS = [
-  new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0, -1),
-  new THREE.Vector3(-1, 0, 0), new THREE.Vector3(1, 0, 0),
-];
+const DIRECTIONS = GUIDE_DIRECTIONS.slice(0, GUIDE_VIEWS.length);
 
 function boundsOf(model: ModelSummary) {
   return new THREE.Box3(new THREE.Vector3(...model.bounds.min), new THREE.Vector3(...model.bounds.max));
@@ -85,8 +81,7 @@ interface GuideRenderOptions {
   rows: GuideExport['rows'];
   preview: boolean;
   signal: AbortSignal;
-  focusPasses?: boolean;
-  mapCallouts?: (pass: GuidePass, remap: (callout: GuideCallout) => GuideCallout | null) => void;
+  detailCallouts?: readonly GuideCallout[];
 }
 
 export function passIncludesFace(pass: GuidePass, hit?: ShadowHit, tone?: ToneAssignment, edge?: ShadowHit): boolean {
@@ -96,9 +91,96 @@ export function passIncludesFace(pass: GuidePass, hit?: ShadowHit, tone?: ToneAs
   return tone?.regionId === hit.regionId && (pass === 'midtone' || tone.tone === 'highlight');
 }
 
-export async function renderGuideViews({
-  readBatch, model, parts, orientation, coverage, tones, edges, rows, preview, signal, focusPasses = false, mapCallouts,
-}: GuideRenderOptions) {
+type GuideSource = { model: ModelSummary; address: typeof ANCHOR_ADDRESS; matrix: THREE.Matrix4 };
+
+async function renderDetails(options: GuideRenderOptions, sources: GuideSource[], passes: GuidePass[],
+  overview: THREE.OrthographicCamera[], render: (scene: THREE.Scene, camera: THREE.Camera, color: THREE.Color) => string) {
+  const { rows, coverage, tones, edges, detailCallouts, readBatch, signal } = options;
+  const details: NonNullable<GuideExport['details']> = {};
+  if (!detailCallouts) return details;
+  type RegionBatch = { filePath: string; matrix: THREE.Matrix4; faceOffset: number; batchIndex: number; hits: ShadowHit[] };
+  const regions = new Map(rows.map((row) => [row.id, [] as RegionBatch[]]));
+  for (const source of sources) {
+    for (const batch of source.model.batches) {
+      const batchIndex = batch.batchIndex + source.address.batchOffset;
+      const batches = new Map<string, RegionBatch>();
+      for (const hit of coverage.get(batchIndex)?.values() ?? []) {
+        const region = regions.get(hit.regionId);
+        if (!region) continue;
+        let entry = batches.get(hit.regionId);
+        if (!entry) {
+          entry = { filePath: batch.filePath, matrix: source.matrix, faceOffset: source.address.faceOffset, batchIndex, hits: [] };
+          batches.set(hit.regionId, entry);
+          region.push(entry);
+        }
+        entry.hits.push(hit);
+      }
+    }
+  }
+
+  const vertex = new THREE.Vector3();
+  for (const row of rows) {
+    const batches = regions.get(row.id)!;
+    if (!batches.length) continue;
+    const chunks = [];
+    for (const batch of batches) {
+      signal.throwIfAborted();
+      const data = await readBatch(batch.filePath);
+      signal.throwIfAborted();
+      const hits = batch.hits.filter(({ triangleIndex, faceId }) => data.faceIds[triangleIndex] + batch.faceOffset === faceId);
+      const positions = new Float32Array(hits.length * 9);
+      hits.forEach(({ triangleIndex }, i) => {
+        for (let offset = 0; offset < 9; offset += 3) {
+          vertex.fromArray(data.positions, triangleIndex * 9 + offset).applyMatrix4(batch.matrix).toArray(positions, i * 9 + offset);
+        }
+      });
+      chunks.push({ hits, positions, shades: tones.get(batch.batchIndex), band: edges?.get(batch.batchIndex) });
+    }
+
+    const callouts = detailCallouts.filter((callout) => callout.regionId === row.id);
+    for (const pass of passes) {
+      const swatch = pass === 'edge' ? row.edgeSwatch : row.swatches?.[pass];
+      const color = new THREE.Color(swatch?.hex ?? (pass === 'edge' ? 0x48a887 : 0xd6dbd7));
+      const material = new THREE.MeshBasicMaterial({ color, side: THREE.DoubleSide, toneMapped: false });
+      const scene = new THREE.Scene();
+      const geometries: THREE.BufferGeometry[] = [];
+      try {
+        for (const { hits, positions, shades, band } of chunks) {
+          const selected: number[] = [];
+          hits.forEach((hit, i) => {
+            if (passIncludesFace(pass, hit, shades?.get(hit.faceId), band?.get(hit.faceId))) {
+              selected.push(i * 3, i * 3 + 1, i * 3 + 2);
+            }
+          });
+          if (!selected.length) continue;
+          const geometry = new THREE.BufferGeometry();
+          geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+          geometry.setIndex(new THREE.BufferAttribute(Uint32Array.from(selected), 1));
+          geometries.push(geometry);
+          const mesh = new THREE.Mesh(geometry, material);
+          mesh.frustumCulled = false;
+          scene.add(mesh);
+        }
+        if (!geometries.length) continue;
+        const frame = measureGuideDetail(geometries);
+        if (!frame.area.some((area) => area > 0)) continue;
+        const cards = details[pass] ??= [];
+        for (const callout of callouts.length ? callouts : [undefined]) {
+          signal.throwIfAborted();
+          const { camera, ...position } = frameGuideDetail(geometries, frame, overview, callout);
+          cards.push({ ...position, regionId: row.id, image: render(scene, camera, color) });
+        }
+      } finally {
+        for (const geometry of geometries) geometry.dispose();
+        material.dispose();
+      }
+    }
+  }
+  return details;
+}
+
+export async function renderGuideViews(options: GuideRenderOptions) {
+  const { readBatch, model, parts, orientation, coverage, tones, edges, rows, preview, signal, detailCallouts } = options;
   const side = preview ? 384 : 1000;
   const passes: GuidePass[] = preview ? ['shadow'] : [...GUIDE_PASSES];
   if (edges?.size && !preview && (!parts?.length || parts.some((part) =>
@@ -111,47 +193,6 @@ export async function renderGuideViews({
   const sources = parts?.length
     ? parts.map((part) => ({ model: part.model, address: part, matrix: orientationMatrix.clone().multiply(poseMatrix(part.pose)) }))
     : [{ model, address: ANCHOR_ADDRESS, matrix: orientationMatrix }];
-  const boundsByPass = passes.map(() => new THREE.Box3());
-  const regionsByPass = passes.map(() => new Set<string>());
-  if (focusPasses) {
-    const vertex = new THREE.Vector3();
-    for (const source of sources) {
-      for (const batch of source.model.batches) {
-        const batchIndex = batch.batchIndex + source.address.batchOffset;
-        const faces = coverage.get(batchIndex);
-        if (!faces?.size) continue;
-        signal.throwIfAborted();
-        const { positions, faceIds } = await readBatch(batch.filePath);
-        const shades = tones.get(batchIndex);
-        const band = edges?.get(batchIndex);
-        for (const hit of faces.values()) {
-          if (faceIds[hit.triangleIndex] + source.address.faceOffset !== hit.faceId) continue;
-          passes.forEach((pass, passIndex) => {
-            if (!passIncludesFace(pass, hit, shades?.get(hit.faceId), band?.get(hit.faceId))) return;
-            regionsByPass[passIndex].add(hit.regionId);
-            for (let offset = 0; offset < 9; offset += 3) {
-              boundsByPass[passIndex].expandByPoint(
-                vertex.fromArray(positions, hit.triangleIndex * 9 + offset).applyMatrix4(source.matrix),
-              );
-            }
-          });
-        }
-      }
-    }
-  }
-  const camerasByPass = passes.map((pass, index) => {
-    const bounds = boundsByPass[index];
-    const cameras = bounds.isEmpty() ? fullCameras : createCameras(bounds);
-    if (focusPasses) mapCallouts?.(pass, (callout) => {
-      if (!regionsByPass[index].has(callout.regionId)) return null;
-      const viewIndex = GUIDE_VIEWS.indexOf(callout.view);
-      if (viewIndex < 0) return null;
-      const p = new THREE.Vector3(callout.x * 2 - 1, 1 - callout.y * 2, 0)
-        .unproject(fullCameras[viewIndex]).project(cameras[viewIndex]);
-      return { ...callout, x: pinPosition((1 + p.x) / 2), y: pinPosition((1 - p.y) / 2) };
-    });
-    return cameras;
-  });
   const output = document.createElement('canvas');
   output.width = output.height = side;
   const renderer = new THREE.WebGLRenderer({ powerPreference: 'high-performance', alpha: false });
@@ -161,11 +202,13 @@ export async function renderGuideViews({
   mesh.frustumCulled = false;
   const scene = new THREE.Scene();
   scene.add(mesh);
-  const targets = camerasByPass.map((cameras) => cameras.map(() => {
+  const makeTarget = () => {
     const target = new THREE.WebGLRenderTarget(side, side, { colorSpace: THREE.SRGBColorSpace });
     target.samples = Math.min(4, renderer.capabilities.maxSamples);
     return target;
-  }));
+  };
+  const targets = passes.map(() => fullCameras.map(makeTarget));
+  const detailTarget = detailCallouts ? makeTarget() : null;
   renderer.setClearColor(0xffffff, 1);
   renderer.autoClear = false;
   const swatches = new Map(rows.map(({ id, swatches, edgeSwatch }) => {
@@ -187,7 +230,6 @@ export async function renderGuideViews({
       for (const batch of source.model.batches) {
         const batchIndex = batch.batchIndex + source.address.batchOffset;
         const faces = coverage.get(batchIndex);
-        if (focusPasses && !faces?.size) continue;
         signal.throwIfAborted();
         const data = await readBatch(batch.filePath);
         signal.throwIfAborted();
@@ -198,7 +240,6 @@ export async function renderGuideViews({
         const faceColors = passes.map(() => new Float32Array(data.positions.length));
         const shades = tones.get(batchIndex);
         const band = edges?.get(batchIndex);
-        const passIndices = passes.map((): number[] => []);
         for (let i = 0; i < data.faceIds.length; i++) {
           const id = data.faceIds[i] + source.address.faceOffset;
           const hit = faces?.get(id);
@@ -210,10 +251,6 @@ export async function renderGuideViews({
           for (let index = 0; index < passes.length; index++) {
             const pass = passes[index];
             const covered = passIncludesFace(pass, hit, shade, band?.get(id));
-            if (focusPasses) {
-              if (!covered) continue;
-              passIndices[index].push(i * 3, i * 3 + 1, i * 3 + 2);
-            }
             const color = covered ? palette?.get(pass) ?? (pass === 'edge' ? missingEdgeSwatch : neutral) : neutral;
             const strength = color === neutral ? relief : 1;
             const array = faceColors[index];
@@ -227,31 +264,37 @@ export async function renderGuideViews({
         const colorAttribute = new THREE.BufferAttribute(new Float32Array(data.positions.length), 3).setUsage(THREE.DynamicDrawUsage);
         geometry.setAttribute('color', colorAttribute);
         passes.forEach((_pass, passIndex) => {
-          if (focusPasses && !passIndices[passIndex].length) return;
-          const index = focusPasses ? new THREE.BufferAttribute(Uint32Array.from(passIndices[passIndex]), 1) : null;
-          geometry.setIndex(index);
           colorAttribute.array.set(faceColors[passIndex]);
           colorAttribute.needsUpdate = true;
-          camerasByPass[passIndex].forEach((camera, viewIndex) => {
+          fullCameras.forEach((camera, viewIndex) => {
             renderer.setRenderTarget(targets[passIndex][viewIndex]);
             renderer.render(scene, camera);
           });
-          if (index) {
-            // Three.js releases the live index on dispose. Retire each pass's index before replacing it.
-            geometry.dispose();
-          }
         });
       }
     }
     passes.forEach((pass, index) => {
       images[pass] = targets[index].map((target) => toPng(renderer, target, output));
     });
-    return images;
+    renderer.setRenderTarget(null);
+    for (const target of targets.flat()) target.dispose();
+    targets.length = 0;
+    mesh.geometry.dispose();
+    const details = detailTarget ? await renderDetails(options, sources, passes, fullCameras, (detail, camera, color) => {
+      renderer.setRenderTarget(detailTarget);
+      // Choose a background that keeps pale and dark swatches visible in print.
+      renderer.setClearColor(color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722 > 0.4 ? 0x889891 : 0xf1f4f2);
+      renderer.clear();
+      renderer.render(detail, camera);
+      return toPng(renderer, detailTarget, output);
+    }) : undefined;
+    return { images, details };
   } finally {
     renderer.setRenderTarget(null);
     mesh.geometry.dispose();
     material.dispose();
     for (const target of targets.flat()) target.dispose();
+    detailTarget?.dispose();
     renderer.dispose();
     renderer.forceContextLoss();
   }

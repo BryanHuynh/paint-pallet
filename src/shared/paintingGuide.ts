@@ -22,6 +22,14 @@ export interface GuideRow {
 
 export type GuideImages = Record<ToneSlot, string[]> & { edge?: string[] };
 
+export interface GuideDetail {
+  regionId: string;
+  view: GuideView | 'Top' | 'Bottom';
+  image: string;
+  x: number;
+  y: number;
+}
+
 export interface InstallationStepView {
   incoming: string;
   parent: string;
@@ -37,8 +45,7 @@ export interface GuideExport {
   snapshot: string;
   rows: GuideRow[];
   callouts: GuideCallout[];
-  focusedPasses?: boolean;
-  passCallouts?: Partial<Record<GuidePass, GuideCallout[]>>;
+  details?: Partial<Record<GuidePass, GuideDetail[]>>;
   installationViews?: string[];
   images: GuideImages;
   installation?: InstallationStepView[];
