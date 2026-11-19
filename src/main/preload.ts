@@ -32,6 +32,7 @@ const api: PaintPalletApi = {
   cancelConnectedFill: (jobId: string) => ipcRenderer.invoke('worker:cancel-fill', jobId),
   computeLightExposure: (request: ExposureRequest) => ipcRenderer.invoke('worker:light-exposure', request),
   cancelLightExposure: (jobId: string) => ipcRenderer.invoke('worker:cancel-light', jobId),
+  generateVisionRecipes: (request) => ipcRenderer.invoke('palette:generate-vision-recipes', request),
   saveProject: (request: ProjectSaveRequest) => ipcRenderer.invoke('project:save', request),
   exportPaintingGuide: (guide) => ipcRenderer.invoke('guide:export', guide),
   openProject: () => ipcRenderer.invoke('project:open'),

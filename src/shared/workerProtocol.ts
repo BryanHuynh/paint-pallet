@@ -2,6 +2,7 @@ import type { OpenedProject, ProjectSaveRequest } from './paintProject';
 
 import type { PartPose } from './kit';
 import type { GuideExport } from './paintingGuide';
+import type { VisionRecipeRequest, VisionRecipeResult } from './visionRecipes';
 
 export type Vec3 = [number, number, number];
 
@@ -120,6 +121,7 @@ export interface PaintPalletApi {
   previewRidgeBand?: (request: RidgeBandRequest) => Promise<Uint32Array>;
   computeLightExposure?: (request: ExposureRequest) => Promise<Float32Array>;
   cancelLightExposure?: (jobId: string) => Promise<{ canceled: boolean }>;
+  generateVisionRecipes?: (request: VisionRecipeRequest) => Promise<VisionRecipeResult>;
   saveProject?: (request: ProjectSaveRequest) => Promise<boolean>;
   exportPaintingGuide?: (guide: GuideExport) => Promise<boolean>;
   openProject?: () => Promise<OpenedProject | null>;
