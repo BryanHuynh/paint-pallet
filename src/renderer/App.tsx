@@ -116,16 +116,19 @@ export default function App({
   })) : undefined, [parts, isolatedPartId, ghostPart?.id, assembly.draft?.pose]);
   const [aimingLight, setAimingLight] = useState(false);
   const [previewBeforeFill, setPreviewBeforeFill] = useState(false);
-  const fill = useConnectedFill(api, canPaintPart && !assembly.draft && !aimingLight && shadow.tool === 'fill' && Boolean(shadow.recipe),
-    displayModel?.modelId, shadow.region?.id, shadow.committedCoverage, paintPart, previewBeforeFill);
-  const committedFills = useRef(new WeakSet<Uint32Array>());
-  useEffect(() => {
-    if (previewBeforeFill || !fill.packed || committedFills.current.has(fill.packed)) return;
-    committedFills.current.add(fill.packed);
-    shadow.commitFill(unpackFillFaces(fill.packed, paintPart));
-    fill.cancel();
-  }, [previewBeforeFill, fill.packed, paintPart, shadow.commitFill, fill.cancel]);
   const [pendingModel, setPendingModel] = useState<ModelSummary | null>(null);
+  const [isImporting, setIsImporting] = useState(false);
+  const [isCommitting, setIsCommitting] = useState(false);
+  const isBusy = isImporting || kitImporting || Boolean(pendingModel) || isCommitting || projectAction !== null;
+  const fillEnabled = canPaintPart && !assembly.draft && !aimingLight && !isImporting && !kitImporting &&
+    !pendingModel && projectAction !== 'open' && shadow.tool === 'fill' && Boolean(shadow.recipe);
+  const fill = useConnectedFill(api, fillEnabled, displayModel?.modelId, shadow.region?.id,
+    shadow.committedCoverage, paintPart, previewBeforeFill, shadow.commitFill);
+  const fillPickVersion = useRef(0);
+  function cancelFill() {
+    ++fillPickVersion.current;
+    fill.cancel();
+  }
   const [orientation, setOrientation] = useState<ModelOrientation>({
     upright: '+Y',
     front: '+Z',
@@ -163,9 +166,7 @@ export default function App({
   }, [fill.previewCoverage, shadow.colors, recipes, shadow.regions]);
   const [pickResult, setPickResult] = useState<PickResult | null>(null);
   const [progress, setProgress] = useState<ImportProgressEvent | null>(null);
-  const [isImporting, setIsImporting] = useState(false);
   const [isDraggingStl, setIsDraggingStl] = useState(false);
-  const [isCommitting, setIsCommitting] = useState(false);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [cameraPresetRequest, setCameraPresetRequest] = useState<{
     preset: CameraPreset;
@@ -180,6 +181,16 @@ export default function App({
   const appModelGenRef = useRef(0);
   const appViewGenRef = useRef(0);
   const pickSeqRef = useRef(0);
+  const pickContext = useMemo(() => ({}), [displayModel, companionParts, fillEnabled, previewBeforeFill,
+    shadow.region?.id, assembly.draft]);
+  const pickContextRef = useRef(pickContext);
+  pickContextRef.current = pickContext;
+  const pendingFillPick = useRef<{
+    context: typeof pickContext;
+    viewGeneration: number;
+    version: number;
+    done: Promise<void>;
+  }>(null);
 
   useEffect(() => {
     if (!api) return;
@@ -394,7 +405,7 @@ export default function App({
 
   function choosePart(part: KitPart, remove?: KitPart) {
     if (pendingModelRef.current || importInFlight.current || part.id === focusId) return;
-    fill.cancel();
+    cancelFill();
     lighting.cancel();
     edge.cancel();
     shadow.setTool(null);
@@ -525,7 +536,7 @@ export default function App({
         activeModelIdRef.current = committed.modelId;
         pendingModelRef.current = null;
         const opened = takePendingProject(committed.modelId);
-        fill.cancel();
+        cancelFill();
         if (opened) {
           const { state, paint, tones, edges } = opened.project;
           setOrientation(state.orientation);
@@ -602,57 +613,77 @@ export default function App({
     setStatusMsg(message);
   }, []);
 
-  const handleSurfacePick = async (
+  const handleSurfacePick = (
     origin: Vec3,
     direction: Vec3,
     batchIndices: number[],
     token: PickGenerationToken,
   ) => {
-    if (!api || !displayModel || token.modelId !== displayModel.modelId) return;
+    if (!api || !displayModel || isBusy || token.modelId !== displayModel.modelId) return;
     const startAppModelGen = appModelGenRef.current;
     const startAppViewGen = appViewGenRef.current;
+    const version = fillPickVersion.current;
+    const directFill = fillEnabled && !previewBeforeFill;
+    const sequence = ++pickSeqRef.current;
     const isCurrent = () =>
       activeModelIdRef.current === token.modelId &&
       appModelGenRef.current === startAppModelGen &&
-      appViewGenRef.current === startAppViewGen;
+      appViewGenRef.current === startAppViewGen &&
+      pickContextRef.current === pickContext &&
+      (!fillEnabled || fillPickVersion.current === version) &&
+      (directFill || pickSeqRef.current === sequence);
 
-    try {
-      const sequence = ++pickSeqRef.current;
-      const result = await api.pickFace(displayModel.modelId, origin, direction, batchIndices);
-      if (sequence !== pickSeqRef.current || !isCurrent()) return;
-      if (result.hit && result.distance !== null && selectedPart &&
-          (assembly.draft || shadow.tool === 'fill')) {
-        const ray = new Ray(new Vector3(...origin), new Vector3(...direction)).applyMatrix4(poseMatrix(selectedPart.pose));
-        const occluders = (companionParts ?? []).flatMap((part) => {
-          if (part.id === selectedPart.id || part.hidden || part.staged || part.id === ghostPart?.id) return [];
-          const local = ray.clone().applyMatrix4(poseMatrix(part.pose).invert());
-          const start = local.origin.toArray();
-          const forward = local.direction.toArray();
-          const batches = findRayIntersectingBatchIndices(part.model.batches, start, forward);
-          return batches.length ? [{ model: part.model, start, forward, batches }] : [];
-        });
-        const hits = await Promise.all(occluders.map(({ model, start, forward, batches }) =>
-          api.pickFace(model.modelId, start, forward, batches)));
-        if (sequence !== pickSeqRef.current || !isCurrent()) return;
-        const distance = result.distance;
-        if (hits.some((hit) => hit.hit && hit.distance !== null && hit.distance < distance - 1e-5)) {
-          setStatusMsg('The selected surface is behind another part. Hide that part or isolate the target.');
-          return;
+    const pick = async () => {
+      if (!isCurrent()) return;
+      try {
+        const result = await api.pickFace(displayModel.modelId, origin, direction, batchIndices);
+        if (!isCurrent()) return;
+        if (result.hit && result.distance !== null && selectedPart &&
+            (assembly.draft || fillEnabled)) {
+          const ray = new Ray(new Vector3(...origin), new Vector3(...direction)).applyMatrix4(poseMatrix(selectedPart.pose));
+          const occluders = (companionParts ?? []).flatMap((part) => {
+            if (part.id === selectedPart.id || part.hidden || part.staged || part.id === ghostPart?.id) return [];
+            const local = ray.clone().applyMatrix4(poseMatrix(part.pose).invert());
+            const start = local.origin.toArray();
+            const forward = local.direction.toArray();
+            const batches = findRayIntersectingBatchIndices(part.model.batches, start, forward);
+            return batches.length ? [{ model: part.model, start, forward, batches }] : [];
+          });
+          const hits = await Promise.all(occluders.map(({ model, start, forward, batches }) =>
+            api.pickFace(model.modelId, start, forward, batches)));
+          if (!isCurrent()) return;
+          const distance = result.distance;
+          if (hits.some((hit) => hit.hit && hit.distance !== null && hit.distance < distance - 1e-5)) {
+            setStatusMsg('The selected surface is behind another part. Hide that part or isolate the target.');
+            return;
+          }
         }
-      }
-      if (assembly.draft && selectedPart) {
-        void assembly.capture(selectedPart, result);
-        setPickResult(result);
-      } else if (canPaintPart && shadow.tool === 'fill' && shadow.region) {
-        if (result.hit && result.originalFaceId !== null && result.partId === displayModel.partId) {
-          fill.select({ modelId: displayModel.modelId, faceId: result.originalFaceId, regionId: shadow.region.id });
+        if (assembly.draft && selectedPart) {
+          void assembly.capture(selectedPart, result);
+          setPickResult(result);
+        } else if (fillEnabled && shadow.region) {
+          if (result.hit && result.originalFaceId !== null && result.partId === displayModel.partId) {
+            fill.select({ modelId: displayModel.modelId, faceId: result.originalFaceId, regionId: shadow.region.id });
+          }
+        } else {
+          setPickResult(result);
         }
-      } else {
-        setPickResult(result);
+      } catch (error) {
+        if (isCurrent()) setStatusMsg(error instanceof Error ? error.message : 'Surface pick failed.');
       }
-    } catch (error) {
-      if (isCurrent()) setStatusMsg(error instanceof Error ? error.message : 'Surface pick failed.');
-    }
+    };
+
+    if (!directFill) return pick();
+    // Preserve click order for Fill so Undo reverses the most recent applied click.
+    const previous = pendingFillPick.current;
+    const sameView = previous?.context === pickContext && previous.viewGeneration === startAppViewGen && previous.version === version;
+    const done = sameView ? previous.done.then(pick) : pick();
+    const pending = { context: pickContext, viewGeneration: startAppViewGen, version, done };
+    pendingFillPick.current = pending;
+    void done.finally(() => {
+      if (pendingFillPick.current === pending) pendingFillPick.current = null;
+    });
+    return done;
   };
 
   const triggerCameraPreset = (preset: CameraPreset) => {
@@ -663,8 +694,6 @@ export default function App({
     progress && progress.totalBytes > 0
       ? Math.min(100, Math.round((progress.bytesRead / progress.totalBytes) * 100))
       : 0;
-
-  const isBusy = isImporting || kitImporting || Boolean(pendingModel) || isCommitting || projectAction !== null;
 
   return (
     <div className="app-shell">
@@ -889,7 +918,8 @@ export default function App({
 
         <aside className="inspector-panel" aria-label="Model inspector">
           {api?.importKitParts && model && (
-            <KitPanel parts={parts} selected={selectedPart} busy={isBusy || Boolean(assembly.draft)}
+            <KitPanel key={model?.modelId} parts={parts} selected={selectedPart} busy={isBusy || Boolean(assembly.draft) ||
+              shadow.strokePending || lighting.brushPending || edge.stroke}
               choose={choosePart} add={addKitParts} confirmPlacement={assembly.confirmPlacement}
               isolated={paintIsolation !== null}
               toggleIsolation={() => {
@@ -910,6 +940,7 @@ export default function App({
             <ShadowPanel
               paint={shadow}
               fill={fill}
+              onCancelFill={cancelFill}
               recipes={recipes}
               busy={isBusy || lighting.brushPending || edge.stroke}
               onToolChange={(tool) => {
@@ -920,12 +951,12 @@ export default function App({
               }}
               previewBeforeFill={previewBeforeFill}
               setPreviewBeforeFill={(value) => {
-                fill.cancel();
+                cancelFill();
                 setPreviewBeforeFill(value);
               }}
               onApplyFill={() => {
                 if (fill.packed) shadow.commitFill(unpackFillFaces(fill.packed, paintPart));
-                fill.cancel();
+                cancelFill();
               }}
             />
           )}
@@ -938,7 +969,7 @@ export default function App({
                   setAimingLight(false);
                   return;
                 }
-                fill.cancel();
+                cancelFill();
                 shadow.setTool(null);
                 edge.cancel();
                 edge.setTool(null);
@@ -946,7 +977,7 @@ export default function App({
                 setAimingLight(true);
               }}
               onAimFromCamera={() => {
-                fill.cancel();
+                cancelFill();
                 shadow.setTool(null);
                 edge.cancel();
                 edge.setTool(null);
@@ -977,7 +1008,7 @@ export default function App({
                 if (tool) {
                   edge.cancel();
                   edge.setTool(null);
-                  fill.cancel();
+                  cancelFill();
                   shadow.setTool(null);
                 }
                 lighting.setBrushTool(tool);
@@ -991,14 +1022,14 @@ export default function App({
               beginPreview={() => {
                 lighting.cancel();
                 lighting.setBrushTool(null);
-                fill.cancel();
+                cancelFill();
                 shadow.setTool(null);
                 edge.start();
               }}
               chooseTool={(tool) => {
                 lighting.cancel();
                 lighting.setBrushTool(null);
-                fill.cancel();
+                cancelFill();
                 shadow.setTool(null);
                 edge.setTool(tool);
               }}
