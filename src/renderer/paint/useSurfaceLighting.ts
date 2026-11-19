@@ -282,7 +282,9 @@ export function useSurfaceLighting(
     selectSnapshot,
     addSnapshot,
     aimLight(direction: Vec3) {
-      setSettings(lightAngles(direction));
+      const angles = lightAngles(direction);
+      const current = snapshotsRef.current.items.find(({ id }) => id === snapshotsRef.current.activeId)!.settings;
+      if (angles.azimuth !== current.azimuth || angles.elevation !== current.elevation) setSettings(angles);
     },
     renameSnapshot: (name: string) => editSnapshot((current) => ({ ...current, name })),
     azimuth, setAzimuth: (value: number) => setSettings({ azimuth: value }),

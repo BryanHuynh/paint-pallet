@@ -135,10 +135,16 @@ export default function App({
   const lighting = useSurfaceLighting(api, model?.modelId, orientation, shadow.committedCoverage,
     attached.length > 1 ? attached.map((part) => ({ modelId: part.model.modelId, pose: part.pose, faceOffset: part.faceOffset })) : undefined,
     layoutKey);
-  const [lightCameraRequest, setLightCameraRequest] = useState(0);
+  const lightCameraSequence = useRef(0);
+  const [lightCameraRequest, setLightCameraRequest] = useState<number | null>(null);
+  const lightDirection = useMemo(() => worldLightDirection(lighting.azimuth, lighting.elevation).toArray(),
+    [lighting.azimuth, lighting.elevation]);
   useEffect(() => {
-    if (!lighting.previewing || !canPaintPart || assembly.draft) setAimingLight(false);
-  }, [lighting.previewing, canPaintPart, assembly.draft]);
+    if (!lighting.previewing || !lighting.hasShadow || !canPaintPart || assembly.draft) {
+      setAimingLight(false);
+      setLightCameraRequest(null);
+    }
+  }, [lighting.previewing, lighting.hasShadow, canPaintPart, assembly.draft]);
   const edge = useEdgeHighlight(api, displayModel?.modelId, lighting.snapshot.id, shadow.region?.id, shadow.committedCoverage, paintPart);
   const guideEdges = useMemo(() => clipEdgeCoverage(edge.committed, shadow.committedCoverage), [edge.committed, shadow.committedCoverage]);
   const coverage = useMemo(() => {
@@ -787,8 +793,8 @@ export default function App({
             highlightPickFace={assembly.draft?.method === 'six-face' && assembly.expectedId === focusId}
             onSurfacePick={handleSurfacePick}
             lightPlacement={{
-              active: aimingLight && lighting.previewing && !assembly.draft,
-              direction: worldLightDirection(lighting.azimuth, lighting.elevation).toArray(),
+              active: aimingLight && lighting.previewing && lighting.hasShadow && canPaintPart && !assembly.draft && !isBusy,
+              direction: lightDirection,
               cameraRequest: lightCameraRequest,
               onDirection: lighting.aimLight,
             }}
@@ -936,6 +942,7 @@ export default function App({
               onAim={() => {
                 if (aimingLight) {
                   setAimingLight(false);
+                  setLightCameraRequest(null);
                   return;
                 }
                 fill.cancel();
@@ -952,7 +959,7 @@ export default function App({
                 edge.setTool(null);
                 lighting.start();
                 setAimingLight(true);
-                setLightCameraRequest((previous) => previous + 1);
+                setLightCameraRequest(++lightCameraSequence.current);
               }}
               busy={isBusy || shadow.strokePending || lighting.brushPending || edge.stroke}
               onSelectSnapshot={(id) => {

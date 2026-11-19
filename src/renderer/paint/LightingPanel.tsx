@@ -67,10 +67,10 @@ export function LightingPanel({
               {aiming ? 'Finish aiming' : 'Aim light in 3D'}
             </button>
             <button type="button" className="btn btn--secondary btn--small" disabled={busy} onClick={onAimFromCamera}>
-              Light from camera
+              Aim from current view
             </button>
           </div>
-          {aiming && <p className="hint-text">Drag in the viewport to move the light. Alt-drag to orbit.</p>}
+          {aiming && <p className="hint-text">Drag the gold ball to aim the light. Drag elsewhere to orbit. Use arrow keys when the ball has focus.</p>}
           <details className="light-angles">
             <summary>Light angles</summary>
             <Slider id="light-azimuth" label="Azimuth" min={0} max={359} value={lighting.azimuth}

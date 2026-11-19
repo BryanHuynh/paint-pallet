@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
+import { Quaternion, Vector3 } from 'three';
 import type { ExposureRequest, PaintPalletApi } from '../../src/shared/workerProtocol';
+import { dragLightDirection } from '../../src/renderer/components/lightHandle';
 import type { ShadowCoverage } from '../../src/renderer/paint/shadowPaint';
 import { lightAngles, useSurfaceLighting, worldLightDirection } from '../../src/renderer/paint/useSurfaceLighting';
 
@@ -19,6 +21,18 @@ describe('directional lighting preview', () => {
     expect(lightAngles([0, 1, 0])).toEqual({ azimuth: 0, elevation: 90 });
     for (const [azimuth, elevation] of [[355, 27], [45, -33], [180, 3]]) {
       expect(lightAngles(worldLightDirection(azimuth, elevation).toArray())).toEqual({ azimuth, elevation });
+    }
+  });
+
+  it('moves the light toward the pointer on both hemispheres of an orbited camera', () => {
+    const camera = new Quaternion().setFromAxisAngle(new Vector3(0, 1, 0), Math.PI / 3);
+    const viewRight = new Vector3(1, 0, 0).applyQuaternion(camera);
+    for (const depth of [-1, 1]) {
+      const direction = new Vector3(0, 0, depth).applyQuaternion(camera).toArray();
+      const next = new Vector3(...dragLightDirection(direction, camera, 60, -60, 600));
+      expect(next.dot(viewRight)).toBeGreaterThan(0.25);
+      expect(next.y).toBeGreaterThan(0.25);
+      expect(next.length()).toBeCloseTo(1);
     }
   });
 

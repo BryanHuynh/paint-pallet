@@ -15,6 +15,7 @@ import { disposeDetailMesh, setShadowOverlay } from '../paint/shadowOverlay';
 import type { ShadowCoverage, SurfaceFace } from '../paint/shadowPaint';
 import { SurfaceBrush } from '../paint/surfaceBrush';
 import { SurfaceBrushPreview } from '../paint/surfaceBrushPreview';
+import { dragLightDirection } from './lightHandle';
 
 export type CameraPreset = 'reset' | 'focus' | 'front' | 'back' | 'top' | 'bottom' | 'right' | 'left';
 
@@ -35,7 +36,7 @@ export interface Viewport3DProps {
   ghostModelId?: string;
   jointMarker?: Vec3;
   highlightPickFace?: boolean;
-  lightPlacement?: { active: boolean; direction: Vec3; cameraRequest: number; onDirection: (direction: Vec3) => void };
+  lightPlacement?: { active: boolean; direction: Vec3; cameraRequest: number | null; onDirection: (direction: Vec3) => void };
   orientation: ModelOrientation;
   cameraPresetRequest: { preset: CameraPreset; seq: number } | null;
   onSurfacePick: (
@@ -300,7 +301,7 @@ export function Viewport3D({
   previewPickRef.current = highlightPickFace;
   const lightPlacementRef = useRef(lightPlacement);
   lightPlacementRef.current = lightPlacement;
-  const handledCameraRequest = useRef(0);
+  const handledCameraRequest = useRef<number | null>(null);
   const onPickRef = useRef(onSurfacePick);
   onPickRef.current = onSurfacePick;
   const shadowPaintRef = useRef(shadowPaint);
@@ -557,7 +558,8 @@ export function Viewport3D({
     const stagedMaterial = new THREE.MeshStandardMaterial({ color: '#83b4a5', roughness: 0.8,
       opacity: 0.38, transparent: true, depthWrite: false, side: THREE.FrontSide });
     const lightHandle = new THREE.Mesh(new THREE.SphereGeometry(1, 24, 16),
-      new THREE.MeshBasicMaterial({ color: '#ffe09b', depthTest: false, depthWrite: false }));
+      new THREE.MeshPhongMaterial({ color: '#ffba52', specular: '#ffeab7', shininess: 30,
+        transparent: true, depthTest: false, depthWrite: false }));
     lightHandle.visible = false;
     lightHandle.renderOrder = 11;
     scene.add(lightHandle);
@@ -569,6 +571,13 @@ export function Viewport3D({
     lightLine.frustumCulled = false;
     lightLine.visible = false;
     scene.add(lightLine);
+    const lightTarget = document.createElement('button');
+    lightTarget.type = 'button';
+    lightTarget.className = 'viewport-light-handle';
+    lightTarget.setAttribute('aria-label', 'Light direction handle');
+    lightTarget.title = 'Drag or use arrow keys to aim the light';
+    lightTarget.hidden = true;
+    container.appendChild(lightTarget);
     const companions = new Map<string, THREE.Group>();
     const marker = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 8),
       new THREE.MeshBasicMaterial({ color: '#ffd17a', depthTest: false, depthWrite: false }));
@@ -685,9 +694,17 @@ export function Viewport3D({
     let downX = 0;
     let downY = 0;
     let strokePointer: number | null = null;
-    let lightDrag: { pointer: number; x: number; y: number; direction: THREE.Vector3; right: THREE.Vector3; up: THREE.Vector3 } | null = null;
-    const lightDirection = new THREE.Vector3();
+    let lightDrag: { pointer: number; x: number; y: number; direction: Vec3; rotation: THREE.Quaternion;
+      lastX: number; lastY: number; height: number } | null = null;
+    let orbitActive = false;
+    const onOrbitStart = () => { orbitActive = true; };
+    const onOrbitEnd = () => { orbitActive = false; };
+    controls.addEventListener('start', onOrbitStart);
+    controls.addEventListener('end', onOrbitEnd);
     const lightCenter = new THREE.Vector3();
+    const lightPosition = new THREE.Vector3();
+    const projectedLight = new THREE.Vector3();
+    const lightBounds = new THREE.Box3();
     let strokeView = 0;
     let lastSample = { x: 0, y: 0 };
     let sampleFrame = 0;
@@ -781,21 +798,14 @@ export function Viewport3D({
       lastSample = next;
     };
     const onPointerDown = (e: PointerEvent) => {
+      if (lightDrag) {
+        e.stopImmediatePropagation();
+        return;
+      }
       if (e.button !== 0) return;
       downX = e.clientX;
       downY = e.clientY;
-      const placement = lightPlacementRef.current;
-      if (placement?.active && !e.altKey) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        camera.updateMatrixWorld();
-        lightDrag = { pointer: e.pointerId, x: e.clientX, y: e.clientY,
-          direction: new THREE.Vector3(...placement.direction),
-          right: new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0),
-          up: new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1) };
-        canvas.setPointerCapture(e.pointerId);
-        return;
-      }
+      if (lightPlacementRef.current?.active) return;
       const paint = shadowPaintRef.current;
       if (!paint?.enabled || e.altKey) return;
 
@@ -830,15 +840,6 @@ export function Viewport3D({
       sampleBrush(lastSample);
     };
     const onPointerMove = (e: PointerEvent) => {
-      if (lightDrag?.pointer === e.pointerId) {
-        e.stopImmediatePropagation();
-        const sensitivity = Math.PI / Math.max(180, canvas.clientHeight);
-        const next = lightDrag.direction.clone()
-          .applyAxisAngle(lightDrag.up, (e.clientX - lightDrag.x) * sensitivity)
-          .applyAxisAngle(lightDrag.right, (e.clientY - lightDrag.y) * sensitivity);
-        if (lightPlacementRef.current?.active) lightPlacementRef.current.onDirection(next.toArray());
-        return;
-      }
       moveBrushHover(e);
       if (e.pointerId !== strokePointer) return;
       e.stopImmediatePropagation();
@@ -852,11 +853,6 @@ export function Viewport3D({
       });
     };
     const onPointerUp = (e: PointerEvent) => {
-      if (lightDrag?.pointer === e.pointerId) {
-        onPointerMove(e);
-        lightDrag = null;
-        return;
-      }
       if (e.pointerId === strokePointer) {
         e.stopImmediatePropagation();
         if (e.clientX !== lastSample.x || e.clientY !== lastSample.y) {
@@ -865,18 +861,67 @@ export function Viewport3D({
         if (strokePointer !== null) endStroke(true);
         return;
       }
-      if (e.button !== 0 || e.altKey || shadowPaintRef.current?.enabled) return;
+      if (e.button !== 0 || e.altKey || shadowPaintRef.current?.enabled || lightPlacementRef.current?.active) return;
       if (Math.hypot(e.clientX - downX, e.clientY - downY) <= 4) pickAt(e);
     };
     const onPointerCancel = (e: PointerEvent) => {
-      if (lightDrag?.pointer === e.pointerId) lightDrag = null;
       if (e.pointerId === strokePointer) endStroke(false);
       clearBrushHover();
     };
-    const onStrokeWheel = (event: WheelEvent) => {
-      if (strokePointer === null) return;
+    const onGestureWheel = (event: WheelEvent) => {
+      if (strokePointer === null && !lightDrag) return;
       event.preventDefault();
       event.stopImmediatePropagation();
+    };
+    const endLightDrag = () => {
+      if (!lightDrag) return;
+      const { pointer } = lightDrag;
+      lightDrag = null;
+      delete lightTarget.dataset.dragging;
+      if (lightTarget.hasPointerCapture(pointer)) lightTarget.releasePointerCapture(pointer);
+    };
+    const onLightDown = (event: PointerEvent) => {
+      const placement = lightPlacementRef.current;
+      if (event.button !== 0 || !placement?.active || lightDrag || orbitActive || strokePointer !== null) return;
+      event.preventDefault();
+      lightTarget.focus({ preventScroll: true });
+      clearBrushHover();
+      lightTarget.setPointerCapture(event.pointerId);
+      lightTarget.dataset.dragging = '';
+      lightDrag = {
+        pointer: event.pointerId, x: event.clientX, y: event.clientY, direction: placement.direction,
+        rotation: camera.getWorldQuaternion(new THREE.Quaternion()), height: canvas.clientHeight,
+        lastX: event.clientX, lastY: event.clientY,
+      };
+    };
+    const onLightMove = (event: PointerEvent) => {
+      const placement = lightPlacementRef.current;
+      const drag = lightDrag;
+      if (!placement?.active || drag?.pointer !== event.pointerId ||
+          (drag.lastX === event.clientX && drag.lastY === event.clientY)) return;
+      drag.lastX = event.clientX;
+      drag.lastY = event.clientY;
+      placement.onDirection(dragLightDirection(drag.direction, drag.rotation,
+        event.clientX - drag.x, event.clientY - drag.y, drag.height));
+    };
+    const onLightUp = (event: PointerEvent) => {
+      if (lightDrag?.pointer !== event.pointerId) return;
+      onLightMove(event);
+      endLightDrag();
+    };
+    const onLightCancel = (event: PointerEvent) => {
+      if (lightDrag?.pointer === event.pointerId) endLightDrag();
+    };
+    const onLightKey = (event: KeyboardEvent) => {
+      const placement = lightPlacementRef.current;
+      if (!placement?.active || lightDrag || orbitActive) return;
+      const x = Number(event.key === 'ArrowRight') - Number(event.key === 'ArrowLeft');
+      const y = Number(event.key === 'ArrowDown') - Number(event.key === 'ArrowUp');
+      if (!x && !y) return;
+      event.preventDefault();
+      const step = (event.shiftKey ? 10 : 3) * Math.max(180, canvas.clientHeight) / 180;
+      placement.onDirection(dragLightDirection(placement.direction, camera.getWorldQuaternion(new THREE.Quaternion()),
+        x * step, y * step, canvas.clientHeight));
     };
     canvas.addEventListener('pointerdown', onPointerDown, true);
     canvas.addEventListener('pointermove', onPointerMove, true);
@@ -884,10 +929,17 @@ export function Viewport3D({
     canvas.addEventListener('pointercancel', onPointerCancel, true);
     canvas.addEventListener('lostpointercapture', onPointerCancel);
     canvas.addEventListener('pointerleave', clearBrushHover);
-    canvas.addEventListener('wheel', onStrokeWheel, { capture: true, passive: false });
+    container.addEventListener('wheel', onGestureWheel, { capture: true, passive: false });
+    lightTarget.addEventListener('pointerdown', onLightDown);
+    lightTarget.addEventListener('pointermove', onLightMove);
+    lightTarget.addEventListener('pointerup', onLightUp);
+    lightTarget.addEventListener('pointercancel', onLightCancel);
+    lightTarget.addEventListener('lostpointercapture', onLightCancel);
+    lightTarget.addEventListener('keydown', onLightKey);
 
     const resizeObserver = new ResizeObserver(() => {
       if (strokePointer !== null) endStroke(false);
+      endLightDrag();
       const w = container.clientWidth || 800;
       const h = container.clientHeight || 600;
       camera.aspect = w / h;
@@ -899,23 +951,44 @@ export function Viewport3D({
     let rafId = 0;
     const animate = () => {
       rafId = window.requestAnimationFrame(animate);
-      controls.update();
       const placement = lightPlacementRef.current;
-      const radius = sceneRefs.current?.radius ?? 1;
-      lightCenter.set(0, radius * .5, 0);
-      if (placement && placement.cameraRequest !== handledCameraRequest.current) {
-        handledCameraRequest.current = placement.cameraRequest;
-        camera.getWorldDirection(lightDirection).negate();
-        placement.onDirection(lightDirection.toArray());
-      }
-      lightHandle.visible = lightLine.visible = Boolean(placement?.active && activeModelRef.current);
-      if (placement?.active) {
-        lightHandle.position.copy(lightCenter).addScaledVector(lightDirection.fromArray(placement.direction), radius * .85);
-        lightHandle.scale.setScalar(radius * .042);
+      if (!placement?.active) endLightDrag();
+      if (!lightDrag) controls.update();
+      const bounds = activeModelRef.current?.bounds;
+      lightHandle.visible = lightLine.visible = false;
+      if (placement?.active && bounds && surfaceGroup.visible) {
+        if (placement.cameraRequest !== null && placement.cameraRequest !== handledCameraRequest.current) {
+          handledCameraRequest.current = placement.cameraRequest;
+          placement.onDirection(camera.getWorldDirection(lightPosition).negate().toArray());
+        }
+        lightBounds.min.fromArray(bounds.min);
+        lightBounds.max.fromArray(bounds.max);
+        const radius = Math.max(.5, lightBounds.getSize(lightPosition).length() * .5);
+        surfaceGroup.localToWorld(lightBounds.getCenter(lightCenter));
+
+        camera.updateMatrixWorld();
+        const projectionScale = camera.projectionMatrix.elements[5];
+        const centerDepth = -projectedLight.copy(lightCenter).applyMatrix4(camera.matrixWorldInverse).z;
+        const viewHalfSize = Math.max(0, centerDepth) * Math.min(1, camera.aspect) / projectionScale;
+        const armLength = Math.min(radius * .9, viewHalfSize * .75);
+        lightHandle.position.copy(lightCenter).addScaledVector(lightPosition.fromArray(placement.direction), armLength);
+        projectedLight.copy(lightHandle.position).applyMatrix4(camera.matrixWorldInverse);
+        const depth = -projectedLight.z;
+        const height = canvas.clientHeight;
+        if (height > 0 && depth >= camera.near && depth <= camera.far) {
+          projectedLight.applyMatrix4(camera.projectionMatrix);
+          lightHandle.scale.setScalar(18 * depth / (height * projectionScale));
+          lightTarget.style.left = `${(projectedLight.x + 1) * 50}%`;
+          lightTarget.style.top = `${(1 - projectedLight.y) * 50}%`;
+          lightHandle.visible = Math.abs(projectedLight.x) <= 1 && Math.abs(projectedLight.y) <= 1;
+        }
+        lightLine.visible = true;
         lightLinePoints.setXYZ(0, lightCenter.x, lightCenter.y, lightCenter.z);
         lightLinePoints.setXYZ(1, lightHandle.position.x, lightHandle.position.y, lightHandle.position.z);
         lightLinePoints.needsUpdate = true;
       }
+      // Keep capture while the pointer leads the projected ball outside the viewport.
+      lightTarget.hidden = !lightHandle.visible && !lightDrag;
       const surfaceDetail = detailGroup.visible ? 'original' : 'preview';
       if (canvas.dataset.surfaceDetail !== surfaceDetail) canvas.dataset.surfaceDetail = surfaceDetail;
       const paint = shadowPaintRef.current;
@@ -935,7 +1008,9 @@ export function Viewport3D({
       canvas.removeEventListener('pointercancel', onPointerCancel, true);
       canvas.removeEventListener('lostpointercapture', onPointerCancel);
       canvas.removeEventListener('pointerleave', clearBrushHover);
-      canvas.removeEventListener('wheel', onStrokeWheel, true);
+      container.removeEventListener('wheel', onGestureWheel, true);
+      endLightDrag();
+      lightTarget.remove();
       if (strokePointer !== null) endStroke(false);
       brush.dispose();
       faceOutlineGeometry.dispose();
