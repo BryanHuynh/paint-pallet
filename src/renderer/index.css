@@ -253,8 +253,30 @@ body,
 }
 
 .viewport-canvas {
+  position: relative;
   width: 100%;
   height: 100%;
+}
+
+.viewport-light-handle {
+  position: absolute;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  transform: translate(-50%, -50%);
+  cursor: grab;
+  touch-action: none;
+}
+
+.viewport-light-handle:focus-visible {
+  outline: 2px solid #ffdf9b;
+}
+
+.viewport-light-handle[data-dragging] {
+  cursor: grabbing;
 }
 
 .stl-drop-overlay {
