@@ -23,7 +23,7 @@ function Slider({
 }
 
 export function LightingPanel({
-  lighting, busy, brushSize, onBrushSize, onChooseBrush, onSelectSnapshot, onAddSnapshot, onPreview,
+  lighting, busy, brushSize, onBrushSize, onChooseBrush, onSelectSnapshot, onAddSnapshot, onPreview, aiming, onAim, onAimFromCamera,
 }: {
   lighting: ReturnType<typeof useSurfaceLighting>;
   busy: boolean;
@@ -33,6 +33,9 @@ export function LightingPanel({
   onSelectSnapshot?: (id: string) => void;
   onAddSnapshot?: (duplicate: boolean) => void;
   onPreview?: () => void;
+  aiming?: boolean;
+  onAim?: () => void;
+  onAimFromCamera?: () => void;
 }) {
   return (
     <section className="inspector-section" aria-label="Lighting">
@@ -59,10 +62,22 @@ export function LightingPanel({
       </div>
       {lighting.hasShadow ? (
         <>
-          <Slider id="light-azimuth" label="Azimuth" min={0} max={359} value={lighting.azimuth}
-            unit="°" onChange={lighting.setAzimuth} />
-          <Slider id="light-elevation" label="Elevation" min={-90} max={90} value={lighting.elevation}
-            unit="°" onChange={lighting.setElevation} />
+          <div className="shadow-tools">
+            <button type="button" className="btn btn--secondary btn--small" disabled={busy} aria-pressed={aiming} onClick={onAim}>
+              {aiming ? 'Finish aiming' : 'Aim light in 3D'}
+            </button>
+            <button type="button" className="btn btn--secondary btn--small" disabled={busy} onClick={onAimFromCamera}>
+              Light from camera
+            </button>
+          </div>
+          {aiming && <p className="hint-text">Drag in the viewport to move the light. Alt-drag to orbit.</p>}
+          <details className="light-angles">
+            <summary>Light angles</summary>
+            <Slider id="light-azimuth" label="Azimuth" min={0} max={359} value={lighting.azimuth}
+              unit="°" onChange={lighting.setAzimuth} />
+            <Slider id="light-elevation" label="Elevation" min={-90} max={90} value={lighting.elevation}
+              unit="°" onChange={lighting.setElevation} />
+          </details>
           <Slider id="light-midtone" label="Midtone cutoff" min={0} max={100} value={lighting.midtone}
             unit="%" onChange={lighting.setMidtone} />
           <Slider id="light-highlight" label="Highlight cutoff" min={0} max={100} value={lighting.highlight}

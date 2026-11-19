@@ -46,6 +46,7 @@ function validateKit(value: unknown): asserts value is KitState {
   if (!isRecord(value) || !Array.isArray(value.parts) || !value.parts.length || !Array.isArray(value.joints) ||
     !value.parts.every((part) => isRecord(part) && nonemptyId(part.id) && typeof part.name === 'string' &&
       nonemptyId(part.sourceName) && typeof part.staged === 'boolean' && typeof part.hidden === 'boolean' &&
+      (part.placementConfirmed === undefined || (part.placementConfirmed === true && !part.staged)) &&
       [part.faceOffset, part.batchOffset].every((offset) => offset === undefined ||
         (typeof offset === 'number' && Number.isSafeInteger(offset) && offset >= 0 && offset <= 0xffffffff)) &&
       isRecord(part.pose) && finiteTuple(part.pose.translation, 3) && finiteTuple(part.pose.rotation, 4) &&
@@ -54,7 +55,7 @@ function validateKit(value: unknown): asserts value is KitState {
   }
   const parts = new Map(value.parts.map((part) => [part.id, part]));
   const anchor = value.parts[0];
-  if (parts.size !== value.parts.length || anchor.staged ||
+  if (parts.size !== value.parts.length || anchor.staged || anchor.placementConfirmed ||
     (anchor.faceOffset ?? 0) !== 0 || (anchor.batchOffset ?? 0) !== 0 ||
     anchor.pose.translation.some((axis: number) => axis !== 0) ||
     anchor.pose.rotation.some((axis: number, index: number) => axis !== (index === 3 ? 1 : 0))) {
@@ -66,7 +67,7 @@ function validateKit(value: unknown): asserts value is KitState {
     if (!isRecord(joint) || !nonemptyId(joint.childId) || !nonemptyId(joint.parentId) || !finiteTuple(joint.point, 3) ||
       !['authored', 'six-face', 'manual', 'nearby'].some((method) => method === joint.method) ||
       joint.childId === anchor.id || !parts.has(joint.childId) || !parts.has(joint.parentId) ||
-      parts.get(joint.childId)?.staged || parts.get(joint.parentId)?.staged || parents.has(joint.childId)) {
+      parts.get(joint.childId)?.staged || parts.get(joint.childId)?.placementConfirmed || parts.get(joint.parentId)?.staged || parents.has(joint.childId)) {
       throw new Error('Invalid kit attachment.');
     }
     parents.set(joint.childId, joint.parentId);
@@ -86,11 +87,13 @@ function validateKit(value: unknown): asserts value is KitState {
     if (part.staged || part.id === anchor.id) continue;
     const visited = new Set<string>();
     let id: string | undefined = part.id;
-    while (id && id !== anchor.id && !visited.has(id)) {
+    while (id && id !== anchor.id && !parts.get(id)?.placementConfirmed && !visited.has(id)) {
       visited.add(id);
       id = parents.get(id);
     }
-    if (id !== anchor.id) throw new Error('Kit attachments must lead back to the anchor.');
+    if (id !== anchor.id && !(id && parts.get(id)?.placementConfirmed)) {
+      throw new Error('Kit attachments must lead back to the anchor or a confirmed placement.');
+    }
   }
 }
 

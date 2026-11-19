@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { openProjectArchive, writeProjectArchive } from '../../src/main/projectArchive';
 import { WorkerClient, readBatchBinary } from '../../src/main/workerClient';
+import { IDENTITY_PART_POSE } from '../../src/shared/kit';
 import type { ProjectContents } from '../../src/shared/paintProject';
 import { writeBinaryStl } from '../fixtures/stlFixture';
 
@@ -80,6 +81,32 @@ describe('portable paint projects', () => {
       expect([...batch.faceIds]).toEqual([0, 1]);
     } finally {
       await worker.dispose();
+      await reopened.cleanup();
+    }
+  });
+
+  it('restores pose-confirmed parts and leaves alternatives staged without inventing joints', async () => {
+    const original = path.join(root, 'anchor.stl');
+    const part = path.join(root, 'selected.stl');
+    const alternate = path.join(root, 'alternate.stl');
+    for (const file of [original, part, alternate]) {
+      writeBinaryStl(file, [{ v1: [0, 0, 0], v2: [1, 0, 0], v3: [0, 1, 0] }]);
+    }
+    const state: ProjectContents['state'] = { ...fixture.state, kit: {
+      parts: [
+        { id: 'anchor', sourceName: 'anchor.stl', name: 'Anchor', staged: false, hidden: false, pose: IDENTITY_PART_POSE },
+        { id: 'part', sourceName: 'selected.stl', name: 'Selected', staged: false, hidden: false,
+          placementConfirmed: true, pose: { rotation: [0, 0, 0, 1], translation: [1, 2, 3] } },
+        { id: 'alternate', sourceName: 'alternate.stl', name: 'Alternate', staged: true, hidden: false, pose: IDENTITY_PART_POSE },
+      ],
+      joints: [],
+    } };
+    const destination = path.join(root, 'assembly.paintproject');
+    await writeProjectArchive(destination, original, 'anchor.stl', { ...fixture, state }, [part, alternate]);
+    const reopened = await openProjectArchive(destination, path.join(root, 'cache'));
+    try {
+      expect(reopened.contents.state.kit).toEqual(state.kit);
+    } finally {
       await reopened.cleanup();
     }
   });

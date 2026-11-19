@@ -217,6 +217,15 @@ export function useKitAssembly(
     cancel();
   }
 
+  function confirmPlacement(ids: readonly string[]) {
+    if (draft) return;
+    const selected = new Set(ids);
+    const confirmed = parts.map((part) => part.staged && selected.has(part.id)
+      ? { ...part, staged: false, placementConfirmed: true as const }
+      : part);
+    if (confirmed.some((part, index) => part !== parts[index])) write(confirmed, joints);
+  }
+
   function keepPose() {
     if (!draft || draft.method !== 'manual') return;
     write(moveKitPart(parts, joints, draft.childId, draft.pose), joints);
@@ -229,7 +238,7 @@ export function useKitAssembly(
     const next = [...joints];
     if (previous < 0) next.push(record);
     else next[previous] = record;
-    write(moveKitPart(parts, joints, draft.childId, draft.pose).map((part) => part.id === draft.childId ? { ...part, staged: false } : part), next);
+    write(moveKitPart(parts, joints, draft.childId, draft.pose).map((part) => part.id === draft.childId ? { ...part, staged: false, placementConfirmed: undefined } : part), next);
   }
 
   function transfer(from: AssemblyEdit[], save: (edit: AssemblyEdit) => void, trim: () => void) {
@@ -241,7 +250,7 @@ export function useKitAssembly(
     const recorded = new Map(next.parts.map((part) => [part.id, part]));
     const restored = parts.map((part) => {
       const earlier = recorded.get(part.id);
-      return earlier ? { ...part, pose: earlier.pose, staged: earlier.staged } : part;
+      return earlier ? { ...part, pose: earlier.pose, staged: earlier.staged, placementConfirmed: earlier.placementConfirmed } : part;
     });
     const ids = new Set(restored.map((part) => part.id));
     setParts(restored);
@@ -271,7 +280,7 @@ export function useKitAssembly(
 
   return {
     joints, draft, overlay, expectedId, error, analyzing, isolated, setIsolated,
-    begin, selectParent, capture, snapNearby, cancel, adjust, adjustManual, back, markPoint, keepPose, confirm, reset,
+    begin, selectParent, capture, snapNearby, cancel, adjust, adjustManual, back, markPoint, keepPose, confirm, confirmPlacement, reset,
     canUndo: undo.length > 0, canRedo: redo.length > 0, picking,
     showPreview() {
       if (draft?.point && draft.method !== 'six-face') {

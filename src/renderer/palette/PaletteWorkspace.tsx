@@ -8,6 +8,7 @@ import {
 import styles from './PaletteWorkspace.module.css';
 import { ToneSwatchCard } from './ToneSwatchCard';
 import { createEmptyRecipe } from './recipes';
+import { generateReferenceRecipes } from './referenceRecipes';
 import type { PaletteProjectHandle } from './paletteProject';
 import { MAX_SMART_PIXELS, paintSelection, selectConnectedColors } from './smartSelection';
 import { usePreviewZoom } from './usePreviewZoom';
@@ -101,6 +102,7 @@ export default function PaletteWorkspace({
   const [references, setReferences] = useState<ReferenceImage[]>([]);
   const [activeRefId, setActiveRefId] = useState<string | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
+  const [recipeGenerationMessage, setRecipeGenerationMessage] = useState<string | null>(null);
   const [isDraggingImages, setIsDraggingImages] = useState(false);
 
   const [localRecipes, setLocalRecipes] = useState<PaintRecipe[]>(() => [createEmptyRecipe(1)]);
@@ -387,6 +389,44 @@ export default function PaletteWorkspace({
     event.preventDefault();
     setIsDraggingImages(false);
     void importReferenceFiles(Array.from(files));
+  }
+
+  function handleGenerateRecipes() {
+    if (!references.length) return;
+    const sample = document.createElement('canvas');
+    const context = sample.getContext('2d', { willReadFrequently: true });
+    if (!context) return;
+    const sampleSize = Math.max(12, Math.min(80, Math.floor(Math.sqrt(24000 / references.length))));
+    try {
+      const images = references.map((reference) => {
+        const scale = Math.min(1, sampleSize / Math.max(reference.width, reference.height));
+        sample.width = Math.max(1, Math.round(reference.width * scale));
+        sample.height = Math.max(1, Math.round(reference.height * scale));
+        context.drawImage(reference.element, 0, 0, sample.width, sample.height);
+        return context.getImageData(0, 0, sample.width, sample.height);
+      });
+      const result = generateReferenceRecipes(images);
+      if (!result.length) {
+        setRecipeGenerationMessage('No visible colors were found in the references.');
+        return;
+      }
+      const names = new Set(recipes.map((recipe) => recipe.name));
+      const generated = result.map(({ name, tones }) => {
+        const recipe = createEmptyRecipe(nextRecipeNumberRef.current++);
+        let candidate = name;
+        for (let suffix = 2; names.has(candidate); suffix++) candidate = name + ' ' + suffix;
+        names.add(candidate);
+        recipe.name = candidate;
+        for (const { slot } of TONE_SLOTS) recipe.swatches[slot].hex = tones[slot];
+        return recipe;
+      });
+      setRecipes((previous) => [...previous, ...generated]);
+      setActiveRecipeId(generated[0].id);
+      setConfirmDeleteId(null);
+      setRecipeGenerationMessage('Created ' + generated.length + (generated.length === 1 ? ' recipe.' : ' recipes.'));
+    } catch {
+      setRecipeGenerationMessage('Could not analyze the reference images.');
+    }
   }
 
   function handleCreateRecipe() {
@@ -1178,6 +1218,10 @@ export default function PaletteWorkspace({
           <div className={styles.panelHeader}>
             <h2 className={styles.panelTitle}>Recipes</h2>
             <div className={styles.recipeActions}>
+              <button type="button" className={`${styles.btn} ${styles.btnSecondary}`}
+                disabled={!references.length} onClick={handleGenerateRecipes}>
+                Generate recipes
+              </button>
               <button
                 type="button"
                 className={`${styles.btn} ${styles.btnSecondary}`}
@@ -1195,6 +1239,8 @@ export default function PaletteWorkspace({
               </button>
             </div>
           </div>
+
+          {recipeGenerationMessage && <p className={styles.workspaceIntro} role="status">{recipeGenerationMessage}</p>}
 
           {confirmDeleteId && activeRecipe && confirmDeleteId === activeRecipe.id && (
             <div className={styles.confirmBox} role="alertdialog" aria-label="Confirm delete recipe">

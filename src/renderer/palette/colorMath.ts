@@ -44,7 +44,7 @@ function srgbChannelToLinear(channel: number): number {
   return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
 }
 
-interface OklabSample {
+export interface OklabSample {
   L: number;
   a: number;
   b: number;
@@ -53,7 +53,7 @@ interface OklabSample {
   bl: number;
 }
 
-function rgbToOklabSample(r: number, g: number, bl: number): OklabSample {
+export function rgbToOklabSample(r: number, g: number, bl: number): OklabSample {
   const lr = srgbChannelToLinear(r);
   const lg = srgbChannelToLinear(g);
   const lb = srgbChannelToLinear(bl);

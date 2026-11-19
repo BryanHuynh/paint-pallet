@@ -35,6 +35,7 @@ export interface Viewport3DProps {
   ghostModelId?: string;
   jointMarker?: Vec3;
   highlightPickFace?: boolean;
+  lightPlacement?: { active: boolean; direction: Vec3; cameraRequest: number; onDirection: (direction: Vec3) => void };
   orientation: ModelOrientation;
   cameraPresetRequest: { preset: CameraPreset; seq: number } | null;
   onSurfacePick: (
@@ -283,6 +284,7 @@ export function Viewport3D({
   ghostModelId,
   jointMarker,
   highlightPickFace = false,
+  lightPlacement,
   orientation,
   cameraPresetRequest,
   onSurfacePick,
@@ -296,6 +298,9 @@ export function Viewport3D({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const previewPickRef = useRef(highlightPickFace);
   previewPickRef.current = highlightPickFace;
+  const lightPlacementRef = useRef(lightPlacement);
+  lightPlacementRef.current = lightPlacement;
+  const handledCameraRequest = useRef(0);
   const onPickRef = useRef(onSurfacePick);
   onPickRef.current = onSurfacePick;
   const shadowPaintRef = useRef(shadowPaint);
@@ -551,6 +556,19 @@ export function Viewport3D({
     const companionMaterial = new THREE.MeshStandardMaterial({ color: '#aaaeb2', roughness: 0.84, side: THREE.DoubleSide });
     const stagedMaterial = new THREE.MeshStandardMaterial({ color: '#83b4a5', roughness: 0.8,
       opacity: 0.38, transparent: true, depthWrite: false, side: THREE.FrontSide });
+    const lightHandle = new THREE.Mesh(new THREE.SphereGeometry(1, 24, 16),
+      new THREE.MeshBasicMaterial({ color: '#ffe09b', depthTest: false, depthWrite: false }));
+    lightHandle.visible = false;
+    lightHandle.renderOrder = 11;
+    scene.add(lightHandle);
+    const lightLineGeometry = new THREE.BufferGeometry();
+    const lightLinePoints = new THREE.BufferAttribute(new Float32Array(6), 3);
+    lightLineGeometry.setAttribute('position', lightLinePoints);
+    const lightLineMaterial = new THREE.LineBasicMaterial({ color: '#ffd17a', transparent: true, opacity: .6, depthWrite: false });
+    const lightLine = new THREE.Line(lightLineGeometry, lightLineMaterial);
+    lightLine.frustumCulled = false;
+    lightLine.visible = false;
+    scene.add(lightLine);
     const companions = new Map<string, THREE.Group>();
     const marker = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 8),
       new THREE.MeshBasicMaterial({ color: '#ffd17a', depthTest: false, depthWrite: false }));
@@ -667,6 +685,9 @@ export function Viewport3D({
     let downX = 0;
     let downY = 0;
     let strokePointer: number | null = null;
+    let lightDrag: { pointer: number; x: number; y: number; direction: THREE.Vector3; right: THREE.Vector3; up: THREE.Vector3 } | null = null;
+    const lightDirection = new THREE.Vector3();
+    const lightCenter = new THREE.Vector3();
     let strokeView = 0;
     let lastSample = { x: 0, y: 0 };
     let sampleFrame = 0;
@@ -763,6 +784,18 @@ export function Viewport3D({
       if (e.button !== 0) return;
       downX = e.clientX;
       downY = e.clientY;
+      const placement = lightPlacementRef.current;
+      if (placement?.active && !e.altKey) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        camera.updateMatrixWorld();
+        lightDrag = { pointer: e.pointerId, x: e.clientX, y: e.clientY,
+          direction: new THREE.Vector3(...placement.direction),
+          right: new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0),
+          up: new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1) };
+        canvas.setPointerCapture(e.pointerId);
+        return;
+      }
       const paint = shadowPaintRef.current;
       if (!paint?.enabled || e.altKey) return;
 
@@ -797,6 +830,15 @@ export function Viewport3D({
       sampleBrush(lastSample);
     };
     const onPointerMove = (e: PointerEvent) => {
+      if (lightDrag?.pointer === e.pointerId) {
+        e.stopImmediatePropagation();
+        const sensitivity = Math.PI / Math.max(180, canvas.clientHeight);
+        const next = lightDrag.direction.clone()
+          .applyAxisAngle(lightDrag.up, (e.clientX - lightDrag.x) * sensitivity)
+          .applyAxisAngle(lightDrag.right, (e.clientY - lightDrag.y) * sensitivity);
+        if (lightPlacementRef.current?.active) lightPlacementRef.current.onDirection(next.toArray());
+        return;
+      }
       moveBrushHover(e);
       if (e.pointerId !== strokePointer) return;
       e.stopImmediatePropagation();
@@ -810,6 +852,11 @@ export function Viewport3D({
       });
     };
     const onPointerUp = (e: PointerEvent) => {
+      if (lightDrag?.pointer === e.pointerId) {
+        onPointerMove(e);
+        lightDrag = null;
+        return;
+      }
       if (e.pointerId === strokePointer) {
         e.stopImmediatePropagation();
         if (e.clientX !== lastSample.x || e.clientY !== lastSample.y) {
@@ -822,6 +869,7 @@ export function Viewport3D({
       if (Math.hypot(e.clientX - downX, e.clientY - downY) <= 4) pickAt(e);
     };
     const onPointerCancel = (e: PointerEvent) => {
+      if (lightDrag?.pointer === e.pointerId) lightDrag = null;
       if (e.pointerId === strokePointer) endStroke(false);
       clearBrushHover();
     };
@@ -852,6 +900,22 @@ export function Viewport3D({
     const animate = () => {
       rafId = window.requestAnimationFrame(animate);
       controls.update();
+      const placement = lightPlacementRef.current;
+      const radius = sceneRefs.current?.radius ?? 1;
+      lightCenter.set(0, radius * .5, 0);
+      if (placement && placement.cameraRequest !== handledCameraRequest.current) {
+        handledCameraRequest.current = placement.cameraRequest;
+        camera.getWorldDirection(lightDirection).negate();
+        placement.onDirection(lightDirection.toArray());
+      }
+      lightHandle.visible = lightLine.visible = Boolean(placement?.active && activeModelRef.current);
+      if (placement?.active) {
+        lightHandle.position.copy(lightCenter).addScaledVector(lightDirection.fromArray(placement.direction), radius * .85);
+        lightHandle.scale.setScalar(radius * .042);
+        lightLinePoints.setXYZ(0, lightCenter.x, lightCenter.y, lightCenter.z);
+        lightLinePoints.setXYZ(1, lightHandle.position.x, lightHandle.position.y, lightHandle.position.z);
+        lightLinePoints.needsUpdate = true;
+      }
       const surfaceDetail = detailGroup.visible ? 'original' : 'preview';
       if (canvas.dataset.surfaceDetail !== surfaceDetail) canvas.dataset.surfaceDetail = surfaceDetail;
       const paint = shadowPaintRef.current;
@@ -882,6 +946,10 @@ export function Viewport3D({
       detailTrianglesRef.current = 0;
       for (const layer of companions.values()) disposeGroupMeshes(layer);
       companions.clear();
+      lightHandle.geometry.dispose();
+      lightHandle.material.dispose();
+      lightLineGeometry.dispose();
+      lightLineMaterial.dispose();
       marker.geometry.dispose();
       marker.material.dispose();
       companionMaterial.dispose();

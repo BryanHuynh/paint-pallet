@@ -3,7 +3,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import type { ExposureRequest, PaintPalletApi } from '../../src/shared/workerProtocol';
 import type { ShadowCoverage } from '../../src/renderer/paint/shadowPaint';
-import { useSurfaceLighting } from '../../src/renderer/paint/useSurfaceLighting';
+import { lightAngles, useSurfaceLighting, worldLightDirection } from '../../src/renderer/paint/useSurfaceLighting';
 
 describe('directional lighting preview', () => {
   const orientation = { upright: '+Y', front: '+Z' } as const;
@@ -12,6 +12,15 @@ describe('directional lighting preview', () => {
     [1, { faceId: 1, regionId: 'cloth', batchIndex: 0, triangleIndex: 1 }],
     [2, { faceId: 2, regionId: 'cloth', batchIndex: 0, triangleIndex: 2 }],
   ])]]);
+
+  it('converts a camera light direction to the same world direction used by the viewport', () => {
+    expect(lightAngles([0, 0, 1])).toEqual({ azimuth: 0, elevation: 0 });
+    expect(lightAngles([-1, 0, 0])).toEqual({ azimuth: 270, elevation: 0 });
+    expect(lightAngles([0, 1, 0])).toEqual({ azimuth: 0, elevation: 90 });
+    for (const [azimuth, elevation] of [[355, 27], [45, -33], [180, 3]]) {
+      expect(lightAngles(worldLightDirection(azimuth, elevation).toArray())).toEqual({ azimuth, elevation });
+    }
+  });
 
   it('reuses exposure for cutoff edits and preserves committed masks while a new angle computes', async () => {
     const compute = vi.fn<(request: ExposureRequest) => Promise<Float32Array>>();

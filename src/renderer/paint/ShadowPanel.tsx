@@ -6,6 +6,8 @@ export function ShadowPanel({
   paint,
   fill,
   onApplyFill,
+  previewBeforeFill,
+  setPreviewBeforeFill,
   onToolChange,
   recipes,
   busy,
@@ -13,6 +15,8 @@ export function ShadowPanel({
   paint: ReturnType<typeof useShadowPainting>;
   fill: ReturnType<typeof useConnectedFill>;
   onApplyFill: () => void;
+  previewBeforeFill: boolean;
+  setPreviewBeforeFill: (value: boolean) => void;
   onToolChange: ReturnType<typeof useShadowPainting>['setTool'];
   recipes: PaintRecipe[];
   busy: boolean;
@@ -78,16 +82,21 @@ export function ShadowPanel({
                   onChange={(event) => fill.setCreaseDegrees(Number(event.target.value))} />
                 <output htmlFor="fill-crease">{fill.creaseDegrees}°</output>
               </div>
+              <label className="hint-text">
+                <input type="checkbox" checked={previewBeforeFill} disabled={locked}
+                  onChange={(event) => setPreviewBeforeFill(event.target.checked)} />
+                Preview before filling
+              </label>
               <p className="hint-text" role="status">
                 {fill.loading ? 'Preparing connected surface preview…'
-                  : fill.error ?? (fill.seeded
+                  : fill.error ?? (fill.seeded && previewBeforeFill
                     ? `${fill.added.toLocaleString()} new faces in preview`
-                    : 'Click the surface where the fill should start.')}
+                    : previewBeforeFill ? 'Click a surface to preview the fill.' : 'Click a surface to fill it. Undo reverses the fill.')}
               </p>
-              {fill.seeded && (
+              {fill.seeded && (previewBeforeFill || fill.loading) && (
                 <div className="shadow-tools">
-                  <button type="button" className="btn btn--primary btn--small"
-                    disabled={locked || !fill.added || fill.loading} onClick={onApplyFill}>Apply fill</button>
+                  {previewBeforeFill && <button type="button" className="btn btn--primary btn--small"
+                    disabled={locked || !fill.added || fill.loading} onClick={onApplyFill}>Apply fill</button>}
                   <button type="button" className="btn btn--secondary btn--small"
                     onClick={fill.cancel}>Cancel fill</button>
                 </div>

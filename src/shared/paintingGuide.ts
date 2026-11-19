@@ -37,6 +37,9 @@ export interface GuideExport {
   snapshot: string;
   rows: GuideRow[];
   callouts: GuideCallout[];
+  focusedPasses?: boolean;
+  passCallouts?: Partial<Record<GuidePass, GuideCallout[]>>;
+  installationViews?: string[];
   images: GuideImages;
   installation?: InstallationStepView[];
   isolatedSheets?: { partName: string; images: GuideImages }[];

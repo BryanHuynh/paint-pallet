@@ -56,10 +56,22 @@ function appliedLightKey(settings: LightSettings, orientation: ModelOrientation,
   return JSON.stringify([settings.azimuth, settings.elevation, settings.midtone, settings.highlight, orientation.upright, orientation.front, ...(layoutKey ? [layoutKey] : [])]);
 }
 
-function localLightDirection(azimuth: number, elevation: number, orientation: ModelOrientation): Vec3 {
+export function worldLightDirection(azimuth: number, elevation: number): Vector3 {
   const az = azimuth * Math.PI / 180;
   const el = elevation * Math.PI / 180;
-  return new Vector3(Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el))
+  return new Vector3(Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el));
+}
+
+export function lightAngles(direction: Vec3) {
+  const unit = new Vector3(...direction).normalize();
+  return {
+    azimuth: (Math.round(Math.atan2(unit.x, unit.z) * 180 / Math.PI) + 360) % 360,
+    elevation: Math.round(Math.asin(Math.max(-1, Math.min(1, unit.y))) * 180 / Math.PI),
+  };
+}
+
+function localLightDirection(azimuth: number, elevation: number, orientation: ModelOrientation): Vec3 {
+  return worldLightDirection(azimuth, elevation)
     .applyQuaternion(computeOrientationQuaternion(orientation.upright, orientation.front).invert())
     .toArray();
 }
@@ -269,6 +281,9 @@ export function useSurfaceLighting(
     snapshot,
     selectSnapshot,
     addSnapshot,
+    aimLight(direction: Vec3) {
+      setSettings(lightAngles(direction));
+    },
     renameSnapshot: (name: string) => editSnapshot((current) => ({ ...current, name })),
     azimuth, setAzimuth: (value: number) => setSettings({ azimuth: value }),
     elevation, setElevation: (value: number) => setSettings({ elevation: value }),

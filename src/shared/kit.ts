@@ -19,6 +19,7 @@ export interface KitPart extends PartAddress {
   pose: PartPose;
   hidden: boolean;
   staged: boolean;
+  placementConfirmed?: true;
 }
 
 export const IDENTITY_PART_POSE: PartPose = { translation: [0, 0, 0], rotation: [0, 0, 0, 1] };
@@ -37,6 +38,7 @@ export interface KitPartState extends Partial<PartAddress> {
   pose: PartPose;
   hidden: boolean;
   staged: boolean;
+  placementConfirmed?: true;
 }
 
 export interface InstallationPlan {

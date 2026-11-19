@@ -24,6 +24,7 @@ export function useConnectedFill(
   regionId: string | undefined,
   coverage: ShadowCoverage,
   part?: PartAddress & { faceCount: number },
+  previewBeforeFill = false,
 ) {
   const [seed, setSeed] = useState<FillSeed | null>(null);
   const [creaseDegrees, setCreaseDegrees] = useState(35);
@@ -64,9 +65,13 @@ export function useConnectedFill(
           blockedFaces,
         });
         if (!active) return;
-        const draft = startShadowStroke(query.coverage, FILL_PREVIEW_REGION, 'brush');
-        paintShadowFaces(draft, unpackFillFaces(packed, query.part));
-        setResult({ query, packed, coverage: draft.coverage, added: draft.edit.added.length });
+        if (previewBeforeFill) {
+          const draft = startShadowStroke(query.coverage, FILL_PREVIEW_REGION, 'brush');
+          paintShadowFaces(draft, unpackFillFaces(packed, query.part));
+          setResult({ query, packed, coverage: draft.coverage, added: draft.edit.added.length });
+        } else {
+          setResult({ query, packed });
+        }
       } catch (error) {
         if (active) {
           setResult({ query, error: error instanceof Error ? error.message : 'Could not preview the connected fill.' });
@@ -80,7 +85,7 @@ export function useConnectedFill(
       window.clearTimeout(timeout);
       if (started) void api?.cancelConnectedFill?.(jobId).catch(() => {});
     };
-  }, [api, query]);
+  }, [api, query, previewBeforeFill]);
 
   const ready = result?.query === query ? result : null;
   return {

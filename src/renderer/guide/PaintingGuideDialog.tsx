@@ -31,6 +31,7 @@ const pinPosition = (value: number) => Math.min(0.96, Math.max(0.04, value));
 export default function PaintingGuideDialog({ api, model, orientation, coverage, tones, edges, rows, snapshot, unapplied, callouts, setCallouts, close, parts, joints, installation, setInstallation }: Props) {
   const dialog = useRef<HTMLDialogElement>(null);
   const request = useRef<AbortController | null>(null);
+  const [focusPasses, setFocusPasses] = useState(true);
   const [paper, setPaper] = useState<GuidePaper>('Letter');
   const [region, setRegion] = useState(rows[0]?.id ?? '');
   const [previews, setPreviews] = useState<string[] | null>(null);
@@ -80,7 +81,13 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
     setMessage(null);
     try {
       const options = { readBatch, model, orientation, coverage, tones, edges, rows, preview: false, signal: controller.signal };
-      const images = await renderGuideViews({ ...options, parts: printParts });
+      const passCallouts: NonNullable<GuideExport['passCallouts']> = {};
+      const images = await renderGuideViews({ ...options, parts: printParts, focusPasses,
+        mapCallouts: (pass, remap) => {
+          passCallouts[pass] = callouts.flatMap((callout) => remap(callout) ?? []);
+        },
+      });
+      const installationViews = focusPasses && installation.order.length ? previews ?? undefined : undefined;
       const byId = new Map(printParts.map((part) => [part.id, part]));
       const jointByChild = new Map(joints.map((joint) => [joint.childId, joint]));
       const steps = installation.order.flatMap((id) => {
@@ -101,11 +108,12 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
         if (!part) continue;
         controller.signal.throwIfAborted();
         isolatedSheets.push({ partName: part.name || 'Untitled part',
-          images: await renderGuideViews({ ...options, parts: [part] }) });
+          images: await renderGuideViews({ ...options, parts: [part], focusPasses }) });
       }
       controller.signal.throwIfAborted();
       const saved = await api.exportPaintingGuide({
         paper, modelName: model.fileName, snapshot, rows, callouts, images, installation: steps, isolatedSheets,
+        focusedPasses: focusPasses, passCallouts: focusPasses ? passCallouts : undefined, installationViews,
       });
       if (!controller.signal.aborted && saved) setMessage({ text: 'Painting guide saved.', error: false });
     } catch (error) {
@@ -135,6 +143,13 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
           <select value={paper} onChange={(event) => setPaper(event.target.value as GuidePaper)} disabled={exporting}>
             <option>Letter</option>
             <option>A4</option>
+          </select>
+        </label>
+        <label>Paint views
+          <select value={focusPasses ? 'painted' : 'full'} disabled={exporting}
+            onChange={(event) => setFocusPasses(event.target.value === 'painted')}>
+            <option value="painted">Painted surfaces</option>
+            <option value="full">Full model</option>
           </select>
         </label>
         <label>Callout region

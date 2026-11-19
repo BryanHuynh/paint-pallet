@@ -633,3 +633,19 @@ body,
 .guide-installation__note { display: flex; flex-direction: column; font-size: 0.8rem; gap: 0.25rem; }
 .guide-installation__note textarea { color: inherit; background: #0e1812; border: 1px solid #536359; border-radius: 0.35rem; padding: 0.35rem; resize: vertical; }
 .guide-installation fieldset { border: 1px solid #536359; display: flex; flex-wrap: wrap; gap: 0.65rem; font-size: 0.85rem; }
+
+.assembly-confirmation {
+  border: 1px solid var(--panel-border, #374b43);
+  border-radius: 6px;
+  margin: 0.65rem 0;
+  padding: 0.5rem;
+  min-width: 0;
+}
+
+.assembly-confirmation__parts {
+  display: grid;
+  gap: 0.2rem;
+  max-height: 11rem;
+  overflow-y: auto;
+  margin-bottom: 0.5rem;
+}

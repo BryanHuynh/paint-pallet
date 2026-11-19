@@ -18,12 +18,13 @@ function imagePasses(images: GuideImages | undefined): GuidePass[] {
   return images?.edge ? [...GUIDE_PASSES, 'edge'] : [...GUIDE_PASSES];
 }
 
+function validViewImages(views: unknown): views is string[] {
+  return Array.isArray(views) && views.length === GUIDE_VIEWS.length &&
+    views.every((image) => typeof image === 'string' && /^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(image));
+}
+
 function validImages(images: GuideImages | undefined) {
-  return imagePasses(images).every((pass) => {
-    const views = images?.[pass];
-    return Array.isArray(views) && views.length === GUIDE_VIEWS.length &&
-      views.every((image) => /^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(image));
-  });
+  return imagePasses(images).every((pass) => validViewImages(images?.[pass]));
 }
 
 function validPosition(value: number) {
@@ -40,6 +41,9 @@ export function renderGuideDocument(guide: GuideExport) {
       typeof guide.modelName !== 'string' || typeof guide.snapshot !== 'string' ||
       !Array.isArray(guide.rows) || !Array.isArray(guide.callouts) ||
       !validImages(guide.images) ||
+      (guide.installationViews !== undefined && !validViewImages(guide.installationViews)) ||
+      (guide.passCallouts !== undefined && (!guide.passCallouts ||
+        !Object.values(guide.passCallouts).every(Array.isArray))) ||
       (guide.isolatedSheets !== undefined && (!Array.isArray(guide.isolatedSheets) ||
         !guide.isolatedSheets.every((sheet) => typeof sheet.partName === 'string' && validImages(sheet.images)))) ||
       (guide.installation !== undefined && (!Array.isArray(guide.installation) ||
@@ -71,7 +75,7 @@ export function renderGuideDocument(guide: GuideExport) {
   function paintSheets(images: GuideImages, partName?: string) {
     return imagePasses(images).map((pass) => {
       const views = GUIDE_VIEWS.map((view, index) => {
-        const pins = partName ? [] : guide.callouts.flatMap((callout) => {
+        const pins = partName ? [] : (guide.passCallouts?.[pass] ?? guide.callouts).flatMap((callout) => {
           const row = guide.rows.findIndex((item) => item.id === callout.regionId);
           if (callout.view !== view || row < 0 || !validPosition(callout.x) || !validPosition(callout.y)) return [];
           return guidePin(callout.x, callout.y, row + 1);
@@ -80,7 +84,9 @@ export function renderGuideDocument(guide: GuideExport) {
           images[pass]![index] + '" alt="">' + pins.join('') + '</div></figure>';
       });
       const heading = partName ? escapeText(partName) + ' · ' + label(pass) : label(pass);
-      const legend = partName ? 'Isolated part view. Gray shows surfaces outside this pass.' :
+      const legend = guide.focusedPasses ? 'Only surfaces painted in this pass are shown.' +
+        (partName ? '' : ' Callout numbers match the recipe table.') :
+        partName ? 'Isolated part view. Gray shows surfaces outside this pass.' :
         'Gray shows surfaces outside this pass. Callout numbers match the recipe table.';
       return '<section class="pass"><h1>' + heading + '</h1>' + description +
         '<p class="legend">' + legend + '</p><div class="views">' + views.join('') + '</div></section>';
@@ -92,7 +98,7 @@ export function renderGuideDocument(guide: GuideExport) {
     '</h2><p>Attach to ' + escapeText(step.parent) + '</p>' +
     (step.note ? '<p class="notes">' + escapeText(step.note) + '</p>' : '') +
     '</div><figure><figcaption>' + step.view + '</figcaption><div class="view"><img src="' +
-    guide.images.shadow[GUIDE_VIEWS.indexOf(step.view)] + '" alt="">' + guidePin(step.x, step.y, index + 1) +
+    (guide.installationViews ?? guide.images.shadow)[GUIDE_VIEWS.indexOf(step.view)] + '" alt="">' + guidePin(step.x, step.y, index + 1) +
     '</div></figure></li>') ?? [];
   const installation = steps.length ? '<section class="pass"><h1>Installation sequence</h1>' + description +
     '<ol class="installation">' + steps.join('') + '</ol></section>' : '';

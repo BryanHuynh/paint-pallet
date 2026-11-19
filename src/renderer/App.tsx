@@ -29,7 +29,7 @@ import { ShadowPanel } from './paint/ShadowPanel';
 import { useShadowPainting } from './paint/useShadowPainting';
 import { LightingPanel } from './paint/LightingPanel';
 import { renderToneMask, toneColorKey } from './paint/lightingState';
-import { useSurfaceLighting } from './paint/useSurfaceLighting';
+import { useSurfaceLighting, worldLightDirection } from './paint/useSurfaceLighting';
 import { FILL_PREVIEW_REGION, unpackFillFaces, useConnectedFill } from './paint/useConnectedFill';
 import appLogoUrl from '../../assets/paint-pallet-logo.png';
 
@@ -114,7 +114,17 @@ export default function App({
     hidden: Boolean(isolatedPartId && isolatedPartId !== part.id) || part.hidden,
     pose: part.id === ghostPart?.id ? assembly.draft!.pose : part.pose,
   })) : undefined, [parts, isolatedPartId, ghostPart?.id, assembly.draft?.pose]);
-  const fill = useConnectedFill(api, shadow.tool === 'fill', displayModel?.modelId, shadow.region?.id, shadow.committedCoverage, paintPart);
+  const [aimingLight, setAimingLight] = useState(false);
+  const [previewBeforeFill, setPreviewBeforeFill] = useState(false);
+  const fill = useConnectedFill(api, canPaintPart && !assembly.draft && !aimingLight && shadow.tool === 'fill' && Boolean(shadow.recipe),
+    displayModel?.modelId, shadow.region?.id, shadow.committedCoverage, paintPart, previewBeforeFill);
+  const committedFills = useRef(new WeakSet<Uint32Array>());
+  useEffect(() => {
+    if (previewBeforeFill || !fill.packed || committedFills.current.has(fill.packed)) return;
+    committedFills.current.add(fill.packed);
+    shadow.commitFill(unpackFillFaces(fill.packed, paintPart));
+    fill.cancel();
+  }, [previewBeforeFill, fill.packed, paintPart, shadow.commitFill, fill.cancel]);
   const [pendingModel, setPendingModel] = useState<ModelSummary | null>(null);
   const [orientation, setOrientation] = useState<ModelOrientation>({
     upright: '+Y',
@@ -125,6 +135,10 @@ export default function App({
   const lighting = useSurfaceLighting(api, model?.modelId, orientation, shadow.committedCoverage,
     attached.length > 1 ? attached.map((part) => ({ modelId: part.model.modelId, pose: part.pose, faceOffset: part.faceOffset })) : undefined,
     layoutKey);
+  const [lightCameraRequest, setLightCameraRequest] = useState(0);
+  useEffect(() => {
+    if (!lighting.previewing || !canPaintPart || assembly.draft) setAimingLight(false);
+  }, [lighting.previewing, canPaintPart, assembly.draft]);
   const edge = useEdgeHighlight(api, displayModel?.modelId, lighting.snapshot.id, shadow.region?.id, shadow.committedCoverage, paintPart);
   const guideEdges = useMemo(() => clipEdgeCoverage(edge.committed, shadow.committedCoverage), [edge.committed, shadow.committedCoverage]);
   const coverage = useMemo(() => {
@@ -316,8 +330,8 @@ export default function App({
           activeSnapshotId: snapshots.activeSnapshotId,
           guideCallouts,
           kit: parts.length ? {
-            parts: parts.map(({ id, name, model: partModel, pose, hidden, staged, faceOffset, batchOffset }) => ({
-              id, name, sourceName: partModel.fileName, pose, hidden, staged, faceOffset, batchOffset,
+            parts: parts.map(({ id, name, model: partModel, pose, hidden, staged, placementConfirmed, faceOffset, batchOffset }) => ({
+              id, name, sourceName: partModel.fileName, pose, hidden, staged, placementConfirmed, faceOffset, batchOffset,
             })),
             joints: assembly.joints,
             installation: guideInstallation,
@@ -772,6 +786,12 @@ export default function App({
             cameraPresetRequest={cameraPresetRequest}
             highlightPickFace={assembly.draft?.method === 'six-face' && assembly.expectedId === focusId}
             onSurfacePick={handleSurfacePick}
+            lightPlacement={{
+              active: aimingLight && lighting.previewing && !assembly.draft,
+              direction: worldLightDirection(lighting.azimuth, lighting.elevation).toArray(),
+              cameraRequest: lightCameraRequest,
+              onDirection: lighting.aimLight,
+            }}
             shadowPaint={{
               enabled: Boolean(model && canPaintPart && !assembly.draft && !isBusy && (edge.tool || lighting.brushTool ||
                 (shadow.tool && shadow.tool !== 'fill' && shadow.recipe))),
@@ -870,7 +890,7 @@ export default function App({
         <aside className="inspector-panel" aria-label="Model inspector">
           {api?.importKitParts && model && (
             <KitPanel parts={parts} selected={selectedPart} busy={isBusy || Boolean(assembly.draft)}
-              choose={choosePart} add={addKitParts}
+              choose={choosePart} add={addKitParts} confirmPlacement={assembly.confirmPlacement}
               isolated={paintIsolation !== null}
               toggleIsolation={() => {
                 if (!selectedPart) return;
@@ -898,6 +918,11 @@ export default function App({
                 lighting.setBrushTool(null);
                 shadow.setTool(tool);
               }}
+              previewBeforeFill={previewBeforeFill}
+              setPreviewBeforeFill={(value) => {
+                fill.cancel();
+                setPreviewBeforeFill(value);
+              }}
               onApplyFill={() => {
                 if (fill.packed) shadow.commitFill(unpackFillFaces(fill.packed, paintPart));
                 fill.cancel();
@@ -907,6 +932,28 @@ export default function App({
           {model && canPaintPart && !assembly.draft && lighting.available && (
             <LightingPanel
               lighting={lighting}
+              aiming={aimingLight}
+              onAim={() => {
+                if (aimingLight) {
+                  setAimingLight(false);
+                  return;
+                }
+                fill.cancel();
+                shadow.setTool(null);
+                edge.cancel();
+                edge.setTool(null);
+                lighting.start();
+                setAimingLight(true);
+              }}
+              onAimFromCamera={() => {
+                fill.cancel();
+                shadow.setTool(null);
+                edge.cancel();
+                edge.setTool(null);
+                lighting.start();
+                setAimingLight(true);
+                setLightCameraRequest((previous) => previous + 1);
+              }}
               busy={isBusy || shadow.strokePending || lighting.brushPending || edge.stroke}
               onSelectSnapshot={(id) => {
                 edge.cancel();
