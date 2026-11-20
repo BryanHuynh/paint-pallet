@@ -17,6 +17,7 @@ const api: PaintPalletApi = {
   },
   importStl: (filePath: string) =>
     ipcRenderer.invoke('worker:import-stl', filePath),
+  importPracticeModel: () => ipcRenderer.invoke('worker:import-practice-model'),
   commitModel: (modelId: string) =>
     ipcRenderer.invoke('worker:commit-model', modelId),
   discardModel: (modelId: string) =>
@@ -35,7 +36,14 @@ const api: PaintPalletApi = {
   generateVisionRecipes: (request) => ipcRenderer.invoke('palette:generate-vision-recipes', request),
   saveProject: (request: ProjectSaveRequest) => ipcRenderer.invoke('project:save', request),
   exportPaintingGuide: (guide) => ipcRenderer.invoke('guide:export', guide),
-  openProject: () => ipcRenderer.invoke('project:open'),
+  openProject: (recentPath) => ipcRenderer.invoke('project:open', recentPath),
+  listRecentProjects: () => ipcRenderer.invoke('project:recents'),
+  confirmProjectReplacement: () => ipcRenderer.invoke('project:confirm-replacement'),
+  openDroppedProject: (file) => {
+    const filePath = webUtils.getPathForFile(file);
+    if (!filePath) return Promise.reject(new Error('Drop a Paint Pallet project from your computer.'));
+    return ipcRenderer.invoke('project:open-dropped', filePath);
+  },
   onImportProgress: (listener: (event: ImportProgressEvent) => void) => {
     const handler = (_event: Electron.IpcRendererEvent, payload: ImportProgressEvent) => {
       listener(payload);

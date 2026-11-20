@@ -73,7 +73,7 @@ it('confirms a current assembly, then saves and reopens it for painting and guid
   api.importKitParts = vi.fn().mockResolvedValue({ models: [selected, alternate], canceled: false, errors: [] });
   api.saveProject = vi.fn(async (request: ProjectSaveRequest) => {
     saved = { ...request, model: { ...anchor, modelId: 'reopened-anchor' }, kitModels: [selected, alternate] };
-    return true;
+    return { path: '/example/assembly.paintproject', name: 'assembly.paintproject' };
   });
   api.openProject = vi.fn(async () => saved ?? null);
   const exportGuide = vi.fn<NonNullable<PaintPalletApi['exportPaintingGuide']>>().mockResolvedValue(true);
@@ -100,7 +100,6 @@ it('confirms a current assembly, then saves and reopens it for painting and guid
   expect(screen.getByRole('checkbox', { name: 'alternate' })).not.toBeChecked();
   click('Confirm 1 part');
   expect(screen.getByRole('option', { name: 'selected · Placement confirmed' })).toBeInTheDocument();
-  click('Add region');
 
   fireEvent.click(screen.getByText('Project', { selector: 'summary' }));
   click('Save project');
@@ -144,7 +143,6 @@ it('queues direct fill clicks, undoes one fill at a time, and commits the same f
 
   click('Open model');
   await screen.findByRole('button', { name: 'Click test surface' });
-  click('Add region');
   click('Fill');
   click('Click test surface');
   click('Click test surface');
@@ -171,8 +169,48 @@ it('queues direct fill clicks, undoes one fill at a time, and commits the same f
 
   fireEvent.click(screen.getByRole('checkbox', { name: 'Preview before filling' }));
   click('Click test surface');
-  await screen.findByText('1 new faces in preview');
+  await screen.findByText('1 new face to fill');
   expect(painted).toHaveTextContent('0 painted faces');
   click('Apply fill');
   expect(painted).toHaveTextContent('1 painted faces');
+});
+
+it('repaints from the clicked recipe and passes other paint boundaries to the worker', async () => {
+  const anchor = model('anchor');
+  anchor.batches = [{ batchIndex: 0, filePath: 'test-batch', bounds: anchor.bounds, triangleCount: 4 }];
+  const api = makeApi(anchor);
+  api.readBatch = vi.fn().mockResolvedValue({
+    triangleCount: 4, positions: new Float32Array(36), normals: new Float32Array(36),
+    faceIds: Uint32Array.of(0, 1, 2, 3),
+  });
+  api.pickFace = vi.fn<PaintPalletApi['pickFace']>()
+    .mockResolvedValueOnce(hit(0)).mockResolvedValueOnce(hit(1)).mockResolvedValueOnce(hit(0));
+  const requestFill = vi.fn<NonNullable<PaintPalletApi['previewConnectedFill']>>(async ({ faceId }) =>
+    Uint32Array.of(faceId, 0, faceId));
+  api.previewConnectedFill = requestFill;
+  render(<App api={api} />);
+
+  click('Open model');
+  await screen.findByRole('button', { name: 'Click test surface' });
+  const painted = () => screen.getByLabelText('Painted faces');
+  function addRecipe() {
+    fireEvent.click(screen.getByRole('tab', { name: 'Palette' }));
+    click('Add recipe');
+    fireEvent.click(screen.getByRole('tab', { name: 'Model' }));
+  }
+  click('Fill');
+  click('Click test surface');
+  await waitFor(() => expect(painted()).toHaveTextContent('1 painted faces'));
+  addRecipe();
+  click('Click test surface');
+  await waitFor(() => expect(painted()).toHaveTextContent('1 painted faces'));
+  addRecipe();
+  fireEvent.click(screen.getByRole('checkbox', { name: 'Repaint existing color' }));
+  click('Click test surface');
+  await waitFor(() => expect(painted()).toHaveTextContent('1 painted faces'));
+  expect(requestFill.mock.calls.map(([request]) => request.blockedFaces)).toEqual([[], [0], [1]]);
+  click('Undo stroke');
+  expect(painted()).toHaveTextContent('0 painted faces');
+  fireEvent.change(screen.getByLabelText('Recipe', { exact: true }), { target: { value: 'recipe-1' } });
+  expect(painted()).toHaveTextContent('1 painted faces');
 });

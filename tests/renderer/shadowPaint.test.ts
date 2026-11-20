@@ -8,8 +8,8 @@ describe('shadow coat strokes', () => {
   const first = { faceId: 17, batchIndex: 0, triangleIndex: 2 };
   const second = { faceId: 42, batchIndex: 1, triangleIndex: 8 };
 
-  function stroke(history: ShadowHistory, faces: SurfaceFace[], regionId: string, tool: ShadowTool) {
-    const draft = startShadowStroke(history.coverage, regionId, tool);
+  function stroke(history: ShadowHistory, faces: SurfaceFace[], recipeId: string, tool: ShadowTool) {
+    const draft = startShadowStroke(history.coverage, recipeId, tool);
     paintShadowFaces(draft, faces);
     return commitShadowStroke(history, draft);
   }
@@ -19,14 +19,14 @@ describe('shadow coat strokes', () => {
     const draft = startShadowStroke(history.coverage, 'cloak', 'brush');
 
     expect(paintShadowFaces(draft, [first])).toBe(true);
-    expect(draft.coverage.get(0)?.get(17)?.regionId).toBe('cloak');
+    expect(draft.coverage.get(0)?.get(17)?.recipeId).toBe('cloak');
     expect(history.coverage.size).toBe(0);
     expect(history.undo).toHaveLength(0);
 
     const initialBatch = draft.coverage.get(0);
     expect(paintShadowFaces(draft, [first, second])).toBe(true);
     expect(draft.coverage.get(0)).toBe(initialBatch);
-    expect(draft.coverage.get(1)?.get(42)?.regionId).toBe('cloak');
+    expect(draft.coverage.get(1)?.get(42)?.recipeId).toBe('cloak');
 
     const painted = commitShadowStroke(history, draft);
     expect(painted.coverage).toBe(draft.coverage);
@@ -41,7 +41,7 @@ describe('shadow coat strokes', () => {
     const draft = startShadowStroke(history.coverage, 'cloak', 'erase');
     expect(paintShadowFaces(draft, [first])).toBe(true);
     expect(draft.coverage.size).toBe(0);
-    expect(history.coverage.get(0)?.get(17)?.regionId).toBe('cloak');
+    expect(history.coverage.get(0)?.get(17)?.recipeId).toBe('cloak');
 
     const erased = commitShadowStroke(history, draft);
     expect(erased.coverage.size).toBe(0);
@@ -56,8 +56,8 @@ describe('shadow coat strokes', () => {
     const erased = stroke(history, [first], 'cloak', 'erase');
     const restored = undoShadowStroke(erased);
     const next = stroke(restored, [first, second], 'armor', 'brush');
-    expect(next.coverage.get(0)?.get(17)?.regionId).toBe('cloak');
-    expect(next.coverage.get(1)?.get(42)?.regionId).toBe('armor');
+    expect(next.coverage.get(0)?.get(17)?.recipeId).toBe('cloak');
+    expect(next.coverage.get(1)?.get(42)?.recipeId).toBe('armor');
     expect(next.redo).toHaveLength(0);
   });
 });

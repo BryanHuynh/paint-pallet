@@ -1,14 +1,14 @@
 .workspace {
-  --pp-bg: var(--p-bg, #0f1f10);
-  --pp-surface: var(--p-surface, #162a17);
-  --pp-surface-alt: var(--p-surface-elevated, #1c351e);
+  --pp-bg: var(--p-bg, #111612);
+  --pp-surface: var(--p-surface, #1b231d);
+  --pp-surface-alt: var(--p-surface-elevated, #263029);
   --pp-ink: var(--p-ink, #ffffff);
   --pp-muted: var(--p-muted, #9aa39a);
   --pp-line: var(--p-hairline, rgba(255, 255, 255, 0.14));
   --pp-line-strong: rgba(255, 255, 255, 0.28);
   --pp-accent: var(--p-action, #c6f19d);
   --pp-accent-hover: #d5f5b6;
-  --pp-accent-ink: var(--p-action-ink, #0f1f10);
+  --pp-accent-ink: var(--p-action-ink, #111612);
   --pp-accent-soft: rgba(198, 241, 157, 0.12);
   --pp-danger: var(--p-danger, #f28b82);
   --pp-r-lg: var(--r-lg, 8px);
@@ -21,7 +21,7 @@
   overflow-y: auto;
   background: var(--pp-bg);
   color: var(--pp-ink);
-  font-family: var(--font-text, 'Host Grotesk', 'Segoe UI', system-ui, sans-serif);
+  font-family: var(--font-text, 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif);
   font-size: 15px;
   line-height: 1.5;
   padding: 24px;

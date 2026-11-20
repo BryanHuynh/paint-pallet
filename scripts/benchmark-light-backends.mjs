@@ -96,10 +96,10 @@ function compare(cpu, gpu) {
   return { maxError, errors, maskDifferences, visibleDifferences, worstCutoff, worstCutoffDifferences };
 }
 
-async function exposure(service, modelId, backend, direction) {
+async function exposure(service, modelId, backend, direction, layout = {}) {
   const start = performance.now();
   const jobId = 'light-' + (++sequence);
-  const result = await service.request({ cmd: 'light_exposure', modelId, jobId, direction, exposureBackend: backend });
+  const result = await service.request({ cmd: 'light_exposure', modelId, jobId, direction, exposureBackend: backend, ...layout });
   const bytes = await fs.readFile(result.filePath);
   await fs.unlink(result.filePath);
   const values = new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
@@ -137,9 +137,56 @@ async function benchmark(label, file, simulations) {
   }
 }
 
+async function benchmarkAssembly(file) {
+  const service = worker(path.join(root, 'kit'));
+  try {
+    const { model: anchor } = await service.request({ cmd: 'import', filePath: file, jobId: 'kit-anchor' });
+    const { model: child } = await service.request({ cmd: 'import', filePath: file, jobId: 'kit-child', staged: true });
+    const faceOffset = anchor.triangleCount + 3;
+    const direction = [0, 0, 1];
+    let previous;
+    let foundCrossPartShadow = false;
+    for (const x of [3, -8]) {
+      const layout = {
+        exposureModels: [anchor.modelId, child.modelId].join(','),
+        exposurePoses: [0, 0, 0, 0, 0, 0, 0, 1, faceOffset, x, 0, 1, 0, 0, Math.SQRT1_2, Math.SQRT1_2],
+      };
+      const cpu = await exposure(service, anchor.modelId, 'cpu', direction, layout);
+      const gpu = await exposure(service, anchor.modelId, 'dxr', direction, layout);
+      const delta = compare(cpu.values, gpu.values);
+      if (cpu.values.length !== faceOffset + child.triangleCount ||
+          gpu.values.subarray(anchor.triangleCount, faceOffset).some((score) => score !== 0) ||
+          delta.errors || delta.maskDifferences || delta.visibleDifferences) {
+        throw new Error('The posed kit lighting differs between CPU and DXR: ' + JSON.stringify(delta));
+      }
+      if (previous && previous.every((score, index) => score === cpu.values[index])) {
+        throw new Error('The kit pose fixture did not change light exposure');
+      }
+      previous = cpu.values;
+      console.log(JSON.stringify({ label: 'posed kit', x, cpu: cpu.metrics, dxr: gpu.metrics, ...delta }));
+      const selfOnly = { ...layout, castShadowsBetweenParts: false };
+      const selfCpu = await exposure(service, anchor.modelId, 'cpu', direction, selfOnly);
+      const selfGpu = await exposure(service, anchor.modelId, 'dxr', direction, selfOnly);
+      const selfDelta = compare(selfCpu.values, selfGpu.values);
+      if (selfCpu.values[0] !== 0 || selfGpu.values[0] !== 0 ||
+          selfDelta.errors || selfDelta.maskDifferences || selfDelta.visibleDifferences) {
+        throw new Error('Self shadows differ between CPU and DXR: ' + JSON.stringify(selfDelta));
+      }
+      const unshadowed = selfCpu.values.reduce((count, score, index) => count + (score > 0 && cpu.values[index] === 0 ? 1 : 0), 0);
+      foundCrossPartShadow ||= unshadowed > 0;
+      console.log(JSON.stringify({ label: 'self shadows only', x, unshadowed, dxr: selfGpu.metrics.backend, ...selfDelta }));
+    }
+    if (!foundCrossPartShadow) throw new Error('The kit fixture did not cast any shadows between parts');
+  } finally {
+    await service.close();
+  }
+}
+
 try {
-  await benchmark('overhang', await makeFixture(path.join(root, 'overhang.stl'), false), true);
+  const overhang = await makeFixture(path.join(root, 'overhang.stl'), false);
+  await benchmark('overhang', overhang, true);
   await benchmark('partition', await makeFixture(path.join(root, 'partition.stl'), true), false);
+  await benchmarkAssembly(overhang);
   const [reference, nearLimit] = process.argv.slice(2);
   if (reference) await benchmark('reference', reference, false);
   if (nearLimit) await benchmark('near-2-gib', nearLimit, false);

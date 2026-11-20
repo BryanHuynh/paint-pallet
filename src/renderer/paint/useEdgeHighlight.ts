@@ -3,29 +3,29 @@ import type { PartAddress } from '../../shared/kit';
 import type { PaintPalletApi } from '../../shared/workerProtocol';
 import { unpackFillFaces } from './useConnectedFill';
 import { packShadowCoverage, unpackShadowCoverage } from './projectMasks';
-import { paintShadowFaces, startShadowStroke, type ShadowCoverage, type ShadowRegion, type ShadowStroke, type ShadowTool, type SurfaceFace } from './shadowPaint';
+import { paintShadowFaces, startShadowStroke, type ShadowCoverage, type ShadowStroke, type ShadowTool, type SurfaceFace } from './shadowPaint';
 
 export const EDGE_PREVIEW = 'edge-highlight-preview';
-export const edgeColorKey = (regionId: string) => regionId + ':edge';
+export const edgeColorKey = (recipeId: string) => recipeId + ':edge';
 
 interface AppliedEdges {
   coverage: ShadowCoverage;
-  manualRegions: ReadonlySet<string>;
+  manualRecipes: ReadonlySet<string>;
 }
 interface History {
   current: AppliedEdges;
   undo: AppliedEdges[];
   redo: AppliedEdges[];
 }
-const emptyEdges: AppliedEdges = { coverage: new Map(), manualRegions: new Set() };
+const emptyEdges: AppliedEdges = { coverage: new Map(), manualRecipes: new Set() };
 const emptyHistory = (current: AppliedEdges = emptyEdges): History => ({ current, undo: [], redo: [] });
 
 export function clipEdgeCoverage(edges: ShadowCoverage, shadow: ShadowCoverage): ShadowCoverage {
-  const result = new Map<number, ReadonlyMap<number, SurfaceFace & { regionId: string }>>();
+  const result = new Map<number, ReadonlyMap<number, SurfaceFace & { recipeId: string }>>();
   for (const [batch, marks] of edges) {
     const painted = shadow.get(batch);
     if (!painted) continue;
-    const retained = new Map([...marks].filter(([faceId, mark]) => painted.get(faceId)?.regionId === mark.regionId));
+    const retained = new Map([...marks].filter(([faceId, mark]) => painted.get(faceId)?.recipeId === mark.recipeId));
     if (retained.size) result.set(batch, retained);
   }
   return result;
@@ -35,11 +35,11 @@ export function applyEdgesOver(base: ShadowCoverage, edges: ShadowCoverage, shad
   const result = new Map(base);
   for (const [batch, marks] of edges) {
     const painted = shadow.get(batch);
-    let layer: Map<number, SurfaceFace & { regionId: string }> | undefined;
+    let layer: Map<number, SurfaceFace & { recipeId: string }> | undefined;
     for (const hit of marks.values()) {
-      if (painted?.get(hit.faceId)?.regionId !== hit.regionId) continue;
+      if (painted?.get(hit.faceId)?.recipeId !== hit.recipeId) continue;
       layer ??= new Map(base.get(batch));
-      layer.set(hit.faceId, { ...hit, regionId: preview ? EDGE_PREVIEW : edgeColorKey(hit.regionId) });
+      layer.set(hit.faceId, { ...hit, recipeId: preview ? EDGE_PREVIEW : edgeColorKey(hit.recipeId) });
     }
     if (layer) result.set(batch, layer);
   }
@@ -52,38 +52,38 @@ function isInScope(faceId: number, part?: EdgeScope) {
   return !part || (faceId >= part.faceOffset && faceId < part.faceOffset + part.faceCount);
 }
 
-function replaceRegion(coverage: ShadowCoverage, regionId: string, faces: Iterable<SurfaceFace>, part?: EdgeScope) {
+function replaceRecipe(coverage: ShadowCoverage, recipeId: string, faces: Iterable<SurfaceFace>, part?: EdgeScope) {
   const next = new Map(coverage);
   for (const [batchIndex, batch] of coverage) {
 
-    const other = new Map([...batch].filter(([, hit]) => hit.regionId !== regionId || !isInScope(hit.faceId, part)));
+    const other = new Map([...batch].filter(([, hit]) => hit.recipeId !== recipeId || !isInScope(hit.faceId, part)));
     if (other.size === batch.size) continue;
     if (other.size) next.set(batchIndex, other);
     else next.delete(batchIndex);
   }
-  const stroke = startShadowStroke(next, regionId, 'brush');
+  const stroke = startShadowStroke(next, recipeId, 'brush');
   paintShadowFaces(stroke, faces);
   return stroke.coverage;
 }
 
 export function useEdgeHighlight(
-  api: PaintPalletApi | undefined, modelId: string | undefined, snapshotId: string,
-  regionId: string | undefined, shadow: ShadowCoverage, part?: EdgeScope,
+  api: PaintPalletApi | undefined, modelId: string | undefined,
+  recipeId: string | undefined, shadow: ShadowCoverage, part?: EdgeScope,
 ) {
-  const [histories, setHistories] = useState(new Map<string, History>());
-  const ref = useRef(histories);
+  const [history, setHistory] = useState(emptyHistory);
+  const ref = useRef(history);
   const [tool, setTool] = useState<ShadowTool | null>(null);
   const [stroke, setStroke] = useState(false);
   const [brushDraft, setBrushDraft] = useState<ShadowCoverage | null>(null);
-  const strokeRef = useRef<{ id: string; manualKey: string; edit: ShadowStroke } | null>(null);
+  const strokeRef = useRef<{ manualKey: string; edit: ShadowStroke } | null>(null);
   const [previewing, setPreviewing] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [sensitivity, setSensitivity] = useState(60);
   const [width, setWidth] = useState(1);
-  const manualKey = part?.faceOffset ? part.id + '/' + regionId : regionId;
-  const query = useMemo(() => previewing && modelId && regionId
-    ? { modelId, regionId, snapshotId, shadow, width, sensitivity, part }
-    : null, [previewing, modelId, regionId, snapshotId, shadow, width, sensitivity, part]);
+  const manualKey = part?.faceOffset ? part.id + '/' + recipeId : recipeId;
+  const query = useMemo(() => previewing && modelId && recipeId
+    ? { modelId, recipeId, shadow, width, sensitivity, part }
+    : null, [previewing, modelId, recipeId, shadow, width, sensitivity, part]);
   const [result, setResult] = useState<{
     query: NonNullable<typeof query>;
     preview?: ShadowCoverage;
@@ -91,14 +91,13 @@ export function useEdgeHighlight(
     error?: string;
   } | null>(null);
   const ready = result?.query === query ? result : null;
-  const history = histories.get(snapshotId) ?? emptyHistory();
-  const regionHasShadow = useMemo(() => {
-    if (!regionId) return false;
+  const recipeHasShadow = useMemo(() => {
+    if (!recipeId) return false;
     for (const batch of shadow.values()) {
-      for (const face of batch.values()) if (face.regionId === regionId && isInScope(face.faceId, part)) return true;
+      for (const face of batch.values()) if (face.recipeId === recipeId && isInScope(face.faceId, part)) return true;
     }
     return false;
-  }, [regionId, shadow, part]);
+  }, [recipeId, shadow, part]);
 
   useEffect(() => {
     const preview = api?.previewRidgeBand;
@@ -110,13 +109,13 @@ export function useEdgeHighlight(
       started = true;
       let count = 0;
       for (const batch of query.shadow.values()) {
-        for (const hit of batch.values()) if (hit.regionId === query.regionId && isInScope(hit.faceId, query.part)) count++;
+        for (const hit of batch.values()) if (hit.recipeId === query.recipeId && isInScope(hit.faceId, query.part)) count++;
       }
       const regionFaces = new Uint32Array(count);
       let offset = 0;
       for (const batch of query.shadow.values()) {
         for (const hit of batch.values()) {
-          if (hit.regionId === query.regionId && isInScope(hit.faceId, query.part)) {
+          if (hit.recipeId === query.recipeId && isInScope(hit.faceId, query.part)) {
             regionFaces[offset++] = hit.faceId - (query.part?.faceOffset ?? 0);
           }
         }
@@ -125,7 +124,7 @@ export function useEdgeHighlight(
         const packed = await preview({ modelId: query.modelId, jobId, widthPercent: query.width,
           crease: Math.round(75 - 0.73 * query.sensitivity), regionFaces });
         if (!active) return;
-        const layer = startShadowStroke(emptyEdges.coverage, query.regionId, 'brush');
+        const layer = startShadowStroke(emptyEdges.coverage, query.recipeId, 'brush');
         paintShadowFaces(layer, unpackFillFaces(packed, query.part));
         setResult({ query, packed, preview: layer.coverage });
       } catch (error) {
@@ -141,18 +140,14 @@ export function useEdgeHighlight(
     };
   }, [api, query]);
 
-  function write(next: Map<string, History>) {
+  function writeHistory(next: History) {
     ref.current = next;
-    setHistories(next);
+    setHistory(next);
   }
 
-  function writeHistory(id: string, next: History) {
-    write(new Map(ref.current).set(id, next));
-  }
-
-  function commit(id: string, next: AppliedEdges) {
-    const prior = ref.current.get(id) ?? emptyHistory();
-    writeHistory(id, { current: next, undo: [...prior.undo, prior.current], redo: [] });
+  function commit(next: AppliedEdges) {
+    const prior = ref.current;
+    writeHistory({ current: next, undo: [...prior.undo, prior.current], redo: [] });
   }
 
   function cancel() {
@@ -162,20 +157,20 @@ export function useEdgeHighlight(
   }
 
   function apply(confirm = false) {
-    if (!ready?.packed || !regionId || !manualKey) return;
-    if (history.current.manualRegions.has(manualKey) && !confirm) {
+    if (!ready?.packed || !recipeId || !manualKey) return;
+    if (history.current.manualRecipes.has(manualKey) && !confirm) {
       setConfirming(true);
       return;
     }
-    const manualRegions = new Set(history.current.manualRegions);
-    manualRegions.delete(manualKey);
-    commit(snapshotId, { coverage: replaceRegion(history.current.coverage, regionId, unpackFillFaces(ready.packed, part), part), manualRegions });
+    const manualRecipes = new Set(history.current.manualRecipes);
+    manualRecipes.delete(manualKey);
+    commit({ coverage: replaceRecipe(history.current.coverage, recipeId, unpackFillFaces(ready.packed, part), part), manualRecipes });
     cancel();
   }
 
   function beginBrush() {
-    if (!regionId || !manualKey || !tool || strokeRef.current) return false;
-    strokeRef.current = { id: snapshotId, manualKey, edit: startShadowStroke(history.current.coverage, regionId, tool) };
+    if (!recipeId || !manualKey || !tool || strokeRef.current) return false;
+    strokeRef.current = { manualKey, edit: startShadowStroke(history.current.coverage, recipeId, tool) };
     setStroke(true);
     return true;
   }
@@ -183,7 +178,7 @@ export function useEdgeHighlight(
   function paintFaces(faces: SurfaceFace[]) {
     const edit = strokeRef.current?.edit;
     if (!edit) return;
-    const allowed = faces.filter((face) => shadow.get(face.batchIndex)?.get(face.faceId)?.regionId === edit.regionId);
+    const allowed = faces.filter((face) => shadow.get(face.batchIndex)?.get(face.faceId)?.recipeId === edit.recipeId);
     if (paintShadowFaces(edit, allowed)) setBrushDraft(edit.coverage);
   }
 
@@ -191,28 +186,28 @@ export function useEdgeHighlight(
     const active = strokeRef.current;
     if (!active) return;
     strokeRef.current = null;
-    const { id, edit } = active;
+    const { edit } = active;
     if (keep && (edit.edit.added.length || edit.edit.removed.length)) {
-      const manualRegions = new Set(ref.current.get(id)?.current.manualRegions);
-      manualRegions.add(active.manualKey);
-      commit(id, { coverage: edit.coverage, manualRegions });
+      const manualRecipes = new Set(ref.current.current.manualRecipes);
+      manualRecipes.add(active.manualKey);
+      commit({ coverage: edit.coverage, manualRecipes });
     }
     setBrushDraft(null);
     setStroke(false);
   }
 
   function undo() {
-    const current = ref.current.get(snapshotId);
+    const current = ref.current;
     const previous = current?.undo.at(-1);
     if (!current || !previous || strokeRef.current) return;
-    writeHistory(snapshotId, { current: previous, undo: current.undo.slice(0, -1), redo: [...current.redo, current.current] });
+    writeHistory({ current: previous, undo: current.undo.slice(0, -1), redo: [...current.redo, current.current] });
   }
 
   function redo() {
-    const current = ref.current.get(snapshotId);
+    const current = ref.current;
     const next = current?.redo.at(-1);
     if (!current || !next || strokeRef.current) return;
-    writeHistory(snapshotId, { current: next, undo: [...current.undo, current.current], redo: current.redo.slice(0, -1) });
+    writeHistory({ current: next, undo: [...current.undo, current.current], redo: current.redo.slice(0, -1) });
   }
 
   function reset() {
@@ -221,19 +216,18 @@ export function useEdgeHighlight(
     setTool(null);
     setBrushDraft(null);
     setStroke(false);
-    write(new Map());
+    writeHistory(emptyHistory());
   }
 
-  function restore(snapshots: { id: string; edgeManualRegions?: string[] }[], packed: Uint32Array[] | undefined, regions: ShadowRegion[]) {
+  function restore(manualRecipes: string[] | undefined, packed: Uint32Array | undefined, recipes: readonly { id: string }[]) {
     reset();
-    if (!packed) return;
-    write(new Map(snapshots.map((snapshot, index) => [snapshot.id, emptyHistory({
-      coverage: unpackShadowCoverage(packed[index], regions), manualRegions: new Set(snapshot.edgeManualRegions),
-    })])));
+    if (packed) writeHistory(emptyHistory({
+      coverage: unpackShadowCoverage(packed, recipes), manualRecipes: new Set(manualRecipes),
+    }));
   }
 
   return {
-    available: Boolean(api?.previewRidgeBand), regionHasShadow,
+    available: Boolean(api?.previewRidgeBand), recipeHasShadow,
     tool, setTool, stroke, beginBrush, paintFaces, endBrush,
     coverage: brushDraft ?? history.current.coverage, committed: history.current.coverage,
     preview: ready?.preview, previewing, confirming,
@@ -244,14 +238,11 @@ export function useEdgeHighlight(
     start() { setTool(null); setPreviewing(true); },
     cancel, apply, undo, redo,
     canUndo: history.undo.length > 0, canRedo: history.redo.length > 0,
-    duplicate(targetId: string) {
-      writeHistory(targetId, emptyHistory(ref.current.get(snapshotId)?.current));
-    },
-    exportProject(ids: string[], regions: ShadowRegion[]) {
-      return ids.map((id) => {
-        const edge = ref.current.get(id)?.current ?? emptyEdges;
-        return { packed: packShadowCoverage(edge.coverage, regions), manual: [...edge.manualRegions] };
-      });
+    exportProject(recipes: readonly { id: string }[], coverage: ShadowCoverage) {
+      const edge = ref.current.current;
+      const ids = new Set(recipes.map(({ id }) => id));
+      const manual = [...edge.manualRecipes].filter((key) => ids.has(key) || ids.has(key.slice(key.indexOf('/') + 1)));
+      return { packed: packShadowCoverage(edge.coverage, recipes, coverage), manual };
     },
     restore, reset,
   };

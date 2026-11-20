@@ -34,11 +34,9 @@ it.skipIf(!built)('aims the actual kit lighting with the ball and the current vi
         } }],
         activeRecipeId: 'coat',
         references: [], activeReferenceId: null,
-        regions: [{ id: 'region', name: 'Coat', recipeId: 'coat' }],
-        activeRegionId: 'region',
-        snapshots: [{ id: 'light', name: 'Light', azimuth: 35, elevation: 50,
-          midtone: 35, highlight: 75, applied: false, manual: false }],
-        activeSnapshotId: 'light',
+        lighting: { sources: [{ id: 'light', name: 'Light', azimuth: 35, elevation: 50, intensity: 100 }],
+          activeSourceId: 'light', midtone: 35, highlight: 75, castShadowsBetweenParts: true,
+          applied: false, manual: false },
         kit: {
           parts: [
             { id: 'anchor', name: 'Anchor', sourceName: 'anchor.stl', pose: IDENTITY_PART_POSE, hidden: false, staged: false },
@@ -50,13 +48,14 @@ it.skipIf(!built)('aims the actual kit lighting with the ball and the current vi
       },
       referenceBytes: [],
       paint: Uint32Array.of(0, 0, 0, 0, 1, 1, 0, 0),
-      tones: [new Uint32Array()],
+      toneMask: new Uint32Array(),
     }, [child]);
 
     const app = await electron.launch({ args: [root], cwd: root });
     try {
       await app.evaluate(({ dialog }, file) => {
         dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [file] });
+        dialog.showMessageBoxSync = () => 1;
       }, project);
       const page = await app.firstWindow();
       page.setDefaultTimeout(10000);
@@ -105,6 +104,56 @@ it.skipIf(!built)('aims the actual kit lighting with the ball and the current vi
       expect(await angles()).toEqual([0, 45]);
       await page.getByText('1 midtone faces, including 0 highlights.').waitFor();
 
+      const histogram = page.getByRole('img', { name: 'Distribution of light exposure on painted faces' });
+      await histogram.waitFor();
+      const highlightCutoff = page.getByRole('slider', { name: 'Highlight cutoff' });
+      async function swatchPixels(rgb: [number, number, number]) {
+        const shot = await page.locator('[data-testid="viewport-canvas"] canvas').screenshot({ scale: 'css' });
+        return page.evaluate(async ({ png, rgb: [red, green, blue] }) => {
+          const image = new Image();
+          image.src = 'data:image/png;base64,' + png;
+          await image.decode();
+          const context = new OffscreenCanvas(image.width, image.height).getContext('2d')!;
+          context.drawImage(image, 0, 0);
+          const { data } = context.getImageData(0, 0, image.width, image.height);
+          let count = 0;
+          for (let i = 0; i < data.length; i += 4) {
+            if (data[i] === red && data[i + 1] === green && data[i + 2] === blue) count++;
+          }
+          return count;
+        }, { png: shot.toString('base64'), rgb });
+      }
+      const highlightPixels = () => swatchPixels([238, 216, 195]);
+      const basePaintPixels = () => swatchPixels([50, 84, 135]);
+      const showLighting = page.getByRole('checkbox', { name: 'Show lighting' });
+      expect(await highlightPixels()).toBe(0);
+      await highlightCutoff.scrollIntoViewIfNeeded();
+      const track = await highlightCutoff.boundingBox();
+      if (!track) throw new Error('Lighting levels track is missing.');
+      const trackX = (fraction: number) => track.x + 7 + (track.width - 14) * fraction;
+      await page.mouse.move(trackX(0.75), track.y + track.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(trackX(0.65), track.y + track.height / 2, { steps: 5 });
+      await page.mouse.up();
+      expect(Number(await highlightCutoff.inputValue())).toBeLessThanOrEqual(66);
+      await page.getByText('1 midtone faces, including 1 highlights.').waitFor();
+      await expect.poll(highlightPixels).toBeGreaterThan(100);
+      expect(await showLighting.isChecked()).toBe(true);
+      await showLighting.uncheck();
+      await handle.waitFor({ state: 'hidden' });
+      await expect.poll(highlightPixels).toBe(0);
+      await expect.poll(basePaintPixels).toBeGreaterThan(100);
+      await showLighting.check();
+      await handle.waitFor();
+      await expect.poll(highlightPixels).toBeGreaterThan(100);
+      await page.getByLabel('Highlights start percent').fill('75');
+      expect(await highlightCutoff.inputValue()).toBe('75');
+      await page.getByText('1 midtone faces, including 0 highlights.').waitFor();
+      const castShadows = page.getByRole('checkbox', { name: 'Shadows from other parts' });
+      expect(await castShadows.isChecked()).toBe(true);
+      await castShadows.uncheck();
+      await page.getByText('1 midtone faces, including 0 highlights.').waitFor();
+
       await aimFromView.click();
       await page.getByText('1 midtone faces, including 1 highlights.').waitFor();
       expect(await angles()).toEqual([0, 0]);
@@ -144,6 +193,21 @@ it.skipIf(!built)('aims the actual kit lighting with the ball and the current vi
       expect((await angles())[1]).toBe(3);
       await page.getByRole('button', { name: 'Finish aiming' }).click();
       await handle.waitFor({ state: 'hidden' });
+      await page.getByRole('button', { name: 'Add light', exact: true }).click();
+      await page.getByRole('option', { name: 'Light 2 · 30%' }).waitFor({ state: 'attached' });
+      await page.getByLabel('Light name').fill('Fill light');
+      await page.getByRole('option', { name: 'Fill light · 30%' }).waitFor({ state: 'attached' });
+      await page.getByLabel('Light source', { exact: true }).selectOption('light');
+      await page.getByRole('button', { name: 'Front view', exact: true }).click();
+      await page.getByRole('button', { name: 'Fit selected part', exact: true }).click();
+      await aimFromView.click();
+      await expect.poll(highlightPixels).toBeGreaterThan(100);
+      await page.getByRole('button', { name: 'Apply lighting', exact: true }).click();
+      await showLighting.uncheck();
+      await expect.poll(highlightPixels).toBe(0);
+      await expect.poll(basePaintPixels).toBeGreaterThan(100);
+      await showLighting.check();
+      await expect.poll(highlightPixels).toBeGreaterThan(100);
     } finally {
       await app.close();
     }

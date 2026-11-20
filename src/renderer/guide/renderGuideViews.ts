@@ -87,8 +87,8 @@ interface GuideRenderOptions {
 export function passIncludesFace(pass: GuidePass, hit?: ShadowHit, tone?: ToneAssignment, edge?: ShadowHit): boolean {
   if (!hit) return false;
   if (pass === 'shadow') return true;
-  if (pass === 'edge') return edge?.regionId === hit.regionId;
-  return tone?.regionId === hit.regionId && (pass === 'midtone' || tone.tone === 'highlight');
+  if (pass === 'edge') return edge?.recipeId === hit.recipeId;
+  return tone?.recipeId === hit.recipeId && (pass === 'midtone' || tone.tone === 'highlight');
 }
 
 type GuideSource = { model: ModelSummary; address: typeof ANCHOR_ADDRESS; matrix: THREE.Matrix4 };
@@ -98,20 +98,20 @@ async function renderDetails(options: GuideRenderOptions, sources: GuideSource[]
   const { rows, coverage, tones, edges, detailCallouts, readBatch, signal } = options;
   const details: NonNullable<GuideExport['details']> = {};
   if (!detailCallouts) return details;
-  type RegionBatch = { filePath: string; matrix: THREE.Matrix4; faceOffset: number; batchIndex: number; hits: ShadowHit[] };
-  const regions = new Map(rows.map((row) => [row.id, [] as RegionBatch[]]));
+  type RecipeBatch = { filePath: string; matrix: THREE.Matrix4; faceOffset: number; batchIndex: number; hits: ShadowHit[] };
+  const byRecipe = new Map(rows.map((row) => [row.id, [] as RecipeBatch[]]));
   for (const source of sources) {
     for (const batch of source.model.batches) {
       const batchIndex = batch.batchIndex + source.address.batchOffset;
-      const batches = new Map<string, RegionBatch>();
+      const batches = new Map<string, RecipeBatch>();
       for (const hit of coverage.get(batchIndex)?.values() ?? []) {
-        const region = regions.get(hit.regionId);
-        if (!region) continue;
-        let entry = batches.get(hit.regionId);
+        const recipeBatches = byRecipe.get(hit.recipeId);
+        if (!recipeBatches) continue;
+        let entry = batches.get(hit.recipeId);
         if (!entry) {
           entry = { filePath: batch.filePath, matrix: source.matrix, faceOffset: source.address.faceOffset, batchIndex, hits: [] };
-          batches.set(hit.regionId, entry);
-          region.push(entry);
+          batches.set(hit.recipeId, entry);
+          recipeBatches.push(entry);
         }
         entry.hits.push(hit);
       }
@@ -120,7 +120,7 @@ async function renderDetails(options: GuideRenderOptions, sources: GuideSource[]
 
   const vertex = new THREE.Vector3();
   for (const row of rows) {
-    const batches = regions.get(row.id)!;
+    const batches = byRecipe.get(row.id)!;
     if (!batches.length) continue;
     const chunks = [];
     for (const batch of batches) {
@@ -137,7 +137,7 @@ async function renderDetails(options: GuideRenderOptions, sources: GuideSource[]
       chunks.push({ hits, positions, shades: tones.get(batch.batchIndex), band: edges?.get(batch.batchIndex) });
     }
 
-    const callouts = detailCallouts.filter((callout) => callout.regionId === row.id);
+    const callouts = detailCallouts.filter((callout) => callout.recipeId === row.id);
     for (const pass of passes) {
       const swatch = pass === 'edge' ? row.edgeSwatch : row.swatches?.[pass];
       const color = new THREE.Color(swatch?.hex ?? (pass === 'edge' ? 0x48a887 : 0xd6dbd7));
@@ -168,7 +168,7 @@ async function renderDetails(options: GuideRenderOptions, sources: GuideSource[]
         for (const callout of callouts.length ? callouts : [undefined]) {
           signal.throwIfAborted();
           const { camera, ...position } = frameGuideDetail(geometries, frame, overview, callout);
-          cards.push({ ...position, regionId: row.id, image: render(scene, camera, color) });
+          cards.push({ ...position, recipeId: row.id, image: render(scene, camera, color) });
         }
       } finally {
         for (const geometry of geometries) geometry.dispose();
@@ -244,7 +244,7 @@ export async function renderGuideViews(options: GuideRenderOptions) {
           const id = data.faceIds[i] + source.address.faceOffset;
           const hit = faces?.get(id);
           const shade = shades?.get(id);
-          const palette = hit && swatches.get(hit.regionId);
+          const palette = hit && swatches.get(hit.recipeId);
           const offset = i * 9;
           // A restrained grayscale normal response gives uncovered shapes readable contours.
           const relief = 0.8 + 0.2 * Math.abs(data.normals[offset + 1] * 0.6 + data.normals[offset + 2] * 0.8);

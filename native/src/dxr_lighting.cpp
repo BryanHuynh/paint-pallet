@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 #include "exposure_shader.h"
@@ -85,7 +86,7 @@ class DxrLighting::Scene {
     parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
     parameters[2].Descriptor.ShaderRegister = 0;
     parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    parameters[3].Constants = {0, 0, 6};
+    parameters[3].Constants = {0, 0, 7};
     D3D12_ROOT_SIGNATURE_DESC signatureDesc{};
     signatureDesc.NumParameters = 4;
     signatureDesc.pParameters = parameters;
@@ -101,40 +102,51 @@ class DxrLighting::Scene {
     checked(device_->CreateComputePipelineState(&compute, IID_PPV_ARGS(&pipeline_)), "Could not load the DXR exposure shader");
   }
 
-  bool build(const ModelRecord& model, const std::atomic<bool>& canceled,
+  bool build(const std::vector<LightingPart>& layout, const std::atomic<bool>& canceled,
       bool limitBudget, DxrTimings& timing) {
     struct BottomLevel {
       D3D12_RAYTRACING_GEOMETRY_DESC geometry{};
+      const BatchDescriptor* batch = nullptr;
+      size_t partIndex = 0;
       uint64_t vertexOffset = 0;
       uint64_t resultOffset = 0;
     };
     std::vector<BottomLevel> bottom;
-    bottom.reserve(model.batches.size());
     uint64_t vertexBytes = 0, bottomBytes = 0, scratchBytes = 0;
+    uint64_t trianglesTotal = 0, maxBatchBytes = 0;
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS input{};
     input.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
     input.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
     input.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
     input.NumDescs = 1;
-    for (const auto& batch : model.batches) {
-      auto& item = bottom.emplace_back();
-      item.geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-      item.geometry.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
-      auto& triangles = item.geometry.Triangles;
-      triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-      triangles.VertexCount = batch.triangleCount * 3;
-      triangles.VertexBuffer.StrideInBytes = 3 * sizeof(float);
-      input.pGeometryDescs = &item.geometry;
-      D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO sizes{};
-      device_->GetRaytracingAccelerationStructurePrebuildInfo(&input, &sizes);
-      if (!sizes.ResultDataMaxSizeInBytes || !sizes.ScratchDataSizeInBytes) throw std::runtime_error("Invalid DXR batch sizes");
-      item.vertexOffset = vertexBytes;
-      item.resultOffset = bottomBytes;
-      vertexBytes += batch.triangleCount * bytesPerFace;
-      bottomBytes += aligned(sizes.ResultDataMaxSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
-      scratchBytes = std::max(scratchBytes, sizes.ScratchDataSizeInBytes);
+    for (size_t partIndex = 0; partIndex < layout.size(); ++partIndex) {
+      const auto& part = layout[partIndex];
+      trianglesTotal += part.model->triangleCount;
+      partEnds_.push_back(static_cast<uint32_t>(trianglesTotal));
+      scoreCount_ = std::max(scoreCount_, static_cast<size_t>(part.faceOffset) + part.model->triangleCount);
+      for (const auto& batch : part.model->batches) {
+        auto& item = bottom.emplace_back();
+        item.batch = &batch;
+        item.partIndex = partIndex;
+        item.geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+        item.geometry.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+        auto& triangles = item.geometry.Triangles;
+        triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+        triangles.VertexCount = batch.triangleCount * 3;
+        triangles.VertexBuffer.StrideInBytes = 3 * sizeof(float);
+        input.pGeometryDescs = &item.geometry;
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO sizes{};
+        device_->GetRaytracingAccelerationStructurePrebuildInfo(&input, &sizes);
+        if (!sizes.ResultDataMaxSizeInBytes || !sizes.ScratchDataSizeInBytes) throw std::runtime_error("Invalid DXR batch sizes");
+        item.vertexOffset = vertexBytes;
+        item.resultOffset = bottomBytes;
+        maxBatchBytes = std::max(maxBatchBytes, batch.triangleCount * bytesPerFace);
+        vertexBytes += batch.triangleCount * bytesPerFace;
+        bottomBytes += aligned(sizes.ResultDataMaxSizeInBytes, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+        scratchBytes = std::max(scratchBytes, sizes.ScratchDataSizeInBytes);
+      }
     }
-    if (vertexBytes != model.triangleCount * bytesPerFace || bottom.empty()) throw std::runtime_error("Invalid DXR mesh batches");
+    if (vertexBytes != trianglesTotal * bytesPerFace || bottom.empty()) throw std::runtime_error("Invalid DXR mesh batches");
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS top{};
     top.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
     top.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
@@ -143,7 +155,7 @@ class DxrLighting::Scene {
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO topSizes{};
     device_->GetRaytracingAccelerationStructurePrebuildInfo(&top, &topSizes);
     scratchBytes = std::max(scratchBytes, topSizes.ScratchDataSizeInBytes);
-    const uint64_t scoreBytes = model.triangleCount * sizeof(float);
+    const uint64_t scoreBytes = trianglesTotal * sizeof(float);
     const uint64_t total = vertexBytes + bottomBytes + topSizes.ResultDataMaxSizeInBytes + scratchBytes + scoreBytes;
     requireBudget(total, limitBudget, timing);
     if (canceled.load(std::memory_order_relaxed)) return false;
@@ -157,12 +169,26 @@ class DxrLighting::Scene {
     recordUsage(timing);
 
     // Stream original positions to local memory using a reusable small staging buffer.
-    uint64_t maxBatchBytes = 0;
-    for (const auto& batch : model.batches) maxBatchBytes = std::max(maxBatchBytes, batch.triangleCount * bytesPerFace);
     constexpr size_t chunkBatches = 20;
     auto upload = buffer(maxBatchBytes * chunkBatches, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     PickBatchCache data(1);
-    ids_.reserve(model.triangleCount);
+    ids_.reserve(trianglesTotal);
+    std::vector<LightingTransform> transforms;
+    std::vector<bool> isIdentity;
+    std::array<float, 3> minimum, maximum;
+    minimum.fill(std::numeric_limits<float>::infinity());
+    maximum.fill(-std::numeric_limits<float>::infinity());
+    for (const auto& part : layout) {
+      transforms.emplace_back(part.pose);
+      const bool identity = part.pose == LightingPart{}.pose;
+      isIdentity.push_back(identity);
+      if (identity) {
+        for (size_t axis = 0; axis < 3; ++axis) {
+          minimum[axis] = std::min(minimum[axis], part.model->bounds.min[axis]);
+          maximum[axis] = std::max(maximum[axis], part.model->bounds.max[axis]);
+        }
+      }
+    }
     D3D12_RANGE noRead{0, 0};
     for (size_t offset = 0; offset < bottom.size(); offset += chunkBatches) {
       if (canceled.load(std::memory_order_relaxed)) return false;
@@ -170,15 +196,30 @@ class DxrLighting::Scene {
       uint8_t* destination = nullptr;
       checked(upload->Map(0, &noRead, reinterpret_cast<void**>(&destination)), "Could not map original positions");
       for (size_t i = offset; i < end; i++) {
-        const auto batch = data.getOrLoad(model.batches[i].filePath);
-        if (!batch || batch->faceIds.size() != model.batches[i].triangleCount) {
+        const auto& item = bottom[i];
+        const auto batch = data.getOrLoad(item.batch->filePath);
+        if (!batch || batch->faceIds.size() != item.batch->triangleCount) {
           upload->Unmap(0, nullptr);
           throw std::runtime_error("Original mesh batches are unavailable for DXR");
         }
         const size_t bytes = batch->positions.size() * sizeof(float);
         const size_t chunkOffset = (i - offset) * maxBatchBytes;
-        std::memcpy(destination + chunkOffset, batch->positions.data(), bytes);
-        ids_.insert(ids_.end(), batch->faceIds.begin(), batch->faceIds.end());
+        if (isIdentity[item.partIndex]) {
+          std::memcpy(destination + chunkOffset, batch->positions.data(), bytes);
+        } else {
+          const auto& transform = transforms[item.partIndex];
+          auto* target = reinterpret_cast<float*>(destination + chunkOffset);
+          for (size_t vertex = 0; vertex < batch->positions.size(); vertex += 3) {
+            for (size_t axis = 0; axis < 3; ++axis) {
+              const float value = transform.transformCoordinate(&batch->positions[vertex], axis);
+              target[vertex + axis] = value;
+              minimum[axis] = std::min(minimum[axis], value);
+              maximum[axis] = std::max(maximum[axis], value);
+            }
+          }
+        }
+        const size_t faceOffset = layout[item.partIndex].faceOffset;
+        for (uint32_t id : batch->faceIds) ids_.push_back(static_cast<uint32_t>(faceOffset + id));
         list_->CopyBufferRegion(positions_.Get(), bottom[i].vertexOffset, upload.Get(), chunkOffset, bytes);
       }
       upload->Unmap(0, nullptr);
@@ -201,6 +242,7 @@ class DxrLighting::Scene {
       auto& instance = instances[i];
       instance.Transform[0][0] = instance.Transform[1][1] = instance.Transform[2][2] = 1;
       instance.InstanceMask = 0xff;
+      instance.InstanceID = static_cast<UINT>(item.partIndex + 1);
       instance.AccelerationStructure = build.DestAccelerationStructureData;
       if ((i + 1) % chunkBatches == 0) submit();
     }
@@ -221,35 +263,42 @@ class DxrLighting::Scene {
     barrier(top_.Get());
     submit();
     recordUsage(timing);
-    modelId = model.modelId;
+    for (size_t axis = 0; axis < 3; ++axis) extent_ = std::max(extent_, maximum[axis] - minimum[axis]);
     return !canceled.load(std::memory_order_relaxed);
   }
 
-  bool trace(const ModelRecord& model, const std::array<float, 3>& rawDirection,
-      const std::atomic<bool>& canceled, std::vector<float>& scores, DxrTimings& timing) {
+  bool trace(const std::array<float, 3>& rawDirection,
+      const std::atomic<bool>& canceled, std::vector<float>& scores, DxrTimings& timing,
+      bool selfOnly) {
     recordUsage(timing);
     if (timing.peakDedicatedBytes > timing.budget * 0.95) {
       throw std::runtime_error("Dedicated GPU memory budget has dropped");
     }
     const double length = std::hypot(rawDirection[0], rawDirection[1], rawDirection[2]);
     if (!(length > 0) || !std::isfinite(length)) throw std::runtime_error("Invalid DXR light direction");
-    struct Constants { float x, y, z, bias; uint32_t first, count; };
-    float extent = 0;
-    for (size_t axis = 0; axis < 3; axis++) extent = std::max(extent, model.bounds.max[axis] - model.bounds.min[axis]);
+    struct Constants { float x, y, z, bias; uint32_t first, count, part; };
     Constants constants{static_cast<float>(rawDirection[0] / length), static_cast<float>(rawDirection[1] / length),
-        static_cast<float>(rawDirection[2] / length), std::max(1e-7f, extent * 1e-6f), 0, 0};
+        static_cast<float>(rawDirection[2] / length), std::max(1e-7f, extent_ * 1e-6f), 0, 0, 0};
     const auto start = Clock::now();
     constexpr uint32_t dispatchFaces = 1u << 21;
-    for (uint32_t first = 0; first < model.triangleCount; first += dispatchFaces) {
+    const uint32_t faceCount = static_cast<uint32_t>(ids_.size());
+    size_t partIndex = 0;
+    for (uint32_t first = 0; first < faceCount; first += constants.count) {
       if (canceled.load(std::memory_order_relaxed)) return false;
+      uint32_t end = faceCount;
+      if (selfOnly) {
+        while (first >= partEnds_[partIndex]) ++partIndex;
+        end = partEnds_[partIndex];
+        constants.part = static_cast<uint32_t>(partIndex + 1);
+      }
       constants.first = first;
-      constants.count = std::min(dispatchFaces, model.triangleCount - first);
+      constants.count = std::min(dispatchFaces, end - first);
       list_->SetPipelineState(pipeline_.Get());
       list_->SetComputeRootSignature(signature_.Get());
       list_->SetComputeRootShaderResourceView(0, top_->GetGPUVirtualAddress());
       list_->SetComputeRootShaderResourceView(1, positions_->GetGPUVirtualAddress());
       list_->SetComputeRootUnorderedAccessView(2, output_->GetGPUVirtualAddress());
-      list_->SetComputeRoot32BitConstants(3, 6, &constants, 0);
+      list_->SetComputeRoot32BitConstants(3, 7, &constants, 0);
       list_->Dispatch((constants.count + 127) / 128, 1, 1);
       barrier(output_.Get());
       submit();
@@ -265,7 +314,7 @@ class DxrLighting::Scene {
     if (canceled.load(std::memory_order_relaxed)) return false;
     D3D12_RANGE range{0, bytes};
     const float* data = nullptr;
-    scores.resize(model.triangleCount);
+    scores.assign(scoreCount_, 0);
     void* mapping = nullptr;
     checked(readback_->Map(0, &range, &mapping), "Could not read DXR exposure");
     data = static_cast<const float*>(mapping);
@@ -277,7 +326,7 @@ class DxrLighting::Scene {
     return true;
   }
 
-  std::string modelId;
+  std::string sceneKey;
 
  private:
   void recordUsage(DxrTimings& timing) {
@@ -347,6 +396,9 @@ class DxrLighting::Scene {
   ComPtr<ID3D12PipelineState> pipeline_;
   ComPtr<ID3D12Resource> positions_, bottom_, top_, output_, readback_;
   std::vector<uint32_t> ids_;
+  std::vector<uint32_t> partEnds_;
+  size_t scoreCount_ = 0;
+  float extent_ = 0.0f;
   HANDLE event_ = nullptr;
   uint64_t sequence_ = 0;
 };
@@ -357,20 +409,25 @@ void DxrLighting::clear() { scene_.reset(); }
 
 bool DxrLighting::compute(const ModelRecord& model, const std::array<float, 3>& direction,
     const std::atomic<bool>& canceled, const std::string& option,
-    std::vector<float>& scores, DxrTimings& timing) {
+    std::vector<float>& scores, DxrTimings& timing, const std::vector<LightingPart>& parts,
+    bool castShadowsBetweenParts) {
   if (option == "simulate-unsupported") throw std::runtime_error("DXR capability unavailable (benchmark simulation)");
   if (option == "simulate-failure") throw std::runtime_error("DXR device failure (benchmark simulation)");
   if (canceled.load(std::memory_order_relaxed)) return false;
-  if (!scene_ || scene_->modelId != model.modelId || option == "simulate-low-memory") {
+  const std::vector<LightingPart> single = {{&model}};
+  const auto& layout = parts.empty() ? single : parts;
+  const std::string key = lightingSceneKey(model, layout);
+  if (!scene_ || scene_->sceneKey != key || option == "simulate-low-memory") {
     const auto start = Clock::now();
     scene_.reset();
     auto next = std::make_unique<Scene>();
     next->initialize();
-    if (!next->build(model, canceled, option == "simulate-low-memory", timing)) return false;
+    if (!next->build(layout, canceled, option == "simulate-low-memory", timing)) return false;
+    next->sceneKey = key;
     scene_ = std::move(next);
     timing.setupMs = ms(start);
   }
-  return scene_->trace(model, direction, canceled, scores, timing);
+  return scene_->trace(direction, canceled, scores, timing, layout.size() > 1 && !castShadowsBetweenParts);
 }
 
 }  // namespace pp

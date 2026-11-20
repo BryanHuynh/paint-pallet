@@ -41,12 +41,12 @@ function guidePin(x: number, y: number, number: number) {
 export function renderGuideDocument(guide: GuideExport) {
   const passes = imagePasses(guide.images);
   if ((guide.paper !== 'Letter' && guide.paper !== 'A4') ||
-      typeof guide.modelName !== 'string' || typeof guide.snapshot !== 'string' ||
+      typeof guide.modelName !== 'string' || typeof guide.lighting !== 'string' ||
       !Array.isArray(guide.rows) || !Array.isArray(guide.callouts) ||
       !validImages(guide.images) ||
       (guide.installationViews !== undefined && !validViewImages(guide.installationViews)) ||
       (guide.details !== undefined && (!guide.details || !Object.values(guide.details).every((cards) =>
-        Array.isArray(cards) && cards.every((card) => card && typeof card.regionId === 'string' && validImage(card.image) &&
+        Array.isArray(cards) && cards.every((card) => card && typeof card.recipeId === 'string' && validImage(card.image) &&
           (card.view === 'Top' || card.view === 'Bottom' || GUIDE_VIEWS.includes(card.view)) && validPosition(card.x) && validPosition(card.y))))) ||
       (guide.isolatedSheets !== undefined && (!Array.isArray(guide.isolatedSheets) ||
         !guide.isolatedSheets.every((sheet) => typeof sheet.partName === 'string' && validImages(sheet.images)))) ||
@@ -70,16 +70,16 @@ export function renderGuideDocument(guide: GuideExport) {
   });
 
   const description = '<p class="subtitle">' + escapeText(guide.modelName) + ' · ' +
-    escapeText(guide.snapshot) + '</p>';
+    escapeText(guide.lighting) + '</p>';
   const heads = passes.map((pass) => '<th scope="col">' + label(pass) + '</th>');
   const reference = '<section><h1>Painting guide</h1>' + description +
-    '<h2>Paint recipes by region</h2><table><thead><tr><th scope="col">Region</th>' + heads.join('') +
+    '<h2>Paint recipes</h2><table><thead><tr><th scope="col">Recipe</th>' + heads.join('') +
     '</tr></thead><tbody>' + swatches.join('') + '</tbody></table></section>';
 
   const rows = new Map(guide.rows.map((row, index) => [row.id, { name: row.name, number: index + 1 }]));
   function detailSheets(pass: GuidePass) {
-    const figures = guide.details?.[pass]?.flatMap(({ regionId, view, image, x, y }) => {
-      const row = rows.get(regionId);
+    const figures = guide.details?.[pass]?.flatMap(({ recipeId, view, image, x, y }) => {
+      const row = rows.get(recipeId);
       if (!row) return [];
       return '<figure><figcaption>' + escapeText(row.name) + ' · ' + view + '</figcaption>' +
         '<div class="view"><img src="' + image + '" alt="">' + guidePin(x, y, row.number) + '</div></figure>';
@@ -94,11 +94,11 @@ export function renderGuideDocument(guide: GuideExport) {
 
   function paintSheets(images: GuideImages, partName?: string) {
     return imagePasses(images).map((pass) => {
-      const paintedRegions = guide.details && new Set(guide.details[pass]?.map((card) => card.regionId));
+      const paintedRecipes = guide.details && new Set(guide.details[pass]?.map((card) => card.recipeId));
       const views = GUIDE_VIEWS.map((view, index) => {
         const pins = partName ? [] : guide.callouts.flatMap((callout) => {
-          const row = rows.get(callout.regionId);
-          if (callout.view !== view || !row || (paintedRegions && !paintedRegions.has(callout.regionId)) ||
+          const row = rows.get(callout.recipeId);
+          if (callout.view !== view || !row || (paintedRecipes && !paintedRecipes.has(callout.recipeId)) ||
             !validPosition(callout.x) || !validPosition(callout.y)) return [];
           return guidePin(callout.x, callout.y, row.number);
         });

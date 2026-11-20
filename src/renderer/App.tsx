@@ -1,5 +1,5 @@
-import { Ray, Vector3 } from 'three';
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Box3, Ray, Vector3 } from 'three';
+import React, { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from 'react';
 import type {
   AxisDirection,
   Bounds3,
@@ -14,7 +14,7 @@ import { ALL_AXES, getOrthogonalFrontOptions } from './orientation';
 import { findRayIntersectingBatchIndices, Viewport3D, type CameraPreset, type PickGenerationToken } from './components/Viewport3D';
 import PaintingGuideDialog from './guide/PaintingGuideDialog';
 import type { GuideCallout, GuideRow } from '../shared/paintingGuide';
-import type { OpenedProject } from '../shared/paintProject';
+import type { OpenedProject, ProjectFile } from '../shared/paintProject';
 import type { PaletteProjectHandle, PreparedPaletteProject } from './palette/paletteProject';
 import type { PaintRecipe } from './palette/types';
 import { createEmptyRecipe } from './palette/recipes';
@@ -30,8 +30,10 @@ import { useShadowPainting } from './paint/useShadowPainting';
 import { LightingPanel } from './paint/LightingPanel';
 import { renderToneMask, toneColorKey } from './paint/lightingState';
 import { useSurfaceLighting, worldLightDirection } from './paint/useSurfaceLighting';
-import { FILL_PREVIEW_REGION, unpackFillFaces, useConnectedFill } from './paint/useConnectedFill';
+import { FILL_PREVIEW_RECIPE, useConnectedFill } from './paint/useConnectedFill';
 import appLogoUrl from '../../assets/paint-pallet-logo.png';
+import fieldRobotUrl from '../../assets/field-robot.webp';
+import { ModelTutorial, tutorialSteps } from './components/ModelTutorial';
 
 type PaletteComponent = React.ComponentType<Record<string, unknown>>;
 
@@ -68,21 +70,31 @@ export default function App({
   const ResolvedPalette = PaletteWorkspaceComponent ?? resolveDiscoveredPalette();
 
   const [recipes, setRecipes] = useState<PaintRecipe[]>(() => [createEmptyRecipe(1)]);
-  const shadow = useShadowPainting(recipes);
+  const [activeRecipeId, setActiveRecipeId] = useState<string | null>('recipe-1');
+  const shadow = useShadowPainting(recipes, activeRecipeId);
+  const [guideCallouts, setGuideCallouts] = useState<GuideCallout[]>([]);
   const paletteProject = useRef<PaletteProjectHandle | null>(null);
+  const [referenceEdits, setReferenceEdits] = useState(0);
+  const markReferenceEdit = useCallback(() => setReferenceEdits((count) => count + 1), []);
+  const paletteWorkspace = useMemo(() => ResolvedPalette
+    ? <ResolvedPalette recipes={recipes} setRecipes={setRecipes} activeRecipeId={activeRecipeId}
+      setActiveRecipeId={setActiveRecipeId} usedRecipeIds={shadow.usedRecipeIds}
+      projectRef={paletteProject} onProjectChange={markReferenceEdit} />
+    : null, [ResolvedPalette, recipes, activeRecipeId, shadow.usedRecipeIds, markReferenceEdit]);
   const pendingProject = useRef<{ project: OpenedProject; palette: PreparedPaletteProject } | null>(null);
   const projectMenu = useRef<HTMLDetailsElement | null>(null);
   const [guideOpen, setGuideOpen] = useState(false);
-  const [guideCallouts, setGuideCallouts] = useState<GuideCallout[]>([]);
-  const guideRows = useMemo<GuideRow[]>(() => {
-    const palette = new Map(recipes.map((recipe) => [recipe.id, recipe]));
-    return shadow.regions.map((region) => {
-      const recipe = palette.get(region.recipeId);
-      return { id: region.id, name: region.name.trim() || 'Untitled region', swatches: recipe?.swatches ?? null, edgeSwatch: recipe?.edgeSwatch };
-    });
-  }, [recipes, shadow.regions]);
+  const guideRows = useMemo<GuideRow[]>(() => recipes.filter(({ id }) => shadow.faceCounts.has(id))
+    .map(({ id, name, swatches, edgeSwatch }) => ({ id, name: name.trim() || 'Untitled recipe', swatches, edgeSwatch })),
+  [recipes, shadow.faceCounts]);
   const [projectAction, setProjectAction] = useState<'open' | 'save' | null>(null);
+  const [projectFile, setProjectFile] = useState<ProjectFile | null>(null);
+  const [recentProjects, setRecentProjects] = useState<ProjectFile[]>([]);
+  const [projectNotice, setProjectNotice] = useState('');
   const [activeTab, setActiveTab] = useState<'model' | 'palette'>('model');
+  const [tutorialIndex, setTutorialIndex] = useState<number | null>(null);
+  const tutorialStep = tutorialIndex === null ? undefined : tutorialSteps[tutorialIndex];
+  const tutorialButton = useRef<HTMLButtonElement>(null);
   const [model, setModel] = useState<ModelSummary | null>(null);
   const [parts, setParts] = useState<KitPart[]>([]);
   const [focusId, setFocusId] = useState('');
@@ -115,15 +127,17 @@ export default function App({
     pose: part.id === ghostPart?.id ? assembly.draft!.pose : part.pose,
   })) : undefined, [parts, isolatedPartId, ghostPart?.id, assembly.draft?.pose]);
   const [aimingLight, setAimingLight] = useState(false);
+  const [showLighting, setShowLighting] = useState(true);
   const [previewBeforeFill, setPreviewBeforeFill] = useState(false);
+  const [repaintFill, setRepaintFill] = useState(false);
   const [pendingModel, setPendingModel] = useState<ModelSummary | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [isCommitting, setIsCommitting] = useState(false);
   const isBusy = isImporting || kitImporting || Boolean(pendingModel) || isCommitting || projectAction !== null;
-  const fillEnabled = canPaintPart && !assembly.draft && !aimingLight && !isImporting && !kitImporting &&
+  const fillEnabled = canPaintPart && !assembly.draft && !(showLighting && aimingLight) && !isImporting && !kitImporting &&
     !pendingModel && projectAction !== 'open' && shadow.tool === 'fill' && Boolean(shadow.recipe);
-  const fill = useConnectedFill(api, fillEnabled, displayModel?.modelId, shadow.region?.id,
-    shadow.committedCoverage, paintPart, previewBeforeFill, shadow.commitFill);
+  const fill = useConnectedFill(api, fillEnabled, shadow.recipe?.id, shadow.committedCoverage,
+    previewBeforeFill, repaintFill, shadow.commitFill);
   const fillPickVersion = useRef(0);
   function cancelFill() {
     ++fillPickVersion.current;
@@ -143,33 +157,80 @@ export default function App({
   const lightDirection = useMemo(() => worldLightDirection(lighting.azimuth, lighting.elevation).toArray(),
     [lighting.azimuth, lighting.elevation]);
   useEffect(() => {
-    if (!lighting.previewing || !lighting.hasShadow || !canPaintPart || assembly.draft) {
+    if (!lighting.previewing || !lighting.hasShadow || !lighting.source || !canPaintPart || assembly.draft) {
       setAimingLight(false);
       setLightCameraRequest(null);
     }
-  }, [lighting.previewing, lighting.hasShadow, canPaintPart, assembly.draft]);
-  const edge = useEdgeHighlight(api, displayModel?.modelId, lighting.snapshot.id, shadow.region?.id, shadow.committedCoverage, paintPart);
+  }, [lighting.previewing, lighting.hasShadow, lighting.source?.id, canPaintPart, assembly.draft]);
+  const edge = useEdgeHighlight(api, displayModel?.modelId, shadow.recipe?.id, shadow.committedCoverage, paintPart);
   const guideEdges = useMemo(() => clipEdgeCoverage(edge.committed, shadow.committedCoverage), [edge.committed, shadow.committedCoverage]);
+  const projectContents = useMemo(() => ({}), [recipes, referenceEdits, orientation, parts, assembly.joints,
+    guideInstallation, guideCallouts, activeRecipeId, shadow.committedCoverage, edge.committed,
+    lighting.sources, lighting.midtone, lighting.highlight, lighting.castShadowsBetweenParts,
+    lighting.appliedLightKey, lighting.manual ? lighting.committedMask : null]);
+  const [savedContents, setSavedContents] = useState<typeof projectContents | null>(null);
+  const latestProjectContents = useRef(projectContents);
+  latestProjectContents.current = projectContents;
+  const replacementPromptOpen = useRef(false);
+  const cleanAfterReplacement = useRef(false);
+  const projectDirty = Boolean(model && savedContents && savedContents !== projectContents);
+
+  useEffect(() => {
+    if (!cleanAfterReplacement.current) return;
+    cleanAfterReplacement.current = false;
+    setSavedContents(projectContents);
+  }, [model, projectContents]);
+
+  useEffect(() => {
+    if (!projectDirty || !api?.saveProject) return;
+    const prevent = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = false;
+    };
+    window.addEventListener('beforeunload', prevent);
+    return () => window.removeEventListener('beforeunload', prevent);
+  }, [projectDirty, api]);
+
+  const refreshRecentProjects = useCallback(() => {
+    void api?.listRecentProjects?.().then(setRecentProjects).catch(() => {});
+  }, [api]);
+  useEffect(refreshRecentProjects, [refreshRecentProjects]);
+
+  async function canReplaceProject() {
+    if (replacementPromptOpen.current) return false;
+    replacementPromptOpen.current = true;
+    try {
+      if (!api?.confirmProjectReplacement) {
+        return window.confirm('Discard unsaved changes and open another file?');
+      }
+      const choice = await api.confirmProjectReplacement();
+      if (choice === 'save') return await saveProject();
+      return choice === 'discard';
+    } catch (error) {
+      setStatusMsg(error instanceof Error ? error.message : 'Unable to confirm switching projects.');
+      return false;
+    } finally {
+      replacementPromptOpen.current = false;
+    }
+  }
   const coverage = useMemo(() => {
-    const tones = renderToneMask(fill.previewCoverage ?? shadow.coverage, lighting.mask);
-    const withEdges = applyEdgesOver(tones, edge.coverage, shadow.coverage);
+    const base = fill.previewCoverage ?? shadow.coverage;
+    const tones = showLighting ? renderToneMask(base, lighting.mask) : base;
+    const withEdges = applyEdgesOver(tones, edge.coverage, base);
     return edge.preview ? applyEdgesOver(withEdges, edge.preview, shadow.committedCoverage, true) : withEdges;
-  }, [fill.previewCoverage, shadow.coverage, shadow.committedCoverage, lighting.mask, edge.coverage, edge.preview]);
+  }, [fill.previewCoverage, shadow.coverage, shadow.committedCoverage, showLighting, lighting.mask, edge.coverage, edge.preview]);
   const shadowColors = useMemo(() => {
     const colors = new Map(shadow.colors);
-    if (fill.previewCoverage) colors.set(FILL_PREVIEW_REGION, '#76d9ac');
+    if (fill.previewCoverage) colors.set(FILL_PREVIEW_RECIPE, '#76d9ac');
     colors.set(EDGE_PREVIEW, '#72dfae');
     colors.set(JOINT_HIGHLIGHT, '#ffce78');
-    const byId = new Map(recipes.map((recipe) => [recipe.id, recipe]));
-    for (const region of shadow.regions) {
-      const recipe = byId.get(region.recipeId);
-      colors.set(edgeColorKey(region.id), recipe?.edgeSwatch?.hex ?? '#48a887');
-      if (!recipe) continue;
-      colors.set(toneColorKey(region.id, 'midtone'), recipe.swatches.midtone.hex);
-      colors.set(toneColorKey(region.id, 'highlight'), recipe.swatches.highlight.hex);
+    for (const recipe of recipes) {
+      colors.set(edgeColorKey(recipe.id), recipe.edgeSwatch?.hex ?? '#48a887');
+      colors.set(toneColorKey(recipe.id, 'midtone'), recipe.swatches.midtone.hex);
+      colors.set(toneColorKey(recipe.id, 'highlight'), recipe.swatches.highlight.hex);
     }
     return colors;
-  }, [fill.previewCoverage, shadow.colors, recipes, shadow.regions]);
+  }, [fill.previewCoverage, shadow.colors, recipes]);
   const [pickResult, setPickResult] = useState<PickResult | null>(null);
   const [progress, setProgress] = useState<ImportProgressEvent | null>(null);
   const [isDraggingStl, setIsDraggingStl] = useState(false);
@@ -187,8 +248,8 @@ export default function App({
   const appModelGenRef = useRef(0);
   const appViewGenRef = useRef(0);
   const pickSeqRef = useRef(0);
-  const pickContext = useMemo(() => ({}), [displayModel, companionParts, fillEnabled, previewBeforeFill,
-    shadow.region?.id, assembly.draft]);
+  const pickContext = useMemo(() => ({}), [displayModel, companionParts, fillEnabled, previewBeforeFill, repaintFill,
+    shadow.recipe?.id, assembly.draft]);
   const pickContextRef = useRef(pickContext);
   pickContextRef.current = pickContext;
   const pendingFillPick = useRef<{
@@ -235,7 +296,8 @@ export default function App({
   const importFrom = async (
     prepareImport: () => Promise<(() => Promise<ModelSummary>) | null>,
   ) => {
-    if (!api || importInFlight.current || pendingModelRef.current || isCommitting) return;
+    if (!api || importInFlight.current || isBusy || replacementPromptOpen.current) return;
+    if (projectDirty && !await canReplaceProject()) return;
     importInFlight.current = true;
     setStatusMsg(null);
 
@@ -256,6 +318,7 @@ export default function App({
       const summary = await loadModel();
       pendingModelRef.current = summary;
       setPendingModel(summary);
+      setActiveTab('model');
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Import failed';
       if (/canceled/i.test(msg)) {
@@ -286,10 +349,37 @@ export default function App({
     });
   };
 
+  function showTutorialStep(index: number) {
+    if (projectMenu.current) projectMenu.current.open = false;
+    setTutorialIndex(index);
+    setActiveTab(tutorialSteps[index].tab);
+  }
+
+  function closeTutorial() {
+    setTutorialIndex(null);
+    tutorialButton.current?.focus();
+  }
+
+  function openTutorialProjectMenu() {
+    const menu = projectMenu.current;
+    if (!menu) return;
+    menu.open = true;
+    menu.querySelector('summary')?.focus();
+  }
+
+  const tutorialTarget = tutorialStep?.tab === activeTab && tutorialStep.id;
+  useEffect(() => {
+    if (!tutorialTarget || tutorialTarget === 'finish') return;
+    const target = document.querySelector(`[data-tutorial-target="${tutorialTarget}"]`);
+    const anchor = tutorialTarget === 'recipe' ? target?.querySelector('h2') : target;
+    anchor?.scrollIntoView?.({ block: 'nearest' });
+  }, [tutorialTarget, model]);
+
+  const loadPracticeModel = api?.importPracticeModel;
   const handleStlDragOver = (event: React.DragEvent<HTMLElement>) => {
     if (!event.dataTransfer.types.includes('Files')) return;
     event.preventDefault();
-    const canDrop = Boolean(api?.importDroppedStl) && !isBusy && !importInFlight.current;
+    const canDrop = Boolean(api?.importDroppedStl || api?.openDroppedProject) && !isBusy && !importInFlight.current;
     event.dataTransfer.dropEffect = canDrop ? 'copy' : 'none';
     setIsDraggingStl(canDrop);
   };
@@ -304,13 +394,17 @@ export default function App({
     if (!files.length && !types.includes('Files')) return;
     event.preventDefault();
     setIsDraggingStl(false);
+    if (files.length === 1 && /.paintproject$/i.test(files[0].name) && api?.openDroppedProject) {
+      void openProject(files[0]);
+      return;
+    }
     const importDroppedStl = api?.importDroppedStl;
     if (!importDroppedStl || isBusy) return;
 
     void importFrom(async () => {
       const file = files[0];
       if (files.length !== 1 || !file || !/\.(stl|obj)$/i.test(file.name)) {
-        throw new Error('Drop one .stl or .obj file at a time.');
+        throw new Error(api?.openDroppedProject ? 'Drop one .stl, .obj, or .paintproject file at a time.' : 'Drop one .stl or .obj file at a time.');
       }
 
       return () => importDroppedStl(file);
@@ -324,28 +418,30 @@ export default function App({
     return pending;
   }
 
-  async function saveProject() {
-    if (!api?.saveProject || !model || !paletteProject.current) return;
+  async function saveProject(saveAs = false) {
+    if (!api?.saveProject || !model || !paletteProject.current || isBusy || importInFlight.current) return false;
     if (projectMenu.current) projectMenu.current.open = false;
     setProjectAction('save');
     setStatusMsg(null);
+    setProjectNotice('');
+    const savingContents = projectContents;
     try {
       const paint = shadow.exportProject();
-      const snapshots = lighting.exportProject(paint.regions);
-      const edgeSnapshots = edge.exportProject(snapshots.snapshots.map((snapshot) => snapshot.id), paint.regions);
+      const lightingProject = lighting.exportProject(recipes, shadow.committedCoverage);
+      const edgeProject = edge.exportProject(recipes, shadow.committedCoverage);
       const palette = await paletteProject.current.exportProject();
-      await api.saveProject({
+      const saved = await api.saveProject({
         modelId: model.modelId,
+        ...(saveAs ? { saveAs: true } : {}),
         kitModelIds: parts.slice(1).map((part) => part.model.modelId),
         state: {
           orientation,
           recipes,
           ...palette.state,
-          regions: paint.regions,
-          activeRegionId: paint.activeRegionId,
-          snapshots: snapshots.snapshots.map((snapshot, index) => ({ ...snapshot, edgeManualRegions: edgeSnapshots[index].manual })),
-          activeSnapshotId: snapshots.activeSnapshotId,
-          guideCallouts,
+          activeRecipeId: shadow.recipe?.id ?? null,
+          lighting: lightingProject.lighting,
+          edgeManualRecipes: edgeProject.manual,
+          guideCallouts: guideCallouts.filter(({ recipeId }) => recipes.some(({ id }) => id === recipeId)),
           kit: parts.length ? {
             parts: parts.map(({ id, name, model: partModel, pose, hidden, staged, placementConfirmed, faceOffset, batchOffset }) => ({
               id, name, sourceName: partModel.fileName, pose, hidden, staged, placementConfirmed, faceOffset, batchOffset,
@@ -355,27 +451,37 @@ export default function App({
           } : undefined,
         },
         referenceBytes: palette.referenceBytes,
-        paint: paint.paint,
-        tones: snapshots.tones,
-        edges: edgeSnapshots.map(({ packed }) => packed),
+        paint,
+        toneMask: lightingProject.toneMask,
+        edgeMask: edgeProject.packed,
       });
+      if (saved) {
+        setProjectFile(saved);
+        setSavedContents(savingContents);
+        setProjectNotice(`Saved ${saved.name}`);
+        refreshRecentProjects();
+        return latestProjectContents.current === savingContents;
+      }
     } catch (error) {
       setStatusMsg(error instanceof Error ? error.message : 'Unable to save the paint project.');
     } finally {
       setProjectAction(null);
     }
+    return false;
   }
 
-  async function openProject() {
-    if (!api?.openProject || !paletteProject.current || importInFlight.current) return;
+  async function openProject(origin?: string | File) {
+    if (!api?.openProject || !paletteProject.current || isBusy || importInFlight.current || replacementPromptOpen.current) return;
+    if (projectDirty && !await canReplaceProject()) return;
     const paletteHandle = paletteProject.current;
     if (projectMenu.current) projectMenu.current.open = false;
     importInFlight.current = true;
     setProjectAction('open');
     setStatusMsg(null);
+    setProjectNotice('');
     let project: OpenedProject | null = null;
     try {
-      project = await api.openProject();
+      project = origin instanceof File ? await api.openDroppedProject?.(origin) ?? null : await api.openProject(origin);
       if (!project) return;
       const palette = await paletteHandle.prepareProject(project.state, project.referenceBytes);
       pendingProject.current = { project, palette };
@@ -390,23 +496,44 @@ export default function App({
       importInFlight.current = false;
       setProjectAction(null);
       setProgress(null);
+      refreshRecentProjects();
     }
   }
+
+  const handleProjectShortcut = useEffectEvent((event: KeyboardEvent) => {
+    if (!(event.ctrlKey || event.metaKey) || event.altKey || event.repeat || event.defaultPrevented || guideOpen) return;
+    const key = event.key.toLowerCase();
+    if (key === 's' && api?.saveProject) {
+      event.preventDefault();
+      void saveProject(event.shiftKey);
+    } else if (key === 'o' && !event.shiftKey && api?.openProject) {
+      event.preventDefault();
+      void openProject();
+    } else if (key === 'n' && !event.shiftKey && api?.openProject) {
+      event.preventDefault();
+      if (projectMenu.current) projectMenu.current.open = false;
+      handleOpenStl();
+    }
+  });
+  useEffect(() => {
+    const listener = (event: KeyboardEvent) => handleProjectShortcut(event);
+    window.addEventListener('keydown', listener);
+    return () => window.removeEventListener('keydown', listener);
+  }, []);
 
   function fitKit(parts: KitPart[]) {
     if (parts.length <= 1) {
       setKitBounds(undefined);
       return;
     }
-    const min: Vec3 = [...parts[0].model.bounds.min];
-    const max: Vec3 = [...parts[0].model.bounds.max];
-    for (const { model: part } of parts) {
-      for (let axis = 0; axis < 3; axis++) {
-        min[axis] = Math.min(min[axis], part.bounds.min[axis]);
-        max[axis] = Math.max(max[axis], part.bounds.max[axis]);
-      }
+    const bounds = new Box3();
+    const partBounds = new Box3();
+    for (const part of parts) {
+      partBounds.min.fromArray(part.model.bounds.min);
+      partBounds.max.fromArray(part.model.bounds.max);
+      bounds.union(partBounds.applyMatrix4(poseMatrix(part.pose)));
     }
-    setKitBounds({ min, max });
+    setKitBounds({ min: bounds.min.toArray(), max: bounds.max.toArray() });
   }
 
   function choosePart(part: KitPart, remove?: KitPart) {
@@ -542,15 +669,19 @@ export default function App({
         activeModelIdRef.current = committed.modelId;
         pendingModelRef.current = null;
         const opened = takePendingProject(committed.modelId);
+        cleanAfterReplacement.current = true;
+        setProjectFile(opened?.project.file ?? null);
+        setProjectNotice(opened?.project.file ? `Opened ${opened.project.file.name}` : '');
         cancelFill();
         if (opened) {
-          const { state, paint, tones, edges } = opened.project;
+          const { state, paint, toneMask, edgeMask } = opened.project;
           setOrientation(state.orientation);
           setRecipes(state.recipes);
+          setActiveRecipeId(state.activeRecipeId);
           setGuideCallouts(state.guideCallouts ?? []);
           shadow.restoreProject(state, paint);
-          lighting.restoreProject(state, tones);
-          edge.restore(state.snapshots, edges, state.regions);
+          lighting.restoreProject(state, toneMask);
+          edge.restore(state.edgeManualRecipes, edgeMask, state.recipes);
           opened.palette.apply();
         } else {
           setGuideCallouts([]);
@@ -642,20 +773,47 @@ export default function App({
     const pick = async () => {
       if (!isCurrent()) return;
       try {
-        const result = await api.pickFace(displayModel.modelId, origin, direction, batchIndices);
-        if (!isCurrent()) return;
-        if (result.hit && result.distance !== null && selectedPart &&
-            (assembly.draft || fillEnabled)) {
+        const companionRays = () => {
+          if (!selectedPart) return [];
           const ray = new Ray(new Vector3(...origin), new Vector3(...direction)).applyMatrix4(poseMatrix(selectedPart.pose));
-          const occluders = (companionParts ?? []).flatMap((part) => {
+          return (companionParts ?? []).flatMap((part) => {
             if (part.id === selectedPart.id || part.hidden || part.staged || part.id === ghostPart?.id) return [];
             const local = ray.clone().applyMatrix4(poseMatrix(part.pose).invert());
             const start = local.origin.toArray();
             const forward = local.direction.toArray();
             const batches = findRayIntersectingBatchIndices(part.model.batches, start, forward);
-            return batches.length ? [{ model: part.model, start, forward, batches }] : [];
+            const address = { faceOffset: part.faceOffset, batchOffset: part.batchOffset };
+            return batches.length ? [{ model: part.model, address, start, forward, batches }] : [];
           });
-          const hits = await Promise.all(occluders.map(({ model, start, forward, batches }) =>
+        };
+        if (fillEnabled && shadow.recipe) {
+          const targets = companionRays();
+          if (batchIndices.length) {
+            targets.unshift({ model: displayModel, address: selectedPart ?? ANCHOR_ADDRESS,
+              start: origin, forward: direction, batches: batchIndices });
+          }
+          const hits = await Promise.all(targets.map(async (target) => ({
+            target, hit: await api.pickFace(target.model.modelId, target.start, target.forward, target.batches),
+          })));
+          if (!isCurrent()) return;
+          let closest: { target: typeof targets[number]; distance: number; faceId: number } | undefined;
+          for (const { target, hit } of hits) {
+            if (!hit.hit || hit.partId !== target.model.partId || hit.distance === null || hit.originalFaceId === null) continue;
+            if (!closest || hit.distance < closest.distance) {
+              closest = { target, distance: hit.distance, faceId: hit.originalFaceId };
+            }
+          }
+          if (closest) {
+            fill.select({ model: closest.target.model, address: closest.target.address,
+              faceId: closest.faceId, recipeId: shadow.recipe.id });
+          }
+          return;
+        }
+
+        const result = await api.pickFace(displayModel.modelId, origin, direction, batchIndices);
+        if (!isCurrent()) return;
+        if (result.hit && result.distance !== null && assembly.draft) {
+          const hits = await Promise.all(companionRays().map(({ model, start, forward, batches }) =>
             api.pickFace(model.modelId, start, forward, batches)));
           if (!isCurrent()) return;
           const distance = result.distance;
@@ -664,16 +822,8 @@ export default function App({
             return;
           }
         }
-        if (assembly.draft && selectedPart) {
-          void assembly.capture(selectedPart, result);
-          setPickResult(result);
-        } else if (fillEnabled && shadow.region) {
-          if (result.hit && result.originalFaceId !== null && result.partId === displayModel.partId) {
-            fill.select({ modelId: displayModel.modelId, faceId: result.originalFaceId, regionId: shadow.region.id });
-          }
-        } else {
-          setPickResult(result);
-        }
+        if (assembly.draft && selectedPart) void assembly.capture(selectedPart, result);
+        setPickResult(result);
       } catch (error) {
         if (isCurrent()) setStatusMsg(error instanceof Error ? error.message : 'Surface pick failed.');
       }
@@ -702,9 +852,9 @@ export default function App({
       : 0;
 
   return (
-    <div className="app-shell">
-      <a className="skip-link" href="#viewport-region">
-        Skip to viewport
+    <div className="app-shell" data-tutorial-step={tutorialTarget || undefined}>
+      <a className="skip-link" href={activeTab === 'model' ? '#viewport-region' : '#palette-workspace'}>
+        Skip to workspace
       </a>
 
       <header className="workbench-header">
@@ -745,15 +895,27 @@ export default function App({
         </nav>
 
         <div className="header-actions">
+          {(projectFile || projectDirty) && <span className="project-filename" title={projectFile?.path}>
+            {projectFile?.name ?? 'Untitled project'}{projectDirty && <span aria-label="Unsaved changes"> *</span>}
+          </span>}
           {api?.openProject && api.saveProject && (
             <details className="project-menu" ref={projectMenu}>
-              <summary className="btn btn--secondary">Project</summary>
+              <summary className="btn btn--secondary" data-tutorial-target="finish">Project</summary>
               <div className="project-menu-actions">
-                <button type="button" className="btn btn--secondary" disabled={isBusy} onClick={openProject}>
-                  Open project
+                <button type="button" className="btn btn--secondary" disabled={isBusy} onClick={() => {
+                  if (projectMenu.current) projectMenu.current.open = false;
+                  handleOpenStl();
+                }}>
+                  New from model <kbd aria-hidden="true">Ctrl+N</kbd>
                 </button>
-                <button type="button" className="btn btn--secondary" disabled={isBusy || !model} onClick={saveProject}>
-                  Save project
+                <button type="button" className="btn btn--secondary" disabled={isBusy} onClick={() => void openProject()}>
+                  Open project <kbd aria-hidden="true">Ctrl+O</kbd>
+                </button>
+                <button type="button" className="btn btn--secondary" disabled={isBusy || !model} onClick={() => void saveProject()}>
+                  Save project <kbd aria-hidden="true">Ctrl+S</kbd>
+                </button>
+                <button type="button" className="btn btn--secondary" disabled={isBusy || !model} onClick={() => void saveProject(true)}>
+                  Save project as <kbd aria-hidden="true">Ctrl+Shift+S</kbd>
                 </button>
                 {api.exportPaintingGuide && (
                   <button type="button" className="btn btn--secondary" disabled={isBusy || !model}
@@ -763,6 +925,15 @@ export default function App({
                     }}>
                     Painting guide
                   </button>
+                )}
+                {recentProjects.length > 0 && (
+                  <div className="project-recents" aria-label="Recent projects">
+                    <span>Open recent</span>
+                    {recentProjects.map((file) => (
+                      <button type="button" className="btn btn--secondary" key={file.path} title={file.path} disabled={isBusy}
+                        onClick={() => void openProject(file.path)}>{file.name}</button>
+                    ))}
+                  </div>
                 )}
               </div>
             </details>
@@ -777,38 +948,71 @@ export default function App({
               Cancel import
             </button>
           ) : null}
-          <button
-            type="button"
-            className="btn btn--primary"
-            onClick={handleOpenStl}
-            disabled={!api || isBusy}
-          >
-            Open model
-          </button>
+          <button ref={tutorialButton} type="button" className="btn btn--secondary" aria-pressed={tutorialIndex !== null}
+            onClick={() => tutorialIndex === null ? showTutorialStep(0) : closeTutorial()}>Tutorial</button>
+          {(model || isBusy || activeTab === 'palette') && (
+            <button type="button" className="btn btn--primary" onClick={handleOpenStl}
+              disabled={!api || isBusy}>Open model</button>
+          )}
         </div>
       </header>
 
+      {tutorialIndex !== null && (
+        <ModelTutorial index={tutorialIndex} onStep={showTutorialStep} onClose={closeTutorial}
+          hasModel={Boolean(model)} busy={isBusy}
+          onProjectMenu={api?.openProject && api.saveProject ? openTutorialProjectMenu : undefined}
+          onPractice={loadPracticeModel ? () => void importFrom(async () => loadPracticeModel) : undefined} />
+      )}
+
+      {projectNotice && !projectDirty && <div className="project-notice" role="status">{projectNotice}</div>}
+
       {ResolvedPalette ? (
         <main
+          id="palette-workspace"
+          tabIndex={-1}
           className="palette-host"
           data-testid="palette-host"
           hidden={activeTab !== 'palette'}
         >
-          <ResolvedPalette recipes={recipes} setRecipes={setRecipes} projectRef={paletteProject} />
+          {paletteWorkspace}
         </main>
       ) : null}
 
-      <main className="workbench-main" hidden={activeTab !== 'model'}>
+      <main className="workbench-main" data-empty={!model || undefined} hidden={activeTab !== 'model'}>
         <section
           id="viewport-region"
+          tabIndex={-1}
           className="viewport-region"
           aria-label="STL surface viewport"
           onDragOver={handleStlDragOver}
           onDragLeave={handleStlDragLeave}
           onDrop={handleStlDrop}
         >
+          {model && (
+            <div className="viewport-toolbar" role="group" aria-label="Camera controls">
+              <button type="button" className="btn btn--secondary btn--small" aria-label="Reset view"
+                onClick={() => triggerCameraPreset('reset')}>Reset view</button>
+              {(['front', 'top', 'right'] as const).map((preset) => {
+                const label = preset[0].toUpperCase() + preset.slice(1);
+                return <button type="button" key={preset} className="btn btn--secondary btn--small" aria-label={label + ' view'}
+                  onClick={() => triggerCameraPreset(preset)}>{label}</button>;
+              })}
+              {parts.length > 1 && (
+                <button type="button" className="btn btn--secondary btn--small"
+                  onClick={() => triggerCameraPreset('focus')}>Fit selected part</button>
+              )}
+              {assembly.draft && (['back', 'bottom', 'left'] as const).map((preset) => {
+                const label = preset[0].toUpperCase() + preset.slice(1);
+                return <button type="button" key={preset} className="btn btn--secondary btn--small" aria-label={label + ' view'}
+                  onClick={() => triggerCameraPreset(preset)}>{label}</button>;
+              })}
+              <span className="viewport-toolbar__hint">Drag to orbit · Right-drag to pan · Scroll to zoom</span>
+            </div>
+          )}
+
           <Viewport3D
             api={api}
+            active={activeTab === 'model'}
             model={displayModel}
             companionParts={companionParts}
             ghostModelId={ghostPart?.model.modelId}
@@ -821,8 +1025,10 @@ export default function App({
             cameraPresetRequest={cameraPresetRequest}
             highlightPickFace={assembly.draft?.method === 'six-face' && assembly.expectedId === focusId}
             onSurfacePick={handleSurfacePick}
+            fillPick={fillEnabled}
+            showLighting={showLighting}
             lightPlacement={{
-              active: aimingLight && lighting.previewing && lighting.hasShadow && canPaintPart && !assembly.draft && !isBusy,
+              active: showLighting && aimingLight && lighting.previewing && Boolean(lighting.source) && lighting.hasShadow && canPaintPart && !assembly.draft && !isBusy,
               direction: lightDirection,
               cameraRequest: lightCameraRequest,
               onDirection: lighting.aimLight,
@@ -830,7 +1036,10 @@ export default function App({
             shadowPaint={{
               enabled: Boolean(model && canPaintPart && !assembly.draft && !isBusy && (edge.tool || lighting.brushTool ||
                 (shadow.tool && shadow.tool !== 'fill' && shadow.recipe))),
-                            coverage: assembly.draft ? assembly.overlay : coverage,
+              coverage: assembly.draft ? assembly.overlay : coverage,
+              baseCoverage: shadow.coverage,
+              companionCoverage: coverage,
+              lightPreview: showLighting ? lighting.lightPreview : null,
               address: assembly.draft ? ANCHOR_ADDRESS : paintPart,
               colors: shadowColors,
               diameter: shadow.brushSize,
@@ -846,32 +1055,36 @@ export default function App({
           />
 
           {!model && !isBusy ? (
-            <div className="viewport-empty">
-              <div className="viewport-empty__card">
-                <h2>Model surface inspector</h2>
-                {api?.importDroppedStl ? <p>Drop an STL or OBJ file here.</p> : null}
-                <p>
-                  Open an STL or OBJ model to inspect original triangles,
-                  set upright and front axes, and pick original face IDs. Binary STL files can be up to {stlLimitLabel}.
-                </p>
-                {api ? (
-                  <button
-                    type="button"
-                    className="btn btn--secondary"
-                    onClick={handleOpenStl}
-                  >
-                    Choose model file
-                  </button>
-                ) : (
-                  <p>Open the Electron app to import and inspect STL files.</p>
-                )}
+            <div className="workspace-welcome">
+              <div className="workspace-welcome__inner" data-enter>
+                <div className="workspace-welcome__copy">
+                  <h2>Paint your 3D model</h2>
+                  <p>Build paint recipes, color the surfaces, and turn the finished model into a step-by-step painting guide.</p>
+                  <div className="workspace-welcome__actions">
+                    <button type="button" className="btn btn--primary" onClick={handleOpenStl}
+                      disabled={!api}>Open model</button>
+                    {tutorialIndex === null && (
+                      <button type="button" className="btn btn--secondary" onClick={() => showTutorialStep(0)}>
+                        Start tutorial
+                      </button>
+                    )}
+                  </div>
+                  {api?.importDroppedStl && <p className="workspace-welcome__note">
+                    {api.openDroppedProject ? 'Drop an STL, OBJ, or Paint Pallet project here.' : 'Drop an STL or OBJ file here.'}
+                    {!api?.openProject && stlLimitLabel && ` Binary STLs up to ${stlLimitLabel}.`}
+                  </p>}
+                </div>
+                <div className="workspace-welcome__visual">
+                  <img src={fieldRobotUrl} alt="Painted Field Robot miniature on an octagonal base"
+                    width={760} height={760} draggable={false} />
+                </div>
               </div>
             </div>
           ) : null}
 
           {isDraggingStl && !isBusy ? (
             <div className="stl-drop-overlay" aria-hidden="true">
-              Drop model to open
+              {api?.openDroppedProject ? 'Drop file to open' : 'Drop model to open'}
             </div>
           ) : null}
 
@@ -889,7 +1102,7 @@ export default function App({
           ) : null}
 
           {projectAction && !progress ? (
-            <div className="progress-overlay" role="status">{projectAction === 'open' ? 'Opening project…' : 'Saving project…'}</div>
+            <div className="progress-overlay" role="status">{projectAction === 'open' ? 'Opening projectâ€¦' : 'Saving projectâ€¦'}</div>
           ) : null}
 
           {progress && (isImporting || kitImporting || projectAction === 'open') ? (
@@ -922,7 +1135,20 @@ export default function App({
           ) : null}
         </section>
 
-        <aside className="inspector-panel" aria-label="Model inspector">
+        <aside className="inspector-panel" aria-label="Model inspector" hidden={!model}>
+          {model && (
+            <div className="inspector-section">
+              <label className="hint-text">
+                <input type="checkbox" checked={showLighting} disabled={lighting.brushPending}
+                  onChange={(event) => {
+                    const visible = event.target.checked;
+                    if (!visible) lighting.setBrushTool(null);
+                    setShowLighting(visible);
+                  }} />
+                Show lighting
+              </label>
+            </div>
+          )}
           {api?.importKitParts && model && (
             <KitPanel key={model?.modelId} parts={parts} selected={selectedPart} busy={isBusy || Boolean(assembly.draft) ||
               shadow.strokePending || lighting.brushPending || edge.stroke}
@@ -948,6 +1174,7 @@ export default function App({
               fill={fill}
               onCancelFill={cancelFill}
               recipes={recipes}
+              onRecipeChange={setActiveRecipeId}
               busy={isBusy || lighting.brushPending || edge.stroke}
               onToolChange={(tool) => {
                 edge.cancel();
@@ -956,12 +1183,17 @@ export default function App({
                 shadow.setTool(tool);
               }}
               previewBeforeFill={previewBeforeFill}
+              repaintFill={repaintFill}
+              setRepaintFill={(value) => {
+                cancelFill();
+                setRepaintFill(value);
+              }}
               setPreviewBeforeFill={(value) => {
                 cancelFill();
                 setPreviewBeforeFill(value);
               }}
               onApplyFill={() => {
-                if (fill.packed) shadow.commitFill(unpackFillFaces(fill.packed, paintPart));
+                fill.applyPreview();
                 cancelFill();
               }}
             />
@@ -969,7 +1201,7 @@ export default function App({
           {model && canPaintPart && !assembly.draft && lighting.available && (
             <LightingPanel
               lighting={lighting}
-              aiming={aimingLight}
+              aiming={showLighting && aimingLight}
               onAim={() => {
                 if (aimingLight) {
                   setAimingLight(false);
@@ -992,17 +1224,10 @@ export default function App({
                 setAimingLight(true);
                 setLightCameraRequest(++lightCameraSequence.current);
               }}
-              busy={isBusy || shadow.strokePending || lighting.brushPending || edge.stroke}
-              onSelectSnapshot={(id) => {
-                edge.cancel();
-                edge.setTool(null);
-                lighting.selectSnapshot(id);
-              }}
-              onAddSnapshot={(duplicate) => {
-                edge.cancel();
-                edge.setTool(null);
-                const id = lighting.addSnapshot(duplicate);
-                if (id && duplicate) edge.duplicate(id);
+              busy={!showLighting || isBusy || shadow.strokePending || lighting.brushPending || edge.stroke}
+              onSourceChange={() => {
+                setAimingLight(false);
+                setLightCameraRequest(null);
               }}
               onPreview={() => {
                 edge.cancel();
@@ -1067,7 +1292,7 @@ export default function App({
             )}
           </section>
 
-          <section className="inspector-section">
+          <section className="inspector-section" data-tutorial-target="model">
             <h2>Orientation</h2>
             <div className="field-row">
               <label htmlFor="upright-select">Upright axis</label>
@@ -1126,58 +1351,12 @@ export default function App({
             )}
           </section>
 
-          <section className="inspector-section">
-            <h2>Camera controls</h2>
-            <div className="preset-grid">
-              <button
-                type="button"
-                className="btn btn--secondary btn--small"
-                onClick={() => triggerCameraPreset('reset')}
-              >
-                Reset view
-              </button>
-              <button
-                type="button"
-                className="btn btn--secondary btn--small"
-                onClick={() => triggerCameraPreset('front')}
-              >
-                Front view
-              </button>
-              <button
-                type="button"
-                className="btn btn--secondary btn--small"
-                onClick={() => triggerCameraPreset('top')}
-              >
-                Top view
-              </button>
-              <button
-                type="button"
-                className="btn btn--secondary btn--small"
-                onClick={() => triggerCameraPreset('right')}
-              >
-                Right view
-              </button>
-              {parts.length > 1 && (
-                <button type="button" className="btn btn--secondary btn--small" onClick={() => triggerCameraPreset('focus')}>
-                  Fit selected part
-                </button>
-              )}
-              {assembly.draft && (['back', 'bottom', 'left'] as const).map((preset) => (
-                <button type="button" key={preset} className="btn btn--secondary btn--small" onClick={() => triggerCameraPreset(preset)}>
-                  {preset[0].toUpperCase() + preset.slice(1)} view
-                </button>
-              ))}
-            </div>
-            <p className="hint-text">
-              Drag to orbit · Right-drag to pan · Scroll to zoom
-            </p>
-          </section>
         </aside>
       </main>
       {guideOpen && api && model && (
         <PaintingGuideDialog
           api={api} model={model} orientation={orientation} coverage={shadow.committedCoverage}
-          edges={guideEdges} tones={lighting.committedMask} snapshot={lighting.snapshot.name.trim() || 'Untitled snapshot'}
+          edges={guideEdges} tones={lighting.committedMask} lighting={`${lighting.sources.filter(({ intensity }) => intensity > 0).length} active lights`}
           rows={guideRows} callouts={guideCallouts} setCallouts={setGuideCallouts}
           parts={parts} joints={assembly.joints} installation={guideInstallation} setInstallation={setInstallation}
           unapplied={lighting.unapplied} close={() => setGuideOpen(false)}

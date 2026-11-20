@@ -1,6 +1,6 @@
 #pragma once
 
-#include "stl_importer.hpp"
+#include "surface_lighting.hpp"
 
 #include <array>
 #include <atomic>
@@ -25,7 +25,8 @@ class DxrLighting {
 
   bool compute(const ModelRecord& model, const std::array<float, 3>& direction,
       const std::atomic<bool>& canceled, const std::string& option,
-      std::vector<float>& scores, DxrTimings& timing);
+      std::vector<float>& scores, DxrTimings& timing,
+      const std::vector<LightingPart>& parts, bool castShadowsBetweenParts);
   void clear();
 
  private:

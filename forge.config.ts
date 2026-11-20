@@ -38,6 +38,7 @@ const config: ForgeConfig = {
       path.resolve(__dirname, 'native/vendor/meshoptimizer/meshoptimizer-LICENSE.md'),
       APP_ICON_ICO_PATH,
       APP_ICON_PNG_PATH,
+      path.resolve(__dirname, 'assets/field-robot.stl'),
     ],
   },
   hooks: {

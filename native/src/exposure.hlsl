@@ -7,6 +7,7 @@ cbuffer RaySettings : register(b0) {
   float bias;
   uint firstFace;
   uint faceCount;
+  uint selfPart;
 };
 
 [numthreads(128, 1, 1)]
@@ -28,8 +29,21 @@ void main(uint3 thread : SV_DispatchThreadID) {
   ray.Direction = direction;
   ray.TMin = bias;
   ray.TMax = 3.402823e38;
-  RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE> query;
-  query.TraceRayInline(surface, RAY_FLAG_NONE, 0xff, ray);
-  while (query.Proceed()) {}
-  exposure[id] = query.CommittedStatus() == COMMITTED_NOTHING ? min(1.0, light / area) : 0;
+  bool blocked;
+  if (selfPart == 0) {
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE> query;
+    query.TraceRayInline(surface, RAY_FLAG_NONE, 0xff, ray);
+    while (query.Proceed()) {}
+    blocked = query.CommittedStatus() != COMMITTED_NOTHING;
+  } else {
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_NON_OPAQUE> query;
+    query.TraceRayInline(surface, RAY_FLAG_NONE, 0xff, ray);
+    while (query.Proceed()) {
+      if (query.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && query.CandidateInstanceID() == selfPart) {
+        query.CommitNonOpaqueTriangleHit();
+      }
+    }
+    blocked = query.CommittedStatus() != COMMITTED_NOTHING;
+  }
+  exposure[id] = blocked ? 0 : min(1.0, light / area);
 }

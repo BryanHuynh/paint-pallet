@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Vector3 } from 'three';
-import type { ProjectState } from '../../shared/paintProject';
+import { lightingConfigurationKey, type ProjectLighting, type ProjectLightSource, type ProjectState } from '../../shared/paintProject';
 import type { ExposurePart, ModelOrientation, PaintPalletApi, Vec3 } from '../../shared/workerProtocol';
 import { computeOrientationQuaternion } from '../orientation';
-import { generateToneMask, paintToneFaces, type MaskBrushTool, type ToneMask } from './lightingState';
-import type { ShadowCoverage, ShadowRegion, SurfaceFace } from './shadowPaint';
+import { generateToneMask, paintToneFaces, summarizeExposure, type MaskBrushTool, type ToneMask } from './lightingState';
+import type { ShadowCoverage, SurfaceFace } from './shadowPaint';
 import { packToneMask, unpackToneMask } from './projectMasks';
 
 interface ExposureResult {
@@ -17,6 +17,7 @@ interface AppliedLighting {
   mask: ToneMask;
   manual: boolean;
   lightKey: string;
+  automaticCoverage?: ShadowCoverage;
 }
 
 interface LightingHistory {
@@ -25,35 +26,38 @@ interface LightingHistory {
   redo: (AppliedLighting | null)[];
 }
 
-interface LightSettings {
-  azimuth: number;
-  elevation: number;
-  midtone: number;
-  highlight: number;
-}
-
-interface LightingSnapshot {
-  id: string;
-  name: string;
+type LightSettings = Pick<ProjectLighting, 'sources' | 'activeSourceId' | 'midtone' | 'highlight' | 'castShadowsBetweenParts'>;
+interface LightingState {
   settings: LightSettings;
   history: LightingHistory;
 }
 
-interface SnapshotState {
-  activeId: string;
-  items: LightingSnapshot[];
-}
-
 const NO_MASK: ToneMask = new Map();
 const emptyHistory = (): LightingHistory => ({ current: null, undo: [], redo: [] });
-const initialSettings = (): LightSettings => ({ azimuth: 35, elevation: 50, midtone: 35, highlight: 75 });
-const initialSnapshots = (): SnapshotState => ({
-  activeId: 'snapshot-1',
-  items: [{ id: 'snapshot-1', name: 'Snapshot 1', settings: initialSettings(), history: emptyHistory() }],
+const initialLighting = (): LightingState => ({
+  settings: {
+    sources: [{ id: 'light-1', name: 'Light 1', azimuth: 35, elevation: 50, intensity: 100 }],
+    activeSourceId: 'light-1', midtone: 35, highlight: 75, castShadowsBetweenParts: true,
+  },
+  history: emptyHistory(),
 });
 
-function appliedLightKey(settings: LightSettings, orientation: ModelOrientation, layoutKey?: string) {
-  return JSON.stringify([settings.azimuth, settings.elevation, settings.midtone, settings.highlight, orientation.upright, orientation.front, ...(layoutKey ? [layoutKey] : [])]);
+async function combineExposure(layers: { scores: Float32Array; weight: number }[], active: () => boolean) {
+  if (!layers.length) return new Float32Array(0);
+  if (layers.length === 1 && layers[0].weight === 1) return layers[0].scores;
+  const combined = new Float32Array(layers[0].scores.length);
+  const block = 524288;
+  for (let start = 0; start < combined.length; start += block) {
+    if (!active()) return;
+    const end = Math.min(start + block, combined.length);
+    for (let face = start; face < end; face++) {
+      let total = 0;
+      for (const { scores, weight } of layers) total += (scores[face] ?? 0) * weight;
+      combined[face] = Math.min(1, total);
+    }
+    if (end < combined.length) await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+  }
+  return combined;
 }
 
 export function worldLightDirection(azimuth: number, elevation: number): Vector3 {
@@ -76,6 +80,18 @@ function localLightDirection(azimuth: number, elevation: number, orientation: Mo
     .toArray();
 }
 
+function refreshAutomaticMask(applied: AppliedLighting, shadow: ShadowCoverage,
+  scores: Float32Array, midtone: number, highlight: number): ToneMask {
+  if (!applied.automaticCoverage) return generateToneMask(shadow, scores, midtone, highlight).mask;
+  const changed = new Map([...shadow].filter(([index, faces]) => faces !== applied.automaticCoverage?.get(index)));
+  const mask = new Map(applied.mask);
+  for (const index of mask.keys()) {
+    if (!shadow.has(index) || changed.has(index)) mask.delete(index);
+  }
+  for (const [index, batch] of generateToneMask(changed, scores, midtone, highlight).mask) mask.set(index, batch);
+  return mask;
+}
+
 export function useSurfaceLighting(
   api: PaintPalletApi | undefined,
   modelId: string | undefined,
@@ -84,12 +100,12 @@ export function useSurfaceLighting(
   parts?: ExposurePart[],
   layoutKey?: string,
 ) {
-  const [snapshots, setSnapshots] = useState(initialSnapshots);
-  const snapshotsRef = useRef(snapshots);
-  const nextSnapshotNumber = useRef(2);
-  const snapshot = snapshots.items.find((item) => item.id === snapshots.activeId)!;
-  const { azimuth, elevation, midtone, highlight } = snapshot.settings;
-  const history = snapshot.history;
+  const [state, setState] = useState(initialLighting);
+  const stateRef = useRef(state);
+  const nextLightNumber = useRef(2);
+  const { settings, history } = state;
+  const source = settings.sources.find(({ id }) => id === settings.activeSourceId);
+  const { midtone, highlight } = settings;
   const [previewing, setPreviewing] = useState(false);
   const [result, setResult] = useState<ExposureResult | null>(null);
   const [confirming, setConfirming] = useState(false);
@@ -97,98 +113,135 @@ export function useSurfaceLighting(
   const [brushDraft, setBrushDraft] = useState<ToneMask | null>(null);
   const strokeRef = useRef<{ tool: MaskBrushTool; start: ToneMask; mask: ToneMask } | null>(null);
 
-  const direction = useMemo(() => localLightDirection(azimuth, elevation, orientation), [
-    azimuth, elevation, orientation,
-  ]);
-  const partsRef = useRef(parts);
-  partsRef.current = parts;
-  const key = JSON.stringify([modelId, direction, layoutKey]);
-  const lightKey = appliedLightKey(snapshot.settings, orientation, layoutKey);
+  const plan = useMemo(() => settings.sources.filter(({ intensity }) => intensity > 0)
+    .sort((a, b) => a.azimuth - b.azimuth || a.elevation - b.elevation || a.intensity - b.intensity)
+    .map(({ azimuth, elevation, intensity }) => ({
+      direction: localLightDirection(azimuth, elevation, orientation), weight: intensity / 100,
+    })), [settings.sources, orientation]);
+  const inputsRef = useRef({ plan, parts });
+  inputsRef.current = { plan, parts };
+  const cacheRef = useRef({ scope: '', scores: new Map<string, Float32Array>() });
+  const hasKit = Boolean(parts && parts.length > 1);
+  const castShadowsBetweenParts = !hasKit || settings.castShadowsBetweenParts;
+  const scope = JSON.stringify([modelId, layoutKey, castShadowsBetweenParts]);
+  const key = JSON.stringify([scope, plan]);
+  const lightKey = lightingConfigurationKey(settings, orientation, layoutKey);
   const ready = result?.key === key ? result : null;
   const hasShadow = shadow.size !== 0;
+  const applied = history.current;
+  const needsAutomaticRefresh = Boolean(api?.computeLightExposure && modelId && applied && !applied.manual &&
+    applied.lightKey === lightKey && applied.automaticCoverage !== shadow);
+  const shouldTrace = hasShadow && (previewing || needsAutomaticRefresh);
 
   useEffect(() => {
     const compute = api?.computeLightExposure;
-    if (!compute || !modelId || !previewing || !hasShadow || ready) return;
+    if (!compute || !modelId || !shouldTrace || ready) return;
     let active = true;
-    let started = false;
-    const jobId = crypto.randomUUID();
+    let jobId: string | undefined;
     const timer = window.setTimeout(async () => {
-      started = true;
+      const { plan, parts } = inputsRef.current;
+      if (cacheRef.current.scope !== scope) cacheRef.current = { scope, scores: new Map() };
+      const cache = cacheRef.current.scores;
+      const directions = new Set(plan.map(({ direction }) => JSON.stringify(direction)));
+      for (const cached of cache.keys()) if (!directions.has(cached)) cache.delete(cached);
       try {
-        const scores = await compute({ modelId, jobId, direction, parts: partsRef.current });
-        if (active) setResult({ key, scores });
+        const layers: { scores: Float32Array; weight: number }[] = [];
+        for (const { direction, weight } of plan) {
+          const directionKey = JSON.stringify(direction);
+          let scores = cache.get(directionKey);
+          if (!scores) {
+            jobId = crypto.randomUUID();
+            scores = await compute({ modelId, jobId, direction, parts,
+              ...(castShadowsBetweenParts ? {} : { castShadowsBetweenParts }) });
+            jobId = undefined;
+            if (!active) return;
+            cache.set(directionKey, scores);
+          }
+          layers.push({ scores, weight });
+        }
+        const scores = await combineExposure(layers, () => active);
+        if (active && scores) setResult({ key, scores });
       } catch (error) {
         if (active) setResult({ key, error: error instanceof Error ? error.message : 'Lighting preview failed.' });
       } finally {
-        started = false;
+        jobId = undefined;
       }
     }, 120);
 
     return () => {
       active = false;
       window.clearTimeout(timer);
-      if (started) void api?.cancelLightExposure?.(jobId).catch(() => {});
+      if (jobId) void api?.cancelLightExposure?.(jobId).catch(() => {});
     };
-  }, [api, modelId, previewing, hasShadow, ready, key, direction]);
+  }, [api, modelId, shouldTrace, ready, key, scope, castShadowsBetweenParts]);
 
-  const draft = useMemo(() => {
-    if (!previewing || !ready?.scores || !hasShadow) return null;
-    return generateToneMask(shadow, ready.scores, midtone, highlight);
-  }, [previewing, ready?.scores, hasShadow, shadow, midtone, highlight]);
+  const scores = ready?.scores;
+  const distribution = useMemo(() => scores && hasShadow ? summarizeExposure(shadow, scores) : null,
+    [scores, hasShadow, shadow]);
+  const preview = previewing && scores && distribution ? { scores, midtone, highlight } : null;
+  const draft = preview && distribution ? {
+    midtoneFaces: distribution.atOrAbove[midtone],
+    highlightFaces: distribution.atOrAbove[highlight],
+  } : null;
 
-  function writeSnapshots(next: SnapshotState) {
-    snapshotsRef.current = next;
-    setSnapshots(next);
-  }
+  useEffect(() => {
+    if (!needsAutomaticRefresh || !applied || previewing || brushDraft || (hasShadow && !ready?.scores)) return;
+    const current = stateRef.current;
+    if (current.history.current !== applied) return;
+    const mask = hasShadow ? refreshAutomaticMask(applied, shadow, ready!.scores!, midtone, highlight) : NO_MASK;
+    writeState({ ...current, history: { ...current.history, current: { ...applied, mask, automaticCoverage: shadow } } });
+  }, [needsAutomaticRefresh, applied, previewing, brushDraft, hasShadow, ready?.scores, shadow, midtone, highlight]);
 
-  function editSnapshot(update: (current: LightingSnapshot) => LightingSnapshot) {
-    const current = snapshotsRef.current;
-    writeSnapshots({
-      ...current,
-      items: current.items.map((item) => item.id === current.activeId ? update(item) : item),
-    });
+  function writeState(next: LightingState) {
+    stateRef.current = next;
+    setState(next);
   }
 
   function setSettings(next: Partial<LightSettings>) {
     setConfirming(false);
-    editSnapshot((current) => ({ ...current, settings: { ...current.settings, ...next } }));
+    const current = stateRef.current;
+    writeState({ ...current, settings: { ...current.settings, ...next } });
   }
 
-  function selectSnapshot(id: string) {
-    if (strokeRef.current || !snapshotsRef.current.items.some((item) => item.id === id)) return;
-    setPreviewing(false);
-    setConfirming(false);
-    setBrushTool(null);
-    writeSnapshots({ ...snapshotsRef.current, activeId: id });
+  function editSource(next: Partial<Pick<ProjectLightSource, 'name' | 'azimuth' | 'elevation' | 'intensity'>>) {
+    const { sources, activeSourceId } = stateRef.current.settings;
+    setSettings({ sources: sources.map((light) => light.id === activeSourceId ? { ...light, ...next } : light) });
   }
 
-  function addSnapshot(duplicate: boolean) {
+  function selectSource(id: string) {
+    if (!strokeRef.current && stateRef.current.settings.sources.some((light) => light.id === id)) {
+      setSettings({ activeSourceId: id });
+    }
+  }
+
+  function addSource() {
     if (strokeRef.current) return;
-    const current = snapshotsRef.current;
-    const source = current.items.find((item) => item.id === current.activeId)!;
-    const number = nextSnapshotNumber.current++;
-    const id = `snapshot-${number}`;
-    writeSnapshots({
-      ...current,
-      items: [...current.items, {
-        id,
-        name: duplicate ? `${source.name.trim() || 'Snapshot'} copy` : `Snapshot ${number}`,
-        settings: duplicate ? { ...source.settings } : initialSettings(),
-        history: { ...emptyHistory(), current: duplicate ? source.history.current : null },
-      }],
-    });
-    selectSnapshot(id);
-    return id;
+    const { sources } = stateRef.current.settings;
+    const id = crypto.randomUUID();
+    const names = new Set(sources.map((light) => light.name));
+    let name: string;
+    do { name = `Light ${nextLightNumber.current++}`; } while (names.has(name));
+    setSettings({ sources: [...sources, {
+      id, name, azimuth: source ? (source.azimuth + 120) % 360 : 35,
+      elevation: source ? source.elevation : 50, intensity: sources.length ? 30 : 100,
+    }], activeSourceId: id });
+  }
+
+  function removeSource() {
+    if (strokeRef.current) return;
+    const current = stateRef.current.settings;
+    const index = current.sources.findIndex(({ id }) => id === current.activeSourceId);
+    if (index < 0) return;
+    const sources = current.sources.filter(({ id }) => id !== current.activeSourceId);
+    setSettings({ sources, activeSourceId: sources[Math.min(index, sources.length - 1)]?.id ?? null });
   }
 
   function currentHistory() {
-    const current = snapshotsRef.current;
-    return current.items.find((item) => item.id === current.activeId)!.history;
+    return stateRef.current.history;
   }
 
   function writeHistory(history: LightingHistory) {
-    editSnapshot((current) => ({ ...current, history }));
+    writeState({ ...stateRef.current, history });
   }
 
   function commit(next: AppliedLighting) {
@@ -197,12 +250,13 @@ export function useSurfaceLighting(
   }
 
   function apply(confirm = false) {
-    if (!draft) return;
+    if (!preview) return;
     if (currentHistory().current?.manual && !confirm) {
       setConfirming(true);
       return;
     }
-    commit({ mask: draft.mask, manual: false, lightKey });
+    commit({ mask: generateToneMask(shadow, preview.scores, midtone, highlight).mask,
+      manual: false, lightKey, automaticCoverage: shadow });
     setPreviewing(false);
     setConfirming(false);
   }
@@ -229,7 +283,9 @@ export function useSurfaceLighting(
     if (!stroke) return;
     strokeRef.current = null;
     const current = currentHistory().current;
-    if (keep && current && stroke.mask !== stroke.start) commit({ ...current, mask: stroke.mask, manual: true });
+    if (keep && current && stroke.mask !== stroke.start) {
+      commit({ mask: stroke.mask, lightKey: current.lightKey, manual: true });
+    }
     setBrushDraft(null);
   }
 
@@ -251,8 +307,9 @@ export function useSurfaceLighting(
 
   function reset() {
     strokeRef.current = null;
-    writeSnapshots(initialSnapshots());
-    nextSnapshotNumber.current = 2;
+    writeState(initialLighting());
+    nextLightNumber.current = 2;
+    cacheRef.current = { scope: '', scores: new Map() };
     setBrushDraft(null);
     setBrushTool(null);
     setConfirming(false);
@@ -260,42 +317,53 @@ export function useSurfaceLighting(
     setPreviewing(false);
   }
 
-  function restoreProject(state: ProjectState, tones: Uint32Array[]) {
+  function restoreProject(project: ProjectState, toneMask: Uint32Array) {
     reset();
-    const items = state.snapshots.map(({ id, name, azimuth, elevation, midtone, highlight, applied, manual, appliedLightKey: savedKey }, index) => ({
-      id, name, settings: { azimuth, elevation, midtone, highlight },
-      history: { ...emptyHistory(), current: applied ? { mask: unpackToneMask(tones[index], state.regions), manual, lightKey: savedKey ?? appliedLightKey({ azimuth, elevation, midtone, highlight }, state.orientation) } : null },
-    }));
-    writeSnapshots({ activeId: state.activeSnapshotId, items });
-    nextSnapshotNumber.current = Math.max(0, ...items.map((item) => Number(item.id.replace(/^snapshot-/, '')) || 0)) + 1;
+    const { applied, manual, appliedLightKey, ...settings } = project.lighting;
+    const attached = project.kit?.parts.filter((part) => !part.staged) ?? [];
+    const storedLayout = attached.length > 1 && attached.every((part) => part.faceOffset !== undefined)
+      ? JSON.stringify(attached.map(({ id, faceOffset, pose }) => [id, faceOffset, pose])) : undefined;
+    writeState({ settings, history: emptyHistory() });
+    if (applied) writeHistory({ ...emptyHistory(), current: {
+      mask: unpackToneMask(toneMask, project.recipes), manual,
+      lightKey: appliedLightKey ?? lightingConfigurationKey(settings, project.orientation, storedLayout),
+    } });
+    nextLightNumber.current = settings.sources.length + 1;
   }
 
-  const applied = history.current;
   return {
     available: Boolean(api?.computeLightExposure),
     hasShadow,
+    hasKit,
+    castShadowsBetweenParts,
+    setCastShadowsBetweenParts: (value: boolean) => setSettings({ castShadowsBetweenParts: value }),
     previewing,
     loading: previewing && hasShadow && !ready,
-    error: previewing ? ready?.error : undefined,
-    snapshots: snapshots.items,
-    snapshot,
-    selectSnapshot,
-    addSnapshot,
+    refreshing: !previewing && needsAutomaticRefresh && hasShadow && !ready?.error,
+    error: previewing || needsAutomaticRefresh ? ready?.error : undefined,
+    sources: settings.sources,
+    source,
+    selectSource,
+    addSource,
+    removeSource,
     aimLight(direction: Vec3) {
       const angles = lightAngles(direction);
-      const current = snapshotsRef.current.items.find(({ id }) => id === snapshotsRef.current.activeId)!.settings;
-      if (angles.azimuth !== current.azimuth || angles.elevation !== current.elevation) setSettings(angles);
+      if (source && (angles.azimuth !== source.azimuth || angles.elevation !== source.elevation)) editSource(angles);
     },
-    renameSnapshot: (name: string) => editSnapshot((current) => ({ ...current, name })),
-    azimuth, setAzimuth: (value: number) => setSettings({ azimuth: value }),
-    elevation, setElevation: (value: number) => setSettings({ elevation: value }),
+    renameSource: (name: string) => editSource({ name }),
+    azimuth: source?.azimuth ?? 35, setAzimuth: (value: number) => editSource({ azimuth: value }),
+    elevation: source?.elevation ?? 50, setElevation: (value: number) => editSource({ elevation: value }),
+    intensity: source?.intensity ?? 0, setIntensity: (value: number) => editSource({ intensity: value }),
     midtone, setMidtone: (value: number) => setSettings({ midtone: Math.min(value, highlight) }),
     highlight, setHighlight: (value: number) => setSettings({ highlight: Math.max(value, midtone) }),
     draft,
-    mask: brushDraft ?? (applied?.manual ? applied.mask : draft?.mask ?? applied?.mask) ?? NO_MASK,
+    histogram: distribution?.bins,
+    lightPreview: applied?.manual ? null : preview,
+    mask: brushDraft ?? applied?.mask ?? NO_MASK,
     applied: Boolean(applied),
+    appliedLightKey: applied?.lightKey,
     committedMask: applied?.mask ?? NO_MASK,
-    unapplied: hasShadow && (!applied || applied.lightKey !== lightKey),
+    unapplied: hasShadow && (!applied || applied.lightKey !== lightKey || needsAutomaticRefresh),
     manual: Boolean(applied?.manual),
     confirming,
     brushTool,
@@ -318,14 +386,12 @@ export function useSurfaceLighting(
       setConfirming(false);
     },
     apply,
-    exportProject(regions: ShadowRegion[]) {
+    exportProject(recipes: ProjectState['recipes'], coverage: ShadowCoverage) {
+      const { settings, history } = stateRef.current;
       return {
-        activeSnapshotId: snapshots.activeId,
-        snapshots: snapshots.items.map(({ id, name, settings, history }) => ({
-          id, name, ...settings, applied: Boolean(history.current), manual: Boolean(history.current?.manual),
-          appliedLightKey: history.current?.lightKey,
-        })),
-        tones: snapshots.items.map(({ history }) => packToneMask(history.current?.mask ?? NO_MASK, regions)),
+        lighting: { ...settings, applied: Boolean(history.current), manual: Boolean(history.current?.manual),
+          appliedLightKey: history.current?.lightKey },
+        toneMask: packToneMask(history.current?.mask ?? NO_MASK, recipes, coverage),
       };
     },
     restoreProject,

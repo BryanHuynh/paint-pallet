@@ -1,4 +1,4 @@
-import type { OpenedProject, ProjectSaveRequest } from './paintProject';
+import type { OpenedProject, ProjectFile, ProjectSaveRequest } from './paintProject';
 
 import type { PartPose } from './kit';
 import type { GuideExport } from './paintingGuide';
@@ -98,12 +98,14 @@ export interface ExposureRequest {
   jobId: string;
   direction: Vec3;
   parts?: ExposurePart[];
+  castShadowsBetweenParts?: boolean;
 }
 
 export interface PaintPalletApi {
   selectStlFile: () => Promise<string | null>;
   importDroppedStl?: (file: File) => Promise<ModelSummary>;
   importStl: (filePath: string) => Promise<ModelSummary>;
+  importPracticeModel?: () => Promise<ModelSummary>;
   commitModel?: (modelId: string) => Promise<{ committed: boolean }>;
   discardModel?: (modelId: string) => Promise<{ discarded: boolean }>;
   importKitParts?: () => Promise<KitImportResult | null>;
@@ -122,8 +124,11 @@ export interface PaintPalletApi {
   computeLightExposure?: (request: ExposureRequest) => Promise<Float32Array>;
   cancelLightExposure?: (jobId: string) => Promise<{ canceled: boolean }>;
   generateVisionRecipes?: (request: VisionRecipeRequest) => Promise<VisionRecipeResult>;
-  saveProject?: (request: ProjectSaveRequest) => Promise<boolean>;
+  saveProject?: (request: ProjectSaveRequest) => Promise<ProjectFile | false>;
   exportPaintingGuide?: (guide: GuideExport) => Promise<boolean>;
-  openProject?: () => Promise<OpenedProject | null>;
+  openProject?: (recentPath?: string) => Promise<OpenedProject | null>;
+  listRecentProjects?: () => Promise<ProjectFile[]>;
+  openDroppedProject?: (file: File) => Promise<OpenedProject | null>;
+  confirmProjectReplacement?: () => Promise<'save' | 'discard' | 'cancel'>;
   onImportProgress: (listener: (event: ImportProgressEvent) => void) => () => void;
 }

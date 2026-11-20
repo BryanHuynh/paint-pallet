@@ -9,7 +9,7 @@ export function EdgePanel({ edge, busy, chooseTool, beginPreview, brushSize, set
   return (
     <section className="inspector-section" aria-label="Edge highlights">
       <h2>Edge highlights</h2>
-      {!edge.regionHasShadow ? <p className="hint-text">Select a region with a painted shadow coat.</p> : (
+      {!edge.recipeHasShadow ? <p className="hint-text">Select a recipe that has a painted shadow coat.</p> : (
         <>
           {edge.previewing ? (
             <>
@@ -28,7 +28,7 @@ export function EdgePanel({ edge, busy, chooseTool, beginPreview, brushSize, set
               <p className="hint-text" role={edge.failure ? 'alert' : 'status'}>
                 {edge.failure ?? (edge.loading ? 'Finding raised edges…' : `${edge.suggested.toLocaleString()} faces in the suggested band`)}
               </p>
-              {edge.confirming && <p className="hint-text">Replace manual edge edits in this region?</p>}
+              {edge.confirming && <p className="hint-text">Replace manual edge edits for this recipe?</p>}
               <div className="shadow-tools">
                 <button type="button" className="btn btn--primary btn--small" disabled={busy || edge.loading || Boolean(edge.failure)}
                   onClick={() => edge.apply(edge.confirming)}>

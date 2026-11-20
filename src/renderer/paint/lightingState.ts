@@ -2,13 +2,35 @@ import type { ShadowCoverage, ShadowHit, SurfaceFace } from './shadowPaint';
 
 export type GeneratedTone = 'midtone' | 'highlight';
 export interface ToneAssignment {
-  regionId: string;
+  recipeId: string;
   tone: GeneratedTone;
 }
 export type ToneMask = ReadonlyMap<number, ReadonlyMap<number, ToneAssignment>>;
 
-export function toneColorKey(regionId: string, tone: GeneratedTone): string {
-  return `${regionId}:${tone}`;
+export interface LightTonePreview {
+  scores: Float32Array;
+  midtone: number;
+  highlight: number;
+}
+
+export function summarizeExposure(coverage: ShadowCoverage, exposure: Float32Array) {
+  const bins = new Uint32Array(101);
+  let unlit = 0;
+  for (const faces of coverage.values()) {
+    for (const { faceId } of faces.values()) {
+      const score = exposure[faceId];
+      if (score > 0) bins[Math.min(100, Math.floor(score * 100))]++;
+      else unlit++;
+    }
+  }
+  const atOrAbove = bins.slice();
+  for (let i = 99; i >= 0; i--) atOrAbove[i] += atOrAbove[i + 1];
+  bins[0] += unlit;
+  return { bins, atOrAbove };
+}
+
+export function toneColorKey(recipeId: string, tone: GeneratedTone): string {
+  return `${recipeId}:${tone}`;
 }
 
 export function generateToneMask(
@@ -29,7 +51,7 @@ export function generateToneMask(
       const score = exposure[hit.faceId];
       if (!(score > 0) || score < midtoneCutoff) continue;
       const highlight = score >= highlightCutoff;
-      batch.set(hit.faceId, { regionId: hit.regionId, tone: highlight ? 'highlight' : 'midtone' });
+      batch.set(hit.faceId, { recipeId: hit.recipeId, tone: highlight ? 'highlight' : 'midtone' });
       midtoneFaces++;
       if (highlight) highlightFaces++;
     }
@@ -48,9 +70,9 @@ export function renderToneMask(coverage: ShadowCoverage, mask: ToneMask): Shadow
     let batch: Map<number, ShadowHit> | null = null;
     for (const [faceId, shade] of shades) {
       const hit = faces.get(faceId);
-      if (!hit || hit.regionId !== shade.regionId) continue;
+      if (!hit || hit.recipeId !== shade.recipeId) continue;
       batch ??= new Map(faces);
-      batch.set(faceId, { ...hit, regionId: toneColorKey(hit.regionId, shade.tone) });
+      batch.set(faceId, { ...hit, recipeId: toneColorKey(hit.recipeId, shade.tone) });
     }
     if (batch) rendered.set(index, batch);
   }
@@ -75,19 +97,19 @@ export function paintToneFaces(
   const { tone, erase } = MASK_BRUSH_TOOLS[tool];
   const changes = new Map<number, Map<number, ToneAssignment>>();
   for (const face of faces) {
-    const regionId = shadow.get(face.batchIndex)?.get(face.faceId)?.regionId;
-    if (!regionId) continue;
+    const recipeId = shadow.get(face.batchIndex)?.get(face.faceId)?.recipeId;
+    if (!recipeId) continue;
     const changed = changes.get(face.batchIndex);
     const original = mask.get(face.batchIndex);
     const former = (changed ?? original)?.get(face.faceId);
-    const previous = former?.regionId === regionId ? former.tone : undefined;
+    const previous = former?.recipeId === recipeId ? former.tone : undefined;
     const next = erase
       ? tone === 'midtone' ? undefined : previous === 'highlight' ? 'midtone' : previous
       : previous === 'highlight' ? previous : tone;
     if (next === previous) continue;
 
     const batch = changed ?? new Map(original);
-    if (next) batch.set(face.faceId, { regionId, tone: next });
+    if (next) batch.set(face.faceId, { recipeId, tone: next });
     else batch.delete(face.faceId);
     changes.set(face.batchIndex, batch);
   }

@@ -127,6 +127,7 @@ async function measureCanvasBands(
   canvasPng: Buffer,
 ): Promise<{
   totalModelPixels: number;
+  flatSurfacePixels: number;
   bands: BandCoverage[];
   head: [number, number];
   base: [number, number];
@@ -135,6 +136,10 @@ async function measureCanvasBands(
     const img = nativeImage.createFromBuffer(Buffer.from(pngBase64, 'base64'));
     const { width: w, height: h } = img.getSize();
     const bmp = img.toBitmap();
+    let flatSurfacePixels = 0;
+    for (let i = 0; i < bmp.length; i += 4) {
+      if (bmp[i] === 0xd2 && bmp[i + 1] === 0xd9 && bmp[i + 2] === 0xd4) flatSurfacePixels++;
+    }
 
     const bgB = bmp[(2 * w + 2) * 4 + 0];
     const bgG = bmp[(2 * w + 2) * 4 + 1];
@@ -219,7 +224,7 @@ async function measureCanvasBands(
       return [best.start + Math.floor(best.length / 2), row];
     }
 
-    return { totalModelPixels, bands, head: interiorAt(0.12), base: interiorAt(0.90) };
+    return { totalModelPixels, flatSurfacePixels, bands, head: interiorAt(0.12), base: interiorAt(0.90) };
   }, canvasPng.toString('base64'));
 }
 
@@ -256,6 +261,7 @@ describe('End-to-end WebGL solid surface coverage on dense STL', () => {
             canceled: false,
             filePaths: [targetPath],
           });
+          dialog.showMessageBoxSync = () => 1;
         }, stlPath);
 
         await page.click('button:has-text("Open model")');
@@ -281,6 +287,15 @@ describe('End-to-end WebGL solid surface coverage on dense STL', () => {
           // A solid surface across head, torso, legs, and base must not have scattered-dot gaps
           expect(band.fillRatio, `band ${band.name} fillRatio`).toBeGreaterThanOrEqual(0.85);
         }
+        const showLighting = page.getByRole('checkbox', { name: 'Show lighting' });
+        const measureSurface = async () => measureCanvasBands(electronApp, await canvas.screenshot({ scale: 'css' }));
+        await page.getByRole('button', { name: 'Front view', exact: true }).click();
+        await showLighting.uncheck();
+        await expect.poll(async () => (await measureSurface()).flatSurfacePixels).toBeGreaterThan(50000);
+        await page.getByRole('button', { name: 'Reset view', exact: true }).click();
+        await expect.poll(async () => (await measureSurface()).flatSurfacePixels).toBeLessThan(100);
+        expect((await measureSurface()).totalModelPixels).toBeGreaterThan(50000);
+        await showLighting.check();
 
         // Orbit the camera and verify it settles solid and supports picking on head/base
         const box = await canvas.boundingBox();
@@ -322,7 +337,6 @@ describe('End-to-end WebGL solid surface coverage on dense STL', () => {
           const baseFaceId = Number(await faceIdLocator.innerText());
           expect(Number.isInteger(baseFaceId) && baseFaceId >= 0 && baseFaceId !== headFaceId).toBe(true);
 
-          await page.getByRole('button', { name: 'Add region' }).click();
           await page.getByRole('button', { name: 'Fill', exact: true }).click();
           const paintedFaces = page.getByLabel('Painted faces');
           await page.mouse.click(pickBox.x + orbitedMetrics.head[0], pickBox.y + orbitedMetrics.head[1]);

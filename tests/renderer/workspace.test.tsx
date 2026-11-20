@@ -11,6 +11,7 @@ import {
   findRayIntersectingBatchIndices,
   resolveClickAgainstVisibleDetail,
   selectCameraVisibleBatchIndices,
+  visiblePartBatches,
 } from '../../src/renderer/components/Viewport3D';
 import { computeOrientationQuaternion } from '../../src/renderer/orientation';
 import type { ModelSummary, PaintPalletApi } from '../../src/shared/workerProtocol';
@@ -141,12 +142,13 @@ describe('UI import-orbit-orientation actions', () => {
     expect(screen.getByText('first.stl')).toBeInTheDocument();
   });
 
-  it('updates upright and front orientation and aligns local axes to world +Y and +Z', () => {
+  it('updates upright and front orientation and aligns local axes to world +Y and +Z', async () => {
     const onOrientationChange = vi.fn();
     const api = createMockApi();
     render(<App api={api} disableWebGL onOrientationChange={onOrientationChange} />);
 
-    const uprightSelect = screen.getByLabelText(/upright axis/i);
+    fireEvent.click(screen.getByRole('button', { name: 'Open model' }));
+    const uprightSelect = await screen.findByLabelText(/upright axis/i);
     const frontSelect = screen.getByLabelText(/front axis/i);
 
     fireEvent.change(uprightSelect, { target: { value: '+Z' } });
@@ -318,6 +320,37 @@ describe('UI import-orbit-orientation actions', () => {
     // Ray aimed at batch 20
     const rayHits = findRayIntersectingBatchIndices(batches, [202, 2, 20], [0, 0, -1]);
     expect(rayHits).toEqual([20]);
+  });
+
+  it('streams only batches in frame using the pose of each kit part', () => {
+    const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 100);
+    camera.position.set(0, 0, 8);
+    camera.lookAt(0, 0, 0);
+    camera.updateMatrixWorld();
+    const assembly = new THREE.Group();
+    const child = new THREE.Group();
+    assembly.rotation.z = Math.PI / 2;
+    assembly.add(child);
+    const bounds = (x: number): ModelSummary['bounds'] => ({
+      min: [x - 0.5, -0.5, -0.5], max: [x + 0.5, 0.5, 0.5],
+    });
+    const model: ModelSummary = {
+      modelId: 'kit-part', partId: 'child', fileName: 'part.stl', fileSizeBytes: 184,
+      triangleCount: 2, bounds: { min: bounds(0).min, max: bounds(9).max },
+      batches: [0, 9].map((x, batchIndex) => ({
+        batchIndex, bounds: bounds(x), triangleCount: 1, filePath: `batch-${batchIndex}`,
+      })),
+      previewFilePath: 'preview.bin',
+    };
+    const inFrame = () => {
+      assembly.updateMatrixWorld(true);
+      return visiblePartBatches(camera, child, model).map(({ batchIndex }) => batchIndex);
+    };
+    expect(inFrame()).toEqual([0]);
+    child.position.x = -9;
+    expect(inFrame()).toEqual([1]);
+    child.position.x = 20;
+    expect(inFrame()).toEqual([]);
   });
 
   it('rejects preview-only clicks, requests second click when detail is missing, and resolves visible detail', () => {

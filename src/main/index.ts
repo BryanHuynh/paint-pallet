@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import { savePaintingGuide } from './paintingGuide';
 import type { GuideExport } from '../shared/paintingGuide';
 import { ANCHOR_ADDRESS, restoreKitAddresses } from '../shared/kit';
-import type { OpenedProject, ProjectContents, ProjectSaveRequest } from '../shared/paintProject';
+import type { OpenedProject, ProjectContents, ProjectFile, ProjectSaveRequest } from '../shared/paintProject';
+import { isProjectPath, projectFile, RecentProjects } from './recentProjects';
 import { openProjectArchive, writeProjectArchive } from './projectArchive';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -20,7 +21,7 @@ const palettePageUrl = MAIN_WINDOW_VITE_DEV_SERVER_URL
   ? new URL(MAIN_WINDOW_VITE_DEV_SERVER_URL).href
   : pathToFileURL(palettePagePath).href;
 
-const originalSources = new Map<string, { path: string; name: string; cleanup?: () => Promise<void> }>();
+const originalSources = new Map<string, { path: string; name: string; file?: ProjectFile; fileStamp?: string; cleanup?: () => Promise<void> }>();
 let loadedModelId: string | null = null;
 let mainWindow: BrowserWindow | null = null;
 let workerClient: WorkerClient | null = null;
@@ -68,16 +69,12 @@ function getWorkerClient(): WorkerClient {
   return workerClient;
 }
 
-function resolveAppIconPath(): string | undefined {
-  const iconFileName =
-    process.platform === 'win32'
-      ? 'paint-pallet-logo.ico'
-      : 'paint-pallet-logo.png';
+function resolveBundledAsset(fileName: string): string | undefined {
   const resourcesPath = (process as unknown as { resourcesPath?: string }).resourcesPath;
   const candidates = [
-    resourcesPath ? path.join(resourcesPath, iconFileName) : null,
-    path.resolve(app.getAppPath(), 'assets', iconFileName),
-    path.resolve(process.cwd(), 'assets', iconFileName),
+    resourcesPath ? path.join(resourcesPath, fileName) : null,
+    path.resolve(app.getAppPath(), 'assets', fileName),
+    path.resolve(process.cwd(), 'assets', fileName),
   ];
 
   for (const candidate of candidates) {
@@ -112,12 +109,12 @@ async function validateProjectFaces(model: ModelSummary, contents: ProjectConten
     }
   }
   const checked = new Map<number, { faceId: number; ordinal: number }[]>();
-  for (const mask of [contents.paint, ...(contents.edges ?? [])]) {
+  for (const mask of [contents.paint, ...(contents.edgeMask ? [contents.edgeMask] : [])]) {
     for (let i = 0; i < mask.length; i += 4) {
-      const [faceId, batchIndex, ordinal, regionIndex] = mask.subarray(i, i + 4);
+      const [faceId, batchIndex, ordinal, recipeIndex] = mask.subarray(i, i + 4);
       const batch = batchMap.get(batchIndex);
       if (!batch || faceId < batch.faceOffset || faceId >= batch.faceEnd || ordinal >= batch.triangleCount ||
-        regionIndex >= contents.state.regions.length) throw new Error('Project paint refers to an invalid original face.');
+        recipeIndex >= contents.state.recipes.length) throw new Error('Project paint refers to an invalid original face.');
       const list = checked.get(batchIndex) ?? [];
       list.push({ faceId, ordinal });
       checked.set(batchIndex, list);
@@ -137,11 +134,12 @@ async function validateProjectFaces(model: ModelSummary, contents: ProjectConten
       await file.close();
     }
   }
-  for (const tone of contents.tones) {
+  {
+    const tone = contents.toneMask;
     for (let i = 0; i < tone.length; i += 4) {
       const batch = batchMap.get(tone[i + 1]);
       if (!batch || tone[i] < batch.faceOffset || tone[i] >= batch.faceEnd ||
-          tone[i + 2] >= contents.state.regions.length || (tone[i + 3] !== 1 && tone[i + 3] !== 2)) {
+          tone[i + 2] >= contents.state.recipes.length || (tone[i + 3] !== 1 && tone[i + 3] !== 2)) {
         throw new Error('Project lighting refers to an invalid original face.');
       }
     }
@@ -149,7 +147,7 @@ async function validateProjectFaces(model: ModelSummary, contents: ProjectConten
 }
 
 function createWindow(): void {
-  const iconPath = resolveAppIconPath();
+  const iconPath = resolveBundledAsset(process.platform === 'win32' ? 'paint-pallet-logo.ico' : 'paint-pallet-logo.png');
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -163,6 +161,15 @@ function createWindow(): void {
       contextIsolation: true,
       nodeIntegration: false,
     },
+  });
+  const window = mainWindow;
+  window.webContents.on('will-prevent-unload', (event) => {
+    const choice = dialog.showMessageBoxSync(window, {
+      type: 'warning', title: 'Unsaved project changes',
+      message: 'Close Paint Pallet and discard unsaved changes?',
+      buttons: ['Keep editing', 'Discard changes'], defaultId: 0, cancelId: 0,
+    });
+    if (choice === 1) event.preventDefault();
   });
 
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
@@ -226,6 +233,12 @@ app.whenReady().then(() => {
       throw new Error('STL path must be selected through the file dialog');
     }
     return importStl(resolved);
+  });
+
+  ipcMain.handle('worker:import-practice-model', async () => {
+    const file = resolveBundledAsset('field-robot.stl');
+    if (!file) throw new Error('Could not find the Field Robot practice model.');
+    return importStl(file, { name: 'Field Robot.stl' });
   });
 
   // The preload derives this path from a disk-backed File before invoking IPC.
@@ -429,6 +442,7 @@ app.whenReady().then(() => {
     if (!request || request.modelId !== loadedModelId ||
       typeof request.jobId !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(request.jobId) ||
       !Array.isArray(request.direction) || request.direction.length !== 3 ||
+      (request.castShadowsBetweenParts !== undefined && typeof request.castShadowsBetweenParts !== 'boolean') ||
       !request.direction.every(Number.isFinite) || activeLightingJobs.has(request.jobId)) {
       throw new Error('Invalid lighting request.');
     }
@@ -461,56 +475,141 @@ app.whenReady().then(() => {
     return savePaintingGuide(mainWindow, guide);
   });
 
+  const recentProjects = new RecentProjects(path.join(app.getPath('userData'), 'recent-projects.json'));
+  ipcMain.handle('project:recents', () => recentProjects.list());
+  ipcMain.handle('project:confirm-replacement', async () => {
+    if (!mainWindow) return 'cancel';
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      title: 'Unsaved project changes',
+      message: 'Save changes before opening another file?',
+      buttons: ['Save', 'Discard changes', 'Cancel'],
+      defaultId: 0,
+      cancelId: 2,
+    });
+    return response === 0 ? 'save' : response === 1 ? 'discard' : 'cancel';
+  });
+
+  async function projectFileStamp(filePath: string) {
+    const info = await fs.promises.stat(filePath, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return undefined;
+      throw error;
+    });
+    return info && [info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(':');
+  }
+
+  let savingProject = false;
   ipcMain.handle('project:save', async (_event, request: ProjectSaveRequest) => {
     const source = request && originalSources.get(request.modelId);
     if (!mainWindow || !source || request.modelId !== loadedModelId) {
       throw new Error('Open a model before saving a paint project.');
     }
-    const target = await dialog.showSaveDialog(mainWindow, {
-      title: 'Save Paint Pallet project',
-      defaultPath: path.parse(source.name).name + '.paintproject',
-      filters: [{ name: 'Paint Pallet projects', extensions: ['paintproject'] }],
-    });
-    if (target.canceled || !target.filePath) return false;
-    const ids = request.kitModelIds ?? [];
-    if (!Array.isArray(ids) || new Set(ids).size !== ids.length || ids.length !== kitModels.size ||
-        ids.some((id) => !kitModels.has(id) || !originalSources.has(id))) {
-      throw new Error('The saved part list does not match the open kit.');
+    if (savingProject) throw new Error('A project save is already in progress.');
+    savingProject = true;
+    try {
+      let file = source.file;
+      let stamp = source.fileStamp;
+      if (request.saveAs || !file) {
+        const [recent] = await recentProjects.list();
+        const suggestedName = path.parse(source.name).name + '.paintproject';
+        const target = await dialog.showSaveDialog(mainWindow, {
+          title: file ? 'Save Paint Pallet project as' : 'Save Paint Pallet project',
+          defaultPath: file?.path ?? (recent ? path.join(path.dirname(recent.path), suggestedName) : suggestedName),
+          filters: [{ name: 'Paint Pallet projects', extensions: ['paintproject'] }],
+        });
+        if (target.canceled || !target.filePath) return false;
+        const chosen = path.extname(target.filePath) ? target.filePath : target.filePath + '.paintproject';
+        if (!isProjectPath(chosen)) throw new Error('Use the .paintproject extension to save your project.');
+        file = projectFile(chosen);
+        stamp = await projectFileStamp(file.path);
+      }
+      const ids = request.kitModelIds ?? [];
+      if (loadedModelId !== request.modelId || !Array.isArray(ids) || new Set(ids).size !== ids.length ||
+          ids.length !== kitModels.size || ids.some((id) => !kitModels.has(id) || !originalSources.has(id))) {
+        throw new Error('The saved part list does not match the open kit.');
+      }
+      const destination = file.path;
+      const verifyDestination = async () => {
+        if (await projectFileStamp(destination) !== stamp) {
+          throw new Error('The project file changed or was moved outside Paint Pallet. Use Save project as to keep your edits.');
+        }
+      };
+      await verifyDestination();
+      await writeProjectArchive(destination, source.path, source.name, request,
+        ids.map((id) => originalSources.get(id)!.path), verifyDestination);
+      source.file = file;
+      source.fileStamp = await projectFileStamp(destination);
+      await recentProjects.remember(file.path).catch(() => {});
+      return file;
+    } finally {
+      savingProject = false;
     }
-    await writeProjectArchive(target.filePath, source.path, source.name, request, ids.map((id) => originalSources.get(id)!.path));
-    return true;
   });
 
-  ipcMain.handle('project:open', async (): Promise<OpenedProject | null> => {
+  let openingProject = false;
+  async function loadProject(filePath: string): Promise<OpenedProject> {
+    if (activeImportJobId || openingProject || savingProject) throw new Error('Wait for the current project operation to finish.');
+    const file = projectFile(filePath);
+    openingProject = true;
+    try {
+      const stamp = await projectFileStamp(file.path);
+      if (!stamp) {
+        await recentProjects.forget(file.path).catch(() => {});
+        throw new Error('That project was moved or deleted.');
+      }
+      const archive = await openProjectArchive(file.path, path.join(app.getPath('userData'), 'project-cache'));
+      let model: ModelSummary | undefined;
+      const kitParts: ModelSummary[] = [];
+      try {
+        model = await importStl(archive.originalPath, { name: archive.sourceName, cleanup: archive.cleanup });
+
+        for (const part of archive.kitParts) {
+          kitParts.push(await importStl(part.originalPath, { name: part.sourceName }));
+        }
+        await validateProjectFaces(model, archive.contents, kitParts);
+        if (kitParts.length) stagedKitsByAnchor.set(model.modelId, kitParts);
+        const source = originalSources.get(model.modelId)!;
+        source.file = file;
+        source.fileStamp = stamp;
+        await recentProjects.remember(file.path).catch(() => {});
+        return { model, kitModels: kitParts, file, ...archive.contents };
+      } catch (error) {
+        for (const part of kitParts) await discardStagedPart(part.modelId);
+        if (model) {
+          await discardStagedPart(model.modelId);
+        } else {
+          await archive.cleanup();
+        }
+        throw error;
+      }
+    } finally {
+      openingProject = false;
+    }
+  }
+
+  ipcMain.handle('project:open', async (_event, recentPath?: unknown): Promise<OpenedProject | null> => {
     if (!mainWindow) return null;
+    const previous = await recentProjects.list();
+    if (recentPath !== undefined) {
+      const recent = previous.find((file) => file.path === recentPath);
+      if (!recent) throw new Error('Choose a project from the recent projects list.');
+      return loadProject(recent.path);
+    }
     const selection = await dialog.showOpenDialog(mainWindow, {
       title: 'Open Paint Pallet project',
+      defaultPath: previous[0] ? path.dirname(previous[0].path) : undefined,
       properties: ['openFile'],
       filters: [{ name: 'Paint Pallet projects', extensions: ['paintproject'] }],
     });
     if (selection.canceled || !selection.filePaths.length) return null;
-    if (activeImportJobId) throw new Error('Wait for the current model import.');
-    const archive = await openProjectArchive(selection.filePaths[0], path.join(app.getPath('userData'), 'project-cache'));
-    let model: ModelSummary | undefined;
-    const kitParts: ModelSummary[] = [];
-    try {
-      model = await importStl(archive.originalPath, { name: archive.sourceName, cleanup: archive.cleanup });
+    return loadProject(selection.filePaths[0]);
+  });
 
-      for (const part of archive.kitParts) {
-        kitParts.push(await importStl(part.originalPath, { name: part.sourceName }));
-      }
-      await validateProjectFaces(model, archive.contents, kitParts);
-      if (kitParts.length) stagedKitsByAnchor.set(model.modelId, kitParts);
-      return { model, kitModels: kitParts, ...archive.contents };
-    } catch (error) {
-      for (const part of kitParts) await discardStagedPart(part.modelId);
-      if (model) {
-        await discardStagedPart(model.modelId);
-      } else {
-        await archive.cleanup();
-      }
-      throw error;
+  ipcMain.handle('project:open-dropped', (event, filePath: unknown) => {
+    if (event.sender !== mainWindow?.webContents || event.senderFrame !== event.sender.mainFrame || !isProjectPath(filePath)) {
+      throw new Error('Drop a .paintproject file from your computer.');
     }
+    return loadProject(filePath);
   });
 
   createWindow();
@@ -528,7 +627,7 @@ app.on('window-all-closed', () => {
   }
 });
 
-app.on('before-quit', () => {
+app.on('will-quit', () => {
   for (const id of originalSources.keys()) void releaseOriginalSource(id);
   if (workerClient) {
     void workerClient.dispose();

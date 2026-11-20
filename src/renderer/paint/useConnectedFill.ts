@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useEffectEvent, useMemo, useState } from 'react';
 import { ANCHOR_ADDRESS, type PartAddress } from '../../shared/kit';
-import type { PaintPalletApi } from '../../shared/workerProtocol';
+import type { ModelSummary, PaintPalletApi } from '../../shared/workerProtocol';
 import { paintShadowFaces, startShadowStroke, type ShadowCoverage, type SurfaceFace } from './shadowPaint';
 
-export const FILL_PREVIEW_REGION = 'connected-fill-preview';
+export const FILL_PREVIEW_RECIPE = 'connected-fill-preview';
 
 interface FillSeed {
-  modelId: string;
-  regionId: string;
+  model: ModelSummary;
+  address: PartAddress;
+  recipeId: string;
   faceId: number;
 }
 
@@ -20,20 +21,19 @@ export function* unpackFillFaces(packed: Uint32Array, address: PartAddress = ANC
 export function useConnectedFill(
   api: PaintPalletApi | undefined,
   enabled: boolean,
-  modelId: string | undefined,
-  regionId: string | undefined,
+  recipeId: string | undefined,
   coverage: ShadowCoverage,
-  part: (PartAddress & { faceCount: number }) | undefined,
   previewBeforeFill: boolean,
-  commit: (faces: Iterable<SurfaceFace>) => void,
+  repaint: boolean,
+  commit: (faces: Iterable<SurfaceFace>, repaint: boolean) => void,
 ) {
   const [seeds, setSeeds] = useState<FillSeed[]>([]);
   const seed = seeds[0];
   const [creaseDegrees, setCreaseDegrees] = useState(35);
   const query = useMemo(() => {
-    if (!enabled || !seed || seed.modelId !== modelId || seed.regionId !== regionId) return null;
-    return { seed, creaseDegrees, coverage, part, previewBeforeFill };
-  }, [enabled, seed, modelId, regionId, creaseDegrees, coverage, part, previewBeforeFill]);
+    if (!enabled || !seed || seed.recipeId !== recipeId) return null;
+    return { seed, creaseDegrees, coverage, previewBeforeFill, repaint };
+  }, [enabled, seed, recipeId, creaseDegrees, coverage, previewBeforeFill, repaint]);
   const [result, setResult] = useState<{
     query: NonNullable<typeof query>;
     packed?: Uint32Array;
@@ -46,11 +46,16 @@ export function useConnectedFill(
   const finish = useEffectEvent((completed: NonNullable<typeof query>, packed: Uint32Array) => {
     if (query !== completed) return;
     if (completed.previewBeforeFill) {
-      const draft = startShadowStroke(completed.coverage, FILL_PREVIEW_REGION, 'brush');
-      paintShadowFaces(draft, unpackFillFaces(packed, completed.part));
+      const draft = startShadowStroke(completed.coverage, FILL_PREVIEW_RECIPE, completed.repaint ? 'repaint' : 'brush');
+      function* changedFaces() {
+        for (const face of unpackFillFaces(packed, completed.seed.address)) {
+          if (completed.coverage.get(face.batchIndex)?.get(face.faceId)?.recipeId !== completed.seed.recipeId) yield face;
+        }
+      }
+      paintShadowFaces(draft, changedFaces());
       setResult({ query: completed, packed, coverage: draft.coverage, added: draft.edit.added.length });
     } else {
-      commit(unpackFillFaces(packed, completed.part));
+      commit(unpackFillFaces(packed, completed.seed.address), completed.repaint);
       setSeeds((previous) => previous.slice(1));
     }
   });
@@ -74,17 +79,26 @@ export function useConnectedFill(
     const run = async () => {
       started = true;
       const blockedFaces: number[] = [];
-      for (const batch of query.coverage.values()) {
+      const { model, address } = query.seed;
+      const painted = model.batches.flatMap(({ batchIndex }) => {
+        const batch = query.coverage.get(batchIndex + address.batchOffset);
+        return batch ? [batch] : [];
+      });
+      const seedFaceId = query.seed.faceId + address.faceOffset;
+      const sourceRecipe = query.repaint
+        ? painted.find((batch) => batch.has(seedFaceId))?.get(seedFaceId)?.recipeId
+        : undefined;
+      const passableRecipe = sourceRecipe ?? query.seed.recipeId;
+      for (const batch of painted) {
         for (const hit of batch.values()) {
-          const local = hit.faceId - (query.part?.faceOffset ?? 0);
-          if (hit.regionId !== query.seed.regionId && (!query.part || (local >= 0 && local < query.part.faceCount))) blockedFaces.push(local);
+          if (hit.recipeId !== passableRecipe) blockedFaces.push(hit.faceId - address.faceOffset);
         }
       }
 
       try {
         const packed = await preview({
           jobId,
-          modelId: query.seed.modelId,
+          modelId: model.modelId,
           faceId: query.seed.faceId,
           maxCreaseDegrees: query.creaseDegrees,
           blockedFaces,
@@ -120,11 +134,15 @@ export function useConnectedFill(
     seeded: Boolean(query),
     loading: Boolean(query && !ready),
     previewCoverage: ready?.coverage,
-    packed: ready?.packed,
     added: ready?.added ?? 0,
     error: ready?.error ?? error,
     creaseDegrees,
     setCreaseDegrees,
+    applyPreview() {
+      if (ready?.packed && ready.query.previewBeforeFill) {
+        commit(unpackFillFaces(ready.packed, ready.query.seed.address), ready.query.repaint);
+      }
+    },
     select(next: FillSeed) {
       setError(undefined);
       setSeeds((previous) => previewBeforeFill ? [next] : [...previous, next]);

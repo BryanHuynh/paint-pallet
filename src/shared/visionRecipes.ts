@@ -2,7 +2,6 @@ export const MAX_VISION_REFERENCES = 4;
 export const MAX_VISION_IMAGE_DIMENSION = 1024;
 
 export interface VisionRecipeRequest {
-  apiKey: string;
   images: string[];
 }
 

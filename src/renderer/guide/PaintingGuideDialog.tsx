@@ -15,7 +15,7 @@ interface Props {
   tones: ToneMask;
   edges: ShadowCoverage;
   rows: GuideExport['rows'];
-  snapshot: string;
+  lighting: string;
   unapplied: boolean;
   callouts: GuideCallout[];
   setCallouts: (callouts: GuideCallout[]) => void;
@@ -28,12 +28,12 @@ interface Props {
 
 const pinPosition = (value: number) => Math.min(0.96, Math.max(0.04, value));
 
-export default function PaintingGuideDialog({ api, model, orientation, coverage, tones, edges, rows, snapshot, unapplied, callouts, setCallouts, close, parts, joints, installation, setInstallation }: Props) {
+export default function PaintingGuideDialog({ api, model, orientation, coverage, tones, edges, rows, lighting, unapplied, callouts, setCallouts, close, parts, joints, installation, setInstallation }: Props) {
   const dialog = useRef<HTMLDialogElement>(null);
   const request = useRef<AbortController | null>(null);
   const [includeDetails, setIncludeDetails] = useState(true);
   const [paper, setPaper] = useState<GuidePaper>('Letter');
-  const [region, setRegion] = useState(rows[0]?.id ?? '');
+  const [selectedRecipe, setSelectedRecipe] = useState(rows[0]?.id ?? '');
   const [previews, setPreviews] = useState<string[] | null>(null);
   const [exporting, setExporting] = useState(false);
   const [acknowledged, setAcknowledged] = useState(false);
@@ -43,7 +43,7 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
     const missingEdges = useMemo(() => {
     const painted = new Set<string>();
     for (const batch of edges.values()) {
-      for (const hit of batch.values()) painted.add(hit.regionId);
+      for (const hit of batch.values()) painted.add(hit.recipeId);
     }
     return rows.filter((row) => painted.has(row.id) && !row.edgeSwatch);
   }, [edges, rows]);
@@ -68,9 +68,9 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
   }, [readBatch, model, printParts, orientation, coverage, tones, rows]);
 
   function position(view: GuideView, x: number, y: number) {
-    if (!region) return;
-    setCallouts([...callouts.filter((pin) => pin.view !== view || pin.regionId !== region),
-      { view, regionId: region, x: pinPosition(x), y: pinPosition(y) }]);
+    if (!selectedRecipe) return;
+    setCallouts([...callouts.filter((pin) => pin.view !== view || pin.recipeId !== selectedRecipe),
+      { view, recipeId: selectedRecipe, x: pinPosition(x), y: pinPosition(y) }]);
   }
 
   async function exportGuide() {
@@ -108,7 +108,7 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
       }
       controller.signal.throwIfAborted();
       const saved = await api.exportPaintingGuide({
-        paper, modelName: model.fileName, snapshot, rows, callouts, images, details, installation: steps, isolatedSheets,
+        paper, modelName: model.fileName, lighting, rows, callouts, images, details, installation: steps, isolatedSheets,
       });
       if (!controller.signal.aborted && saved) setMessage({ text: 'Painting guide saved.', error: false });
     } catch (error) {
@@ -129,7 +129,7 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
       <header className="guide-dialog__header">
         <div>
           <h2 id="guide-title">Painting guide</h2>
-          <p className="hint-text">{model.fileName} · {snapshot}</p>
+          <p className="hint-text">{model.fileName} · {lighting}</p>
         </div>
         <button type="button" className="btn btn--secondary" onClick={close}>Close</button>
       </header>
@@ -147,14 +147,14 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
             <option value="full">Full model only</option>
           </select>
         </label>
-        <label>Callout region
-          <select value={region} onChange={(event) => setRegion(event.target.value)} disabled={exporting || rows.length === 0}>
-            {rows.length === 0 && <option value="">No regions</option>}
+        <label>Callout recipe
+          <select value={selectedRecipe} onChange={(event) => setSelectedRecipe(event.target.value)} disabled={exporting || rows.length === 0}>
+            {rows.length === 0 && <option value="">No painted recipes</option>}
             {rows.map((row, index) => <option key={row.id} value={row.id}>{index + 1}. {row.name}</option>)}
           </select>
         </label>
       </div>
-      {rows.length > 0 && <p className="hint-text">Click a view to place the selected region’s number. Click a number to remove it.</p>}
+      {rows.length > 0 && <p className="hint-text">Click a view to place the selected recipe’s number. Click a number to remove it.</p>}
       {previews ? (
         <div className="guide-dialog__views">
           {GUIDE_VIEWS.map((view, index) => (
@@ -162,7 +162,7 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
               <figcaption>{view}</figcaption>
               <div className="guide-dialog__view">
                 <button type="button" className="guide-dialog__image" aria-label={`Place callout on ${view.toLowerCase()} view`}
-                  disabled={exporting || !region}
+                  disabled={exporting || !selectedRecipe}
                   onClick={(event) => {
                     const box = event.currentTarget.getBoundingClientRect();
                     position(view, event.detail === 0 ? 0.5 : (event.clientX - box.left) / box.width,
@@ -170,12 +170,12 @@ export default function PaintingGuideDialog({ api, model, orientation, coverage,
                   }}>
                   <img src={previews[index]} alt={`${view} orthographic view`} draggable={false} />
                 </button>
-                {callouts.filter((pin) => pin.view === view && numbers.has(pin.regionId)).map((pin) => (
-                  <button type="button" key={pin.regionId} className="guide-dialog__pin"
-                    aria-label={`Remove callout ${numbers.get(pin.regionId)} from ${view.toLowerCase()} view`}
+                {callouts.filter((pin) => pin.view === view && numbers.has(pin.recipeId)).map((pin) => (
+                  <button type="button" key={pin.recipeId} className="guide-dialog__pin"
+                    aria-label={`Remove callout ${numbers.get(pin.recipeId)} from ${view.toLowerCase()} view`}
                     disabled={exporting} style={{ left: `${pin.x * 100}%`, top: `${pin.y * 100}%` }}
                     onClick={() => setCallouts(callouts.filter((other) => other !== pin))}>
-                    {numbers.get(pin.regionId)}
+                    {numbers.get(pin.recipeId)}
                   </button>
                 ))}
               </div>

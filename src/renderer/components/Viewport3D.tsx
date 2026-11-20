@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type {
@@ -11,7 +11,8 @@ import type {
 } from '../../shared/workerProtocol';
 import { ANCHOR_ADDRESS, IDENTITY_PART_POSE, type PartAddress, type KitPart, type PartPose } from '../../shared/kit';
 import { computeOrientationQuaternion } from '../orientation';
-import { disposeDetailMesh, setShadowOverlay } from '../paint/shadowOverlay';
+import { disposeDetailMesh, PaintOverlayStyle, setShadowOverlay } from '../paint/shadowOverlay';
+import type { LightTonePreview } from '../paint/lightingState';
 import type { ShadowCoverage, SurfaceFace } from '../paint/shadowPaint';
 import { SurfaceBrush } from '../paint/surfaceBrush';
 import { SurfaceBrushPreview } from '../paint/surfaceBrushPreview';
@@ -36,6 +37,8 @@ export interface Viewport3DProps {
   ghostModelId?: string;
   jointMarker?: Vec3;
   highlightPickFace?: boolean;
+  fillPick?: boolean;
+  showLighting?: boolean;
   lightPlacement?: { active: boolean; direction: Vec3; cameraRequest: number | null; onDirection: (direction: Vec3) => void };
   orientation: ModelOrientation;
   cameraPresetRequest: { preset: CameraPreset; seq: number } | null;
@@ -48,6 +51,9 @@ export interface Viewport3DProps {
   shadowPaint?: {
     enabled: boolean;
     coverage: ShadowCoverage;
+    baseCoverage?: ShadowCoverage;
+    companionCoverage?: ShadowCoverage;
+    lightPreview?: LightTonePreview | null;
     colors: ReadonlyMap<string, string>;
     address?: PartAddress;
     diameter: number;
@@ -60,12 +66,83 @@ export interface Viewport3DProps {
   onPendingModelCommit: (committed: ModelSummary) => Promise<boolean> | boolean;
   onPendingModelError: (error: Error) => void;
   disableWebGL?: boolean;
+  active?: boolean;
 }
 
 export const MAX_DETAIL_BATCHES = 256;
 export const MAX_DETAIL_TRIANGLES = 14_000_000;
 export const INITIAL_STAGE_BATCHES = 16;
 const DETAIL_STREAM_CONCURRENCY = 4;
+const MAX_COMPANION_DETAIL_TRIANGLES = MAX_DETAIL_TRIANGLES / 2;
+
+interface CompanionLayer {
+  group: THREE.Group;
+  ghost: boolean;
+  preview: THREE.Mesh | null;
+  maskedMaterials?: { detail: THREE.MeshStandardMaterial; preview: THREE.MeshStandardMaterial };
+  batches: Map<number, { mesh: THREE.Mesh; faceIds: Uint32Array }>;
+}
+
+export function visiblePartBatches(camera: THREE.PerspectiveCamera, layer: THREE.Group, model: ModelSummary) {
+  // Keep a little detail beyond the viewport edge during damped camera movement.
+  const clipFromPart = camera.projectionMatrix.clone();
+  clipFromPart.elements[0] *= 0.94;
+  clipFromPart.elements[5] *= 0.94;
+  clipFromPart.multiply(camera.matrixWorldInverse).multiply(layer.matrixWorld);
+  const frustum = new THREE.Frustum().setFromProjectionMatrix(clipFromPart);
+  const bounds = new THREE.Box3();
+  const intersects = ({ min, max }: Bounds3) => {
+    bounds.min.fromArray(min);
+    bounds.max.fromArray(max);
+    return frustum.intersectsBox(bounds);
+  };
+  return intersects(model.bounds) ? model.batches.filter((batch) => intersects(batch.bounds)) : [];
+}
+
+function markExactSurface(material: THREE.MeshStandardMaterial, id: number) {
+  material.stencilWrite = true;
+  material.stencilRef = id;
+  material.stencilZPass = THREE.ReplaceStencilOp;
+}
+
+function maskPreviewSurface(material: THREE.MeshStandardMaterial, id: number) {
+  material.stencilWrite = true;
+  material.stencilWriteMask = 0;
+  material.stencilRef = id;
+  material.stencilFunc = THREE.NotEqualStencilFunc;
+}
+
+function attachSurfaceDetail(material: THREE.Material, strength: { value: number }) {
+  const compile = material.onBeforeCompile;
+  const cacheKey = material.customProgramCacheKey();
+  material.customProgramCacheKey = () => cacheKey + ':surface-detail';
+  material.onBeforeCompile = (shader, renderer) => {
+    compile.call(material, shader, renderer);
+    shader.uniforms.surfaceDetailStrength = strength;
+    shader.vertexShader = 'varying vec3 detailViewPosition;\n' + shader.vertexShader.replace(
+      '#include <project_vertex>',
+      '#include <project_vertex>\n detailViewPosition = mvPosition.xyz;',
+    );
+    shader.fragmentShader = 'uniform float surfaceDetailStrength;\n varying vec3 detailViewPosition;\n' +
+      shader.fragmentShader.replace('#include <opaque_fragment>', `
+        if (surfaceDetailStrength > 0.0) {
+          vec3 viewNormal = normalize(cross(dFdx(detailViewPosition), dFdy(detailViewPosition)));
+          float slope = length(viewNormal.xy);
+          float bevel = dot(viewNormal.xy, vec2(-0.55, 0.83));
+          float rim = smoothstep(0.72, 1.0, slope);
+          outgoingLight = mix(outgoingLight, vec3(0.0), surfaceDetailStrength * (max(0.0, -bevel) * 0.28 + rim * 0.22));
+          outgoingLight = mix(outgoingLight, vec3(1.0), surfaceDetailStrength * max(0.0, bevel) * 0.19);
+        }
+        #include <opaque_fragment>
+      `);
+  };
+}
+
+function disposeCompanion(layer: CompanionLayer) {
+  disposeGroupMeshes(layer.group);
+  layer.maskedMaterials?.detail.dispose();
+  layer.maskedMaterials?.preview.dispose();
+}
 
 function distanceSqToBounds(p: THREE.Vector3, b: BatchDescriptor['bounds']): number {
   const dx = Math.max(b.min[0] - p.x, 0, p.x - b.max[0]);
@@ -289,7 +366,10 @@ export function Viewport3D({
   orientation,
   cameraPresetRequest,
   onSurfacePick,
+  fillPick,
+  showLighting = true,
   shadowPaint,
+  active = true,
   onPickNeedsDetail,
   onViewChange,
   onPendingModelCommit,
@@ -304,8 +384,19 @@ export function Viewport3D({
   const handledCameraRequest = useRef<number | null>(null);
   const onPickRef = useRef(onSurfacePick);
   onPickRef.current = onSurfacePick;
+  const fillPickRef = useRef(fillPick);
+  fillPickRef.current = fillPick;
   const shadowPaintRef = useRef(shadowPaint);
   shadowPaintRef.current = shadowPaint;
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const previewScores = shadowPaint?.lightPreview?.scores;
+  const companionCoverage = shadowPaint?.companionCoverage;
+  const paintedCompanionBatches = useMemo(() => {
+    const batches: number[] = [];
+    for (const [index, hits] of companionCoverage ?? []) if (hits.size) batches.push(index);
+    return batches.sort((a, b) => a - b).join(',');
+  }, [companionCoverage]);
   const onPickNeedsDetailRef = useRef(onPickNeedsDetail);
   onPickNeedsDetailRef.current = onPickNeedsDetail;
   const onViewChangeRef = useRef(onViewChange);
@@ -325,6 +416,7 @@ export function Viewport3D({
   const streamGenerationRef = useRef(0);
   const modelGenRef = useRef(0);
   const viewGenRef = useRef(0);
+  const [companionView, setCompanionView] = useState({ moving: false });
 
   const sceneRefs = useRef<{
     scene: THREE.Scene;
@@ -332,29 +424,38 @@ export function Viewport3D({
     controls: OrbitControls;
     orbitLifecycle: ReturnType<typeof attachOrbitDetailLifecycle>;
     renderer: THREE.WebGLRenderer;
+    grid: THREE.GridHelper;
     modelGroup: THREE.Group;
     surfaceGroup: THREE.Group;
     companionMaterial: THREE.MeshStandardMaterial;
     stagedMaterial: THREE.MeshStandardMaterial;
-    companions: Map<string, THREE.Group>;
+    companions: Map<string, CompanionLayer>;
     marker: THREE.Mesh<THREE.SphereGeometry, THREE.MeshBasicMaterial>;
     previewGroup: THREE.Group;
     detailGroup: THREE.Group;
     material: THREE.MeshStandardMaterial;
     previewMaterial: THREE.MeshStandardMaterial;
     shadowMaterial: THREE.MeshBasicMaterial;
+    paintStyle: PaintOverlayStyle;
+    surfaceDetail: { value: number };
+    setLightingVisible: (visible: boolean) => void;
     radius: number;
   } | null>(null);
 
-  function applyShadow(mesh: THREE.Mesh, batchIndex: number, faceIds: Uint32Array) {
-    const material = sceneRefs.current?.shadowMaterial;
+  function applyShadow(mesh: THREE.Mesh, batchIndex: number, faceIds: Uint32Array,
+    companion?: PartAddress, showCompanionPaint = true) {
+    const refs = sceneRefs.current;
     const paint = shadowPaintRef.current;
-    if (material && paint) {
+    if (refs && paint) {
+      const address = companion ?? paint.address ?? ANCHOR_ADDRESS;
+      const coverage = companion ? (showCompanionPaint ? paint.companionCoverage : undefined) : paint.coverage;
       setShadowOverlay(mesh, faceIds, {
-        material,
-        hits: paint.coverage.get(batchIndex + (paint.address ?? ANCHOR_ADDRESS).batchOffset),
-        faceOffset: (paint.address ?? ANCHOR_ADDRESS).faceOffset,
-        colors: paint.colors,
+        material: refs.shadowMaterial,
+        style: refs.paintStyle,
+        hits: coverage?.get(batchIndex + address.batchOffset),
+        baseHits: paint.baseCoverage?.get(batchIndex + address.batchOffset),
+        scores: paint.lightPreview?.scores,
+        faceOffset: address.faceOffset,
       });
     }
   }
@@ -363,17 +464,23 @@ export function Viewport3D({
     for (const [index, entry] of detailCacheRef.current) {
       applyShadow(entry.mesh, index, entry.faceIds);
     }
-  }, [shadowPaint?.coverage, shadowPaint?.colors, shadowPaint?.address]);
+  }, [shadowPaint?.coverage, shadowPaint?.baseCoverage, shadowPaint?.address, previewScores]);
+
+  useEffect(() => {
+    if (shadowPaint?.colors) sceneRefs.current?.paintStyle.setColors(shadowPaint.colors);
+  }, [shadowPaint?.colors]);
+
+  useEffect(() => {
+    sceneRefs.current?.paintStyle.setPreview(shadowPaint?.lightPreview);
+  }, [shadowPaint?.lightPreview]);
 
   const updateSettledLayerVisibility = (
     refs: NonNullable<typeof sceneRefs.current>,
     targetModel: ModelSummary,
   ) => {
-    const allBatchesLoaded =
-      targetModel.batches.length > 0 &&
-      detailCacheRef.current.size >= targetModel.batches.length;
     refs.previewGroup.visible =
-      !allBatchesLoaded && refs.previewGroup.children.length > 0;
+      refs.previewGroup.children.length > 0 &&
+      visiblePartBatches(refs.camera, refs.surfaceGroup, targetModel).some(({ batchIndex }) => !detailCacheRef.current.has(batchIndex));
     refs.detailGroup.visible = refs.detailGroup.children.length > 0;
   };
 
@@ -389,6 +496,11 @@ export function Viewport3D({
     const batchByIndex = new Map(targetModel.batches.map((b) => [b.batchIndex, b]));
     const cache = detailCacheRef.current;
     const desiredSet = new Set(desiredIndices);
+    const paint = shadowPaintRef.current;
+    const batchOffset = paint?.address?.batchOffset ?? 0;
+    const protectedBatches = new Set(visiblePartBatches(refs.camera, refs.surfaceGroup, targetModel)
+      .filter(({ batchIndex }) => paint?.coverage.get(batchIndex + batchOffset)?.size)
+      .map(({ batchIndex }) => batchIndex));
 
     for (const idx of desiredIndices) {
       const existing = cache.get(idx);
@@ -421,7 +533,7 @@ export function Viewport3D({
           let victimKey: number | null = null;
           let oldestTick = Infinity;
           for (const [k, entry] of cache.entries()) {
-            if (desiredSet.has(k)) continue;
+            if (protectedBatches.has(k) || desiredSet.has(k)) continue;
             if (entry.lastUsed < oldestTick) {
               oldestTick = entry.lastUsed;
               victimKey = k;
@@ -429,6 +541,7 @@ export function Viewport3D({
           }
           if (victimKey === null) {
             for (const [k, entry] of cache.entries()) {
+              if (protectedBatches.has(k)) continue;
               if (entry.lastUsed < oldestTick) {
                 oldestTick = entry.lastUsed;
                 victimKey = k;
@@ -442,6 +555,8 @@ export function Viewport3D({
           detailTrianglesRef.current = Math.max(0, detailTrianglesRef.current - victim.triangleCount);
           cache.delete(victimKey);
         }
+        if (!protectedBatches.has(idx) && (cache.size >= MAX_DETAIL_BATCHES ||
+            (detailTrianglesRef.current + bin.triangleCount > MAX_DETAIL_TRIANGLES && cache.size > 0))) continue;
 
         const geo = new THREE.BufferGeometry();
         geo.setAttribute('position', new THREE.BufferAttribute(bin.positions, 3));
@@ -466,18 +581,32 @@ export function Viewport3D({
     const refs = sceneRefs.current;
     if (!refs) return;
     const gen = ++streamGenerationRef.current;
+    refs.camera.updateMatrixWorld(true);
     refs.modelGroup.updateMatrixWorld(true);
     const invMat = new THREE.Matrix4().copy(refs.surfaceGroup.matrixWorld).invert();
     const camLocal = refs.camera.position.clone().applyMatrix4(invMat);
     const tgtLocal = refs.controls.target.clone().applyMatrix4(invMat);
 
-    const desired = selectCameraVisibleBatchIndices(
-      targetModel.batches,
+    const visible = visiblePartBatches(refs.camera, refs.surfaceGroup, targetModel);
+    const paint = shadowPaintRef.current;
+    const batchOffset = paint?.address?.batchOffset ?? 0;
+    const painted = visible.filter(({ batchIndex }) => paint?.coverage.get(batchIndex + batchOffset)?.size);
+    const desired = new Set(painted.map(({ batchIndex }) => batchIndex));
+    let triangles = painted.reduce((sum, batch) => sum + batch.triangleCount, 0);
+    const byIndex = new Map(visible.map((batch) => [batch.batchIndex, batch]));
+    for (const index of selectCameraVisibleBatchIndices(
+      visible,
       [camLocal.x, camLocal.y, camLocal.z],
       [tgtLocal.x, tgtLocal.y, tgtLocal.z],
       MAX_DETAIL_BATCHES,
-    );
-    await ensureDetailBatchesLoaded(targetModel, desired, gen);
+    )) {
+      if (desired.has(index)) continue;
+      const batch = byIndex.get(index)!;
+      if (desired.size >= MAX_DETAIL_BATCHES || triangles + batch.triangleCount > MAX_DETAIL_TRIANGLES) continue;
+      triangles += batch.triangleCount;
+      desired.add(index);
+    }
+    await ensureDetailBatchesLoaded(targetModel, [...desired], gen);
     if (streamGenerationRef.current === gen && refs.detailGroup.children.length > 0) {
       updateSettledLayerVisibility(refs, targetModel);
     }
@@ -489,14 +618,14 @@ export function Viewport3D({
 
     let renderer: THREE.WebGLRenderer;
     try {
-      renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+      renderer = new THREE.WebGLRenderer({ antialias: true, stencil: true, powerPreference: 'high-performance' });
     } catch {
       return;
     }
 
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setSize(container.clientWidth || 800, container.clientHeight || 600);
-    renderer.setClearColor(0x0b160c, 1);
+    renderer.setClearColor(0x101611, 1);
     container.appendChild(renderer.domElement);
 
     const scene = new THREE.Scene();
@@ -515,17 +644,16 @@ export function Viewport3D({
     controls.enableZoom = true;
 
     const hemi = new THREE.HemisphereLight(0xf3f7f0, 0x1a281b, 0.85);
-    scene.add(hemi);
 
     const keyLight = new THREE.DirectionalLight(0xffffff, 1.15);
     keyLight.position.set(2.5, 4, 3);
-    scene.add(keyLight);
 
     const rimLight = new THREE.DirectionalLight(0xc6f19d, 0.45);
     rimLight.position.set(-3, 2, -2.5);
-    scene.add(rimLight);
+    scene.add(hemi, keyLight, rimLight);
+    const sceneLights = [hemi, keyLight, rimLight].map((light) => ({ light, intensity: light.intensity }));
 
-    const grid = new THREE.GridHelper(4, 16, 0x2f4d31, 0x1b311d);
+    const grid = new THREE.GridHelper(4, 16, 0x39463c, 0x26322a);
     scene.add(grid);
 
     const material = new THREE.MeshStandardMaterial({
@@ -535,7 +663,6 @@ export function Viewport3D({
     });
 
     const shadowMaterial = new THREE.MeshBasicMaterial({
-      vertexColors: true,
       side: THREE.DoubleSide,
       toneMapped: false,
       polygonOffset: true,
@@ -544,9 +671,15 @@ export function Viewport3D({
     });
 
     const previewMaterial = material.clone();
+    markExactSurface(material, 1);
+    maskPreviewSurface(previewMaterial, 1);
     const brushPreview = new SurfaceBrushPreview();
     brushPreview.attach(material);
     brushPreview.attach(shadowMaterial);
+    const paintStyle = new PaintOverlayStyle();
+    paintStyle.attach(shadowMaterial);
+    if (shadowPaintRef.current?.colors) paintStyle.setColors(shadowPaintRef.current.colors);
+    paintStyle.setPreview(shadowPaintRef.current?.lightPreview);
 
     const modelGroup = new THREE.Group();
     const surfaceGroup = new THREE.Group();
@@ -555,8 +688,13 @@ export function Viewport3D({
     surfaceGroup.add(previewGroup, detailGroup);
     modelGroup.add(surfaceGroup);
     const companionMaterial = new THREE.MeshStandardMaterial({ color: '#aaaeb2', roughness: 0.84, side: THREE.DoubleSide });
+    markExactSurface(companionMaterial, 0);
     const stagedMaterial = new THREE.MeshStandardMaterial({ color: '#83b4a5', roughness: 0.8,
       opacity: 0.38, transparent: true, depthWrite: false, side: THREE.FrontSide });
+    const surfaceDetail = { value: 0 };
+    for (const surface of [material, previewMaterial, companionMaterial, stagedMaterial, shadowMaterial]) {
+      attachSurfaceDetail(surface, surfaceDetail);
+    }
     const lightHandle = new THREE.Mesh(new THREE.SphereGeometry(1, 24, 16),
       new THREE.MeshPhongMaterial({ color: '#ffba52', specular: '#ffeab7', shininess: 30,
         transparent: true, depthTest: false, depthWrite: false }));
@@ -578,7 +716,7 @@ export function Viewport3D({
     lightTarget.title = 'Drag or use arrow keys to aim the light';
     lightTarget.hidden = true;
     container.appendChild(lightTarget);
-    const companions = new Map<string, THREE.Group>();
+    const companions = new Map<string, CompanionLayer>();
     const marker = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 8),
       new THREE.MeshBasicMaterial({ color: '#ffd17a', depthTest: false, depthWrite: false }));
     marker.visible = false;
@@ -595,9 +733,11 @@ export function Viewport3D({
         onCameraMoved: () => {
           ++streamGenerationRef.current;
           ++viewGenRef.current;
+          setCompanionView({ moving: true });
           onViewChangeRef.current?.();
         },
         onCameraSettled: () => {
+          setCompanionView({ moving: false });
           const m = activeModelRef.current;
           if (m) {
             void streamForCurrentCamera(m);
@@ -612,6 +752,7 @@ export function Viewport3D({
       controls,
       orbitLifecycle,
       renderer,
+      grid,
       modelGroup,
       surfaceGroup,
       companionMaterial,
@@ -623,6 +764,21 @@ export function Viewport3D({
       material,
       previewMaterial,
       shadowMaterial,
+      paintStyle,
+      surfaceDetail,
+      setLightingVisible(visible) {
+        surfaceDetail.value = visible ? 0 : 1;
+        for (const { light, intensity } of sceneLights) light.intensity = visible ? intensity : 0;
+        const materials = [material, previewMaterial, companionMaterial, stagedMaterial];
+        for (const layer of companions.values()) {
+          if (layer.maskedMaterials) materials.push(layer.maskedMaterials.detail, layer.maskedMaterials.preview);
+        }
+        // Keep the base colors available for the view-space detail shader.
+        for (const surface of materials) {
+          if (visible) surface.emissive.setHex(0);
+          else surface.emissive.copy(surface.color);
+        }
+      },
       radius: 1,
     };
 
@@ -654,7 +810,11 @@ export function Viewport3D({
       const ray = pickRay(e.clientX, e.clientY);
       if (!ray) return;
       const { currentModel, orig, dir, rayBatches } = ray;
-
+      const token = { modelId: currentModel.modelId, modelGen: modelGenRef.current, viewGen: viewGenRef.current };
+      if (fillPickRef.current) {
+        onPickRef.current(orig, dir, rayBatches, token);
+        return;
+      }
 
       const resolution = resolveClickAgainstVisibleDetail(
         detailGroup.visible,
@@ -684,11 +844,7 @@ export function Viewport3D({
       }
 
       // Frame remains unchanged; capture visible batch IDs and generations synchronously before async pick
-      onPickRef.current(orig, dir, resolution.visibleBatchIds, {
-        modelId: currentModel.modelId,
-        modelGen: modelGenRef.current,
-        viewGen: viewGenRef.current,
-      });
+      onPickRef.current(orig, dir, resolution.visibleBatchIds, token);
     };
 
     let downX = 0;
@@ -824,8 +980,8 @@ export function Viewport3D({
         index, mesh: entry.mesh, faceIds: entry.faceIds,
       }));
       const preview = previewGroup.visible ? [...previewGroup.children] : [];
-      for (const layer of companions.values()) {
-        if (layer.visible && !layer.userData.ghost) preview.push(...layer.children);
+      for (const { group, ghost } of companions.values()) {
+        if (group.visible && !ghost) preview.push(...group.children.filter((mesh) => mesh.visible));
       }
       if (!brush.capture(renderer, camera, canvas.getBoundingClientRect(), preview, details)) {
         endStroke(false);
@@ -940,17 +1096,20 @@ export function Viewport3D({
     const resizeObserver = new ResizeObserver(() => {
       if (strokePointer !== null) endStroke(false);
       endLightDrag();
-      const w = container.clientWidth || 800;
-      const h = container.clientHeight || 600;
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      if (!w || !h) return;
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
+      setCompanionView((view) => ({ moving: view.moving }));
     });
     resizeObserver.observe(container);
 
     let rafId = 0;
     const animate = () => {
       rafId = window.requestAnimationFrame(animate);
+      if (!activeRef.current) return;
       const placement = lightPlacementRef.current;
       if (!placement?.active) endLightDrag();
       if (!lightDrag) controls.update();
@@ -1019,7 +1178,7 @@ export function Viewport3D({
       disposeGroupMeshes(detailGroup);
       detailCacheRef.current.clear();
       detailTrianglesRef.current = 0;
-      for (const layer of companions.values()) disposeGroupMeshes(layer);
+      for (const layer of companions.values()) disposeCompanion(layer);
       companions.clear();
       lightHandle.geometry.dispose();
       lightHandle.material.dispose();
@@ -1027,11 +1186,13 @@ export function Viewport3D({
       lightLineMaterial.dispose();
       marker.geometry.dispose();
       marker.material.dispose();
+      grid.dispose();
       companionMaterial.dispose();
       stagedMaterial.dispose();
       material.dispose();
       previewMaterial.dispose();
       shadowMaterial.dispose();
+      paintStyle.dispose();
       controls.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode === container) {
@@ -1040,6 +1201,10 @@ export function Viewport3D({
       sceneRefs.current = null;
     };
   }, [disableWebGL]);
+
+  useEffect(() => {
+    sceneRefs.current?.setLightingVisible(showLighting);
+  }, [showLighting, disableWebGL]);
 
   // Stage pendingModel batches in isolation; keep old geometry intact until atomic
   // native commit returns committed:true.
@@ -1112,7 +1277,9 @@ export function Viewport3D({
           detailTrianglesRef.current = 0;
 
           for (const geo of stagedPreviewGeos) {
-            refs.previewGroup.add(new THREE.Mesh(geo, refs.previewMaterial));
+            const preview = new THREE.Mesh(geo, refs.previewMaterial);
+            preview.renderOrder = 2;
+            refs.previewGroup.add(preview);
           }
           for (const entry of stagedDetailEntries) {
             const mesh = new THREE.Mesh(entry.geo, refs.material);
@@ -1155,49 +1322,167 @@ export function Viewport3D({
     const wanted = new Set(companionParts?.map((part) => part.model.modelId));
     for (const [id, layer] of refs.companions) {
       if (wanted.has(id)) continue;
-      refs.modelGroup.remove(layer);
-      disposeGroupMeshes(layer);
+      refs.modelGroup.remove(layer.group);
+      disposeCompanion(layer);
       refs.companions.delete(id);
     }
 
-    let canceled = false;
-    async function loadCompanions() {
-      if (!refs || !api) return;
-      for (const part of companionParts ?? []) {
-        const id = part.model.modelId;
-        let layer = refs.companions.get(id);
-        if (!layer) {
-          layer = new THREE.Group();
-          refs.companions.set(id, layer);
-          refs.modelGroup.add(layer);
+    refs.camera.updateMatrixWorld(true);
+    const moving = companionView.moving;
+    const coverage = shadowPaintRef.current?.companionCoverage;
+    let stencilId = 1;
+    const layers = (companionParts ?? []).map((part) => {
+      const id = part.model.modelId;
+      let layer = refs.companions.get(id);
+      if (!layer) {
+        layer = { group: new THREE.Group(), ghost: false, preview: null, batches: new Map() };
+        refs.companions.set(id, layer);
+        refs.modelGroup.add(layer.group);
+      }
+      const { group } = layer;
+      group.visible = !part.hidden && (id !== model?.modelId || id === ghostModelId);
+      group.position.fromArray(part.pose.translation);
+      group.quaternion.fromArray(part.pose.rotation);
+      group.updateWorldMatrix(true, false);
+      layer.ghost = part.staged || id === ghostModelId;
+      // Each dense part masks only its own simplified triangles. Other parts
+      // still occlude it normally through the depth buffer.
+      const mask = part.model.previewFilePath ? ++stencilId : 0;
+      const useMask = !layer.ghost && mask > 0 && mask <= 255;
+      if (useMask) {
+        if (!layer.maskedMaterials) {
+          const detail = refs.companionMaterial.clone();
+          const preview = refs.companionMaterial.clone();
+          attachSurfaceDetail(detail, refs.surfaceDetail);
+          attachSurfaceDetail(preview, refs.surfaceDetail);
+          layer.maskedMaterials = { detail, preview };
         }
-        layer.visible = !part.hidden && (id !== model?.modelId || id === ghostModelId);
-        layer.position.fromArray(part.pose.translation);
-        layer.quaternion.fromArray(part.pose.rotation);
-        layer.userData.ghost = part.staged || id === ghostModelId;
-        const material = layer.userData.ghost ? refs.stagedMaterial : refs.companionMaterial;
-        for (const child of layer.children) (child as THREE.Mesh).material = material;
-        if (!layer.visible || layer.userData.complete) continue;
-        const files = part.model.previewFilePath ? [part.model.previewFilePath] : part.model.batches.map((batch) => batch.filePath);
+        markExactSurface(layer.maskedMaterials.detail, mask);
+        maskPreviewSurface(layer.maskedMaterials.preview, mask);
+      }
+      const material = layer.ghost ? refs.stagedMaterial : useMask ? layer.maskedMaterials!.detail : refs.companionMaterial;
+      const previewMaterial = useMask ? layer.maskedMaterials!.preview : material;
+      const visible = group.visible ? visiblePartBatches(refs.camera, group, part.model) : [];
+      const desired = new Set<number>();
+      const hasPaint = (index: number) => Boolean(coverage?.get(index + part.batchOffset)?.size);
+      return { part, layer, visible, desired, material, previewMaterial, hasPaint };
+    });
+
+    // Small parts have no simplified fallback. Budget the original detail streamed
+    // for dense parts across the assembly, rather than giving each part its own cache limit.
+    const candidates = layers.flatMap((entry) => {
+      const { layer, part, visible, desired } = entry;
+      if (!part.model.previewFilePath) {
+        for (const { batchIndex } of visible) desired.add(batchIndex);
+        return [];
+      }
+      if (moving || layer.ghost) return [];
+      const target = layer.group.worldToLocal(refs.controls.target.clone());
+      const eye = layer.group.worldToLocal(refs.camera.position.clone());
+      return visible.map((batch) => ({
+        entry, batch,
+        painted: entry.hasPaint(batch.batchIndex),
+        distance: distanceSqToBounds(target, batch.bounds) + 0.25 * distanceSqToBounds(eye, batch.bounds),
+      }));
+    }).sort((a, b) => Number(b.painted) - Number(a.painted) || a.distance - b.distance);
+    let triangles = 0;
+    let count = 0;
+    for (const { entry, batch, painted } of candidates) {
+      if (!painted && (count >= MAX_DETAIL_BATCHES || triangles + batch.triangleCount > MAX_COMPANION_DETAIL_TRIANGLES)) continue;
+      triangles += batch.triangleCount;
+      count++;
+      entry.desired.add(batch.batchIndex);
+    }
+
+    let canceled = false;
+    const previews: (() => Promise<void>)[] = [];
+    const paintedDetails: (() => Promise<void>)[] = [];
+    const details: (() => Promise<void>)[] = [];
+    for (const { part, layer, visible, desired, material, previewMaterial, hasPaint } of layers) {
+      const { group, batches } = layer;
+      const previewPath = part.model.previewFilePath;
+      const refreshPreview = () => {
+        if (layer.preview) layer.preview.visible = moving || visible.some(({ batchIndex }) => !batches.has(batchIndex));
+      };
+      for (const [index, { mesh, faceIds }] of batches) {
+        if (moving || desired.has(index)) {
+          mesh.material = material;
+          mesh.visible = !moving || !layer.preview || hasPaint(index);
+          applyShadow(mesh, index, faceIds, part, !layer.ghost);
+        } else {
+          group.remove(mesh);
+          disposeDetailMesh(mesh);
+          batches.delete(index);
+        }
+      }
+      if (layer.preview && !moving && visible.length === 0) {
+        group.remove(layer.preview);
+        disposeDetailMesh(layer.preview);
+        layer.preview = null;
+      }
+      if (layer.preview) {
+        layer.preview.material = previewMaterial;
+        refreshPreview();
+      }
+
+      async function loadMesh(filePath: string) {
+        if (!api || canceled) return;
         try {
-          for (let i = layer.children.length; i < files.length; i++) {
-            const bin = await api.readBatch(files[i]);
-            if (canceled) return;
-            const geometry = new THREE.BufferGeometry();
-            geometry.setAttribute('position', new THREE.BufferAttribute(bin.positions, 3));
-            geometry.setAttribute('normal', new THREE.BufferAttribute(bin.normals, 3));
-            layer.add(new THREE.Mesh(geometry, material));
-          }
-          layer.userData.complete = true;
+          const bin = await api.readBatch(filePath);
+          if (canceled) return;
+          const geometry = new THREE.BufferGeometry();
+          geometry.setAttribute('position', new THREE.BufferAttribute(bin.positions, 3));
+          geometry.setAttribute('normal', new THREE.BufferAttribute(bin.normals, 3));
+          return { mesh: new THREE.Mesh(geometry, material), faceIds: bin.faceIds };
         } catch (error) {
           if (!canceled) onPickNeedsDetailRef.current?.(error instanceof Error ? error.message : 'Could not display a kit part.');
         }
       }
+      if (previewPath && visible.length && !layer.preview) {
+        previews.push(async () => {
+          const preview = await loadMesh(previewPath);
+          if (!preview) return;
+          layer.preview = preview.mesh;
+          preview.mesh.material = previewMaterial;
+          preview.mesh.renderOrder = 2;
+          group.add(preview.mesh);
+          if (moving) {
+            for (const [index, { mesh }] of batches) mesh.visible = hasPaint(index);
+          }
+          refreshPreview();
+        });
+      }
+      for (const { batchIndex, filePath } of visible) {
+        if (!desired.has(batchIndex) || batches.has(batchIndex)) continue;
+        (hasPaint(batchIndex) ? paintedDetails : details).push(async () => {
+          const entry = await loadMesh(filePath);
+          if (!entry) return;
+          applyShadow(entry.mesh, batchIndex, entry.faceIds, part, !layer.ghost);
+          group.add(entry.mesh);
+          batches.set(batchIndex, entry);
+          refreshPreview();
+        });
+      }
     }
-    void loadCompanions();
+    async function stream(queue: (() => Promise<void>)[]) {
+      for (let offset = 0; offset < queue.length && !canceled; offset += DETAIL_STREAM_CONCURRENCY) {
+        await Promise.all(queue.slice(offset, offset + DETAIL_STREAM_CONCURRENCY).map((load) => load()));
+      }
+    }
+    void stream(previews).then(() => stream(paintedDetails)).then(() => stream(details));
     return () => { canceled = true; };
-  }, [api, model?.modelId, companionParts, ghostModelId]);
+  }, [api, model?.modelId, companionParts, ghostModelId, companionView, disableWebGL, paintedCompanionBatches]);
 
+  useEffect(() => {
+    const refs = sceneRefs.current;
+    for (const part of companionParts ?? []) {
+      const layer = refs?.companions.get(part.model.modelId);
+      if (!layer) continue;
+      for (const [index, { mesh, faceIds }] of layer.batches) {
+        applyShadow(mesh, index, faceIds, part, !layer.ghost);
+      }
+    }
+  }, [companionParts, shadowPaint?.companionCoverage, shadowPaint?.baseCoverage, previewScores]);
   useEffect(() => {
     const refs = sceneRefs.current;
     if (!refs) return;
@@ -1237,6 +1522,8 @@ export function Viewport3D({
     const rotatedCenter = center.clone().applyQuaternion(q);
     refs.modelGroup.position.set(-rotatedCenter.x, -rotatedCenter.y + radius * 0.5, -rotatedCenter.z);
     refs.modelGroup.updateMatrixWorld(true);
+    const floor = new THREE.Box3(min, max).applyMatrix4(refs.modelGroup.matrixWorld).min.y;
+    refs.grid.position.y = floor - radius * 0.012;
 
     refs.controls.target.set(0, radius * 0.5, 0);
     refs.camera.position.set(radius * 1.4, radius * 1.1, radius * 2.2);
@@ -1245,6 +1532,7 @@ export function Viewport3D({
     refs.camera.updateProjectionMatrix();
     refs.controls.update();
     refs.orbitLifecycle.syncRestSnapshot();
+    setCompanionView({ moving: false });
 
   }, [frameBounds, orientation]);
 
@@ -1299,6 +1587,7 @@ export function Viewport3D({
     refs.controls.update();
     refs.camera.updateMatrixWorld(true);
     refs.orbitLifecycle.syncRestSnapshot();
+    setCompanionView({ moving: false });
     if (model) {
       void streamForCurrentCamera(model);
     }

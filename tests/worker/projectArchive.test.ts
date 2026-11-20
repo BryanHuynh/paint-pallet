@@ -7,6 +7,9 @@ import { WorkerClient, readBatchBinary } from '../../src/main/workerClient';
 import { IDENTITY_PART_POSE } from '../../src/shared/kit';
 import type { ProjectContents } from '../../src/shared/paintProject';
 import { writeBinaryStl } from '../fixtures/stlFixture';
+import { createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import { ZipFile } from 'yazl';
 
 const swatch = (hex: string) => ({ hex, brand: 'Studio', bottleName: '', mixNotes: 'Thin with water' });
 const fixture: ProjectContents = {
@@ -21,18 +24,16 @@ const fixture: ProjectContents = {
       { id: 'ref-2', name: 'Red.svg', mimeType: 'image/svg+xml' },
     ],
     activeReferenceId: 'ref-2',
-    regions: [{ id: 'region-1', name: 'Coat', recipeId: 'recipe-1' }],
-    activeRegionId: 'region-1',
-    snapshots: [{ id: 'snapshot-1', name: 'Studio light', azimuth: 40, elevation: 30,
-      midtone: 35, highlight: 75, applied: true, manual: true }],
-    activeSnapshotId: 'snapshot-1',
-    guideCallouts: [{ regionId: 'region-1', view: 'Front', x: 0.32, y: 0.79 }],
+    lighting: { sources: [{ id: 'snapshot-1', name: 'Studio light', azimuth: 40, elevation: 30, intensity: 100 }],
+      activeSourceId: 'snapshot-1', midtone: 35, highlight: 75, castShadowsBetweenParts: true,
+      applied: true, manual: true },
+    guideCallouts: [{ recipeId: 'recipe-1', view: 'Front', x: 0.32, y: 0.79 }],
   },
   referenceBytes: ['#325487', '#b11023'].map((fill) => new TextEncoder().encode(
     '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1" fill="' + fill + '"/></svg>',
   )),
   paint: Uint32Array.of(0, 0, 0, 0),
-  tones: [Uint32Array.of(0, 0, 0, 2)],
+  toneMask: Uint32Array.of(0, 0, 0, 2),
 };
 
 describe('portable paint projects', () => {
@@ -73,7 +74,7 @@ describe('portable paint projects', () => {
       expect(reopened.contents.state).toMatchObject(fixture.state);
       expect(reopened.contents.referenceBytes).toEqual(fixture.referenceBytes);
       expect(reopened.contents.paint).toEqual(fixture.paint);
-      expect(reopened.contents.tones).toEqual(fixture.tones);
+      expect(reopened.contents.toneMask).toEqual(fixture.toneMask);
       const model = await worker.importStl(reopened.originalPath, 'project-import');
       const batch = await readBatchBinary(model.batches[0].filePath);
       const [faceId, , triangleIndex] = reopened.contents.paint;
@@ -124,5 +125,51 @@ describe('portable paint projects', () => {
     const cache = path.join(root, 'cache');
     await expect(openProjectArchive(destination, cache)).rejects.toThrow();
     expect(await fs.readdir(cache)).toEqual([]);
+  });
+
+  it('migrates legacy directions to light sources and keeps the active lighting and edge masks', async () => {
+    const { lighting: _lighting, references: _references, activeReferenceId: _activeReferenceId, ...base } = fixture.state;
+    const original = path.join(root, 'anchor.stl');
+    writeBinaryStl(original, [{ v1: [0, 0, 0], v2: [1, 0, 0], v3: [0, 1, 0] }]);
+    const archive = path.join(root, 'legacy.paintproject');
+    const zip = new ZipFile();
+    zip.addBuffer(Buffer.from(JSON.stringify({
+      ...base, version: 1,
+      regions: [{ id: 'region-2', name: 'Coat back', recipeId: 'recipe-1' },
+        { id: 'region-1', name: 'Coat front', recipeId: 'recipe-1' }],
+      activeRegionId: 'region-1',
+      guideCallouts: [{ regionId: 'region-1', view: 'Front', x: 0.32, y: 0.79 }],
+ sourceName: 'anchor.stl', sourceExtension: '.stl', references: [], activeReferenceId: null,
+      snapshots: [
+        { id: 'first', name: 'Snapshot 1', azimuth: 35, elevation: 50, midtone: 35, highlight: 75, applied: false, manual: false },
+        { id: 'second', name: 'Snapshot 2', azimuth: 70, elevation: 30, midtone: 20, highlight: 65,
+          applied: true, manual: true, edgeManualRegions: ['region-1'] },
+      ],
+      activeSnapshotId: 'second',
+    })), 'manifest.json');
+    zip.addFile(original, 'model.stl');
+    zip.addBuffer(Buffer.from(Uint32Array.of(0, 0, 0, 1).buffer), 'paint.bin');
+    zip.addBuffer(Buffer.alloc(0), 'tone/0');
+    zip.addBuffer(Buffer.from(Uint32Array.of(0, 0, 1, 2, 0, 0, 0, 1).buffer), 'tone/1');
+    zip.addBuffer(Buffer.alloc(0), 'edge/0');
+    zip.addBuffer(Buffer.from(Uint32Array.of(0, 0, 0, 1).buffer), 'edge/1');
+    zip.end();
+    await pipeline(zip.outputStream, createWriteStream(archive));
+    const { contents, cleanup } = await openProjectArchive(archive, path.join(root, 'cache'));
+    try {
+      expect(contents.state.lighting).toMatchObject({ sources: [
+        { name: 'Light 1', azimuth: 35, intensity: 0 }, { name: 'Light 2', azimuth: 70, intensity: 100 },
+      ], activeSourceId: 'light-2', midtone: 20, highlight: 65, manual: true });
+      expect(contents.state).not.toHaveProperty('snapshots');
+      expect(contents.state).not.toHaveProperty('regions');
+      expect(contents.state.activeRecipeId).toBe('recipe-1');
+      expect(contents.state.guideCallouts).toEqual(fixture.state.guideCallouts);
+      expect(contents.state.edgeManualRecipes).toEqual(['recipe-1']);
+      expect(contents.paint).toEqual(fixture.paint);
+      expect(contents.toneMask).toEqual(fixture.toneMask);
+      expect(contents.edgeMask).toEqual(fixture.paint);
+    } finally {
+      await cleanup();
+    }
   });
 });

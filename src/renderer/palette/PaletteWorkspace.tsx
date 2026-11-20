@@ -72,11 +72,19 @@ function loadReferenceFile(file: File, id: string): Promise<ReferenceImage> {
 export default function PaletteWorkspace({
   recipes: sharedRecipes,
   setRecipes: setSharedRecipes,
+  activeRecipeId: sharedActiveRecipeId,
+  setActiveRecipeId: setSharedActiveRecipeId,
+  usedRecipeIds,
   projectRef,
+  onProjectChange,
 }: {
   recipes?: PaintRecipe[];
   setRecipes?: React.Dispatch<React.SetStateAction<PaintRecipe[]>>;
+  activeRecipeId?: string | null;
+  setActiveRecipeId?: (id: string | null) => void;
+  usedRecipeIds?: ReadonlySet<string>;
   projectRef?: React.Ref<PaletteProjectHandle>;
+  onProjectChange?: () => void;
 } = {}): React.ReactElement {
   const importInputId = useId();
   const recipeNameInputId = useId();
@@ -87,7 +95,6 @@ export default function PaletteWorkspace({
   const smartOverlayRef = useRef<HTMLCanvasElement | null>(null);
   const smartImageRef = useRef<ImageData | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const visionKeyRef = useRef<HTMLInputElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const magnifierCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -115,7 +122,9 @@ export default function PaletteWorkspace({
   const recipes = sharedRecipes ?? localRecipes;
   const setRecipes = setSharedRecipes ?? setLocalRecipes;
 
-  const [activeRecipeId, setActiveRecipeId] = useState<string | null>('recipe-1');
+  const [localActiveRecipeId, setLocalActiveRecipeId] = useState<string | null>('recipe-1');
+  const activeRecipeId = sharedActiveRecipeId === undefined ? localActiveRecipeId : sharedActiveRecipeId;
+  const setActiveRecipeId = setSharedActiveRecipeId ?? setLocalActiveRecipeId;
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [activeTone, setActiveTone] = useState<ToneSlot | 'edge'>('shadow');
   const [toolMode, setToolMode] = useState<'eyedropper' | 'select' | 'smart'>('eyedropper');
@@ -208,7 +217,7 @@ export default function PaletteWorkspace({
         },
       };
     },
-  }), [references, activeReference, activeRecipeId, fit]);
+  }), [references, activeReference, activeRecipeId, setActiveRecipeId, fit]);
   const hasSelection = Boolean(selection || smartSelection);
   const zoomReadout = zoom === null ? 'Fit' : `${Math.round(zoom * 100)}%`;
 
@@ -354,6 +363,7 @@ export default function PaletteWorkspace({
         urlsToRevokeRef.current.push(item.url);
       }
       setReferences((prev) => [...prev, ...loaded]);
+      onProjectChange?.();
       setActiveRefId((prev) => prev ?? loaded[0].id);
     }
 
@@ -449,13 +459,7 @@ export default function PaletteWorkspace({
 
   async function handleGenerateVisionRecipes(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const keyInput = visionKeyRef.current;
-    if (!generateVisionRecipes || !visionSelection?.length || !keyInput || isGeneratingVision) return;
-    const apiKey = keyInput.value.trim();
-    if (!apiKey) {
-      setRecipeGenerationMessage('Enter an OpenAI API key.');
-      return;
-    }
+    if (!generateVisionRecipes || !visionSelection?.length || isGeneratingVision) return;
     const revision = projectRevision.current;
     const currentProject = () => isMountedRef.current && revision === projectRevision.current;
     const selected = references.filter((reference) => visionSelection.includes(reference.id));
@@ -476,11 +480,10 @@ export default function PaletteWorkspace({
       return;
     }
 
-    keyInput.value = '';
     setIsGeneratingVision(true);
-    setRecipeGenerationMessage('OpenAI is analyzing the selected references…');
+    setRecipeGenerationMessage('Codex is analyzing the selected references…');
     try {
-      const result = await generateVisionRecipes({ apiKey, images });
+      const result = await generateVisionRecipes({ images });
       if (!currentProject()) return;
       if (!result.ok) {
         setRecipeGenerationMessage(result.message);
@@ -510,11 +513,13 @@ export default function PaletteWorkspace({
     setConfirmDeleteId(null);
   }
 
+  const recipeInUse = Boolean(activeRecipe && usedRecipeIds?.has(activeRecipe.id));
+
   function handleRequestDeleteRecipe() {
     if (!activeRecipe) {
       return;
     }
-    setConfirmDeleteId(activeRecipe.id);
+    if (!recipeInUse) setConfirmDeleteId(activeRecipe.id);
   }
 
   function handleCancelDeleteRecipe() {
@@ -522,7 +527,7 @@ export default function PaletteWorkspace({
   }
 
   function handleConfirmDeleteRecipe() {
-    if (!confirmDeleteId) {
+    if (!confirmDeleteId || usedRecipeIds?.has(confirmDeleteId)) {
       return;
     }
     const deletedIndex = recipes.findIndex((recipe) => recipe.id === confirmDeleteId);
@@ -1287,7 +1292,7 @@ export default function PaletteWorkspace({
           )}
         </section>
 
-        <section className={styles.panel} aria-label="Recipe editor">
+        <section className={styles.panel} aria-label="Recipe editor" data-tutorial-target="recipe">
           <div className={styles.panelHeader}>
             <h2 className={styles.panelTitle}>Recipes</h2>
             <div className={styles.recipeActions}>
@@ -1320,7 +1325,8 @@ export default function PaletteWorkspace({
               <button
                 type="button"
                 className={`${styles.btn} ${styles.btnDanger}`}
-                disabled={!activeRecipe}
+                disabled={!activeRecipe || recipeInUse}
+                title={recipeInUse ? 'This recipe is used by painted faces or paint history.' : undefined}
                 onClick={handleRequestDeleteRecipe}
               >
                 Delete recipe
@@ -1336,8 +1342,7 @@ export default function PaletteWorkspace({
               onSubmit={handleGenerateVisionRecipes}
             >
               <p id={visionDisclosureId} className={styles.subtitle}>
-                Sends the selected reference images to OpenAI for analysis. OpenAI API charges and data policies apply.
-                Paint Pallet clears the API key after each submission.
+                Uses your Codex CLI sign-in to send the selected references to Codex for analysis.
               </p>
               <fieldset className={styles.visionReferences} disabled={isGeneratingVision}>
                 <legend>Select up to {MAX_VISION_REFERENCES} reference images</legend>
@@ -1360,24 +1365,12 @@ export default function PaletteWorkspace({
                   );
                 })}
               </fieldset>
-              <label className={styles.field}>
-                <span className={styles.label}>OpenAI API key</span>
-                <input
-                  ref={visionKeyRef}
-                  className={styles.input}
-                  type="password"
-                  autoComplete="off"
-                  maxLength={512}
-                  required
-                  disabled={isGeneratingVision}
-                />
-              </label>
               <button
                 type="submit"
                 className={`${styles.btn} ${styles.btnPrimary}`}
                 disabled={isGeneratingVision || !visionSelection.length}
               >
-                Send to OpenAI and generate
+                Generate with Codex
               </button>
             </form>
           )}

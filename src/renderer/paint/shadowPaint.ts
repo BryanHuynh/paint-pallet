@@ -1,9 +1,3 @@
-export interface ShadowRegion {
-  id: string;
-  name: string;
-  recipeId: string;
-}
-
 export interface SurfaceFace {
   faceId: number;
   batchIndex: number;
@@ -11,12 +5,13 @@ export interface SurfaceFace {
 }
 
 export type ShadowTool = 'brush' | 'erase';
-export type ShadowHit = SurfaceFace & { regionId: string };
+export type ShadowHit = SurfaceFace & { recipeId: string };
 export type ShadowCoverage = ReadonlyMap<number, ReadonlyMap<number, ShadowHit>>;
 
 interface StrokeEdit {
   added: ShadowHit[];
   removed: ShadowHit[];
+  recipeIds: Set<string>;
 }
 
 export interface ShadowHistory {
@@ -52,28 +47,38 @@ function applyStroke(coverage: ShadowCoverage, added: ShadowHit[], removed: Shad
 }
 
 export interface ShadowStroke {
-  readonly regionId: string;
-  readonly tool: ShadowTool;
+  readonly recipeId: string;
+  readonly tool: ShadowTool | 'repaint';
   readonly edit: StrokeEdit;
   coverage: ShadowCoverage;
 }
 
-export function startShadowStroke(coverage: ShadowCoverage, regionId: string, tool: ShadowTool): ShadowStroke {
-  return { coverage, regionId, tool, edit: { added: [], removed: [] } };
+export function startShadowStroke(coverage: ShadowCoverage, recipeId: string, tool: ShadowStroke['tool']): ShadowStroke {
+  return { coverage, recipeId, tool, edit: { added: [], removed: [], recipeIds: new Set() } };
 }
 
 export function paintShadowFaces(stroke: ShadowStroke, faces: Iterable<SurfaceFace>): boolean {
-  const change: StrokeEdit = { added: [], removed: [] };
+  const change: Pick<StrokeEdit, 'added' | 'removed'> = { added: [], removed: [] };
   for (const face of faces) {
     const previous = stroke.coverage.get(face.batchIndex)?.get(face.faceId);
-    if (stroke.tool === 'brush' && !previous) change.added.push({ ...face, regionId: stroke.regionId });
-    if (stroke.tool === 'erase' && previous?.regionId === stroke.regionId) change.removed.push(previous);
+    if (stroke.tool === 'brush' && !previous) change.added.push({ ...face, recipeId: stroke.recipeId });
+    if (stroke.tool === 'repaint' && previous?.recipeId !== stroke.recipeId) {
+      if (previous) change.removed.push(previous);
+      change.added.push({ ...face, recipeId: stroke.recipeId });
+    }
+    if (stroke.tool === 'erase' && previous?.recipeId === stroke.recipeId) change.removed.push(previous);
   }
   if (!change.added.length && !change.removed.length) return false;
 
   stroke.coverage = applyStroke(stroke.coverage, change.added, change.removed);
-  for (const hit of change.added) stroke.edit.added.push(hit);
-  for (const hit of change.removed) stroke.edit.removed.push(hit);
+  for (const hit of change.added) {
+    stroke.edit.added.push(hit);
+    stroke.edit.recipeIds.add(hit.recipeId);
+  }
+  for (const hit of change.removed) {
+    stroke.edit.removed.push(hit);
+    stroke.edit.recipeIds.add(hit.recipeId);
+  }
   return true;
 }
 

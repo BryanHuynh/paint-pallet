@@ -305,7 +305,7 @@ describe('PaletteWorkspace', () => {
       highlight: { hex: '#86AADA', mixNotes: '2 parts ultramarine, 1 part ivory' },
     };
     const request = vi.fn<(request: VisionRecipeRequest) => Promise<VisionRecipeResult>>()
-      .mockResolvedValueOnce({ ok: false, message: 'OpenAI rejected the API key.' })
+      .mockResolvedValueOnce({ ok: false, message: 'Sign in to Codex CLI with codex login.' })
       .mockResolvedValueOnce({ ok: true, recipes: [{ name: 'Blue cloth', swatches }] });
     vi.stubGlobal('paintPallet', { generateVisionRecipes: request });
     vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockImplementation(function (this: HTMLCanvasElement) {
@@ -320,30 +320,25 @@ describe('PaletteWorkspace', () => {
     fireEvent.change(screen.getByLabelText(/import reference images/i), { target: { files } });
     await screen.findByTestId('reference-canvas');
     await user.click(screen.getByRole('button', { name: 'Generate AI recipes' }));
-    expect(screen.getByText(/sends the selected reference images to OpenAI/i)).toBeInTheDocument();
+    expect(screen.getByText(/uses your Codex CLI sign-in/i)).toBeInTheDocument();
     expect(screen.getByRole('checkbox', { name: 'front.png' })).toBeChecked();
     await user.click(screen.getByRole('checkbox', { name: 'front.png' }));
     await user.click(screen.getByRole('checkbox', { name: 'back.webp' }));
 
-    const key = screen.getByLabelText('OpenAI API key');
-    const submit = screen.getByRole('button', { name: 'Send to OpenAI and generate' });
-    await user.type(key, 'wrong-key');
+    const submit = screen.getByRole('button', { name: 'Generate with Codex' });
     expect(request).not.toHaveBeenCalled();
     await user.click(submit);
-    expect(await screen.findByText('OpenAI rejected the API key.')).toBeInTheDocument();
-    expect(key).toHaveValue('');
+    expect(await screen.findByText('Sign in to Codex CLI with codex login.')).toBeInTheDocument();
     expect(screen.getByLabelText(/recipe name/i)).toHaveValue('Recipe 1');
 
-    await user.type(key, 'example-key');
     await user.click(submit);
     expect(await screen.findByRole('button', { name: 'Blue cloth' })).toHaveAttribute('aria-pressed', 'true');
-    expect(request).toHaveBeenNthCalledWith(2, { apiKey: 'example-key', images: ['data:image/png;base64,5x3'] });
+    expect(request).toHaveBeenNthCalledWith(2, { images: ['data:image/png;base64,5x3'] });
     expect(screen.getByLabelText('Shadow hex')).toHaveValue(swatches.shadow.hex);
     expect(screen.getByLabelText('Midtone hex')).toHaveValue(swatches.midtone.hex);
     expect(screen.getByLabelText('Highlight hex')).toHaveValue(swatches.highlight.hex);
     expect(screen.getByLabelText('Midtone mix notes')).toHaveValue(swatches.midtone.mixNotes);
     expect(screen.getByLabelText('Midtone bottle name')).toHaveValue('');
-    expect(screen.queryByLabelText('OpenAI API key')).toBeNull();
 
     const notes = screen.getByLabelText('Midtone mix notes');
     await user.clear(notes);

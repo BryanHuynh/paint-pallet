@@ -398,18 +398,22 @@ int main() {
             }
           }
           const auto option = pp::extractJsonString(line, "exposureBackend").value_or("auto");
+          const bool castShadowsBetweenParts = pp::extractJsonBool(line, "castShadowsBetweenParts").value_or(true);
           const auto start = std::chrono::steady_clock::now();
           std::string backend = "cpu", fallback, filePath;
           pp::DxrTimings timing;
           // Local comparisons showed a clear end-to-end benefit at reference-model scale.
           constexpr uint32_t referenceScale = 8000000;
-          const bool wantsDxr = option == "auto" ? model->second.triangleCount >= referenceScale : option != "cpu";
-          if (wantsDxr && parts.empty()) {
+          uint64_t triangles = parts.empty() ? model->second.triangleCount : 0;
+          for (const auto& part : parts) triangles += part.model->triangleCount;
+          const bool wantsDxr = option == "auto" ? triangles >= referenceScale : option != "cpu";
+          if (wantsDxr) {
             try {
               std::vector<float> scores;
-              if (state.dxr.compute(model->second, vector, *job.cancelFlag, option, scores, timing)) {
+              if (state.dxr.compute(model->second, vector, *job.cancelFlag, option, scores, timing, parts, castShadowsBetweenParts)) {
                 filePath = pp::writeExposureFile(model->second, jobId, scores, *job.cancelFlag);
                 backend = "dxr";
+                state.lighting.clear();
               }
             } catch (const std::exception& failure) {
               state.dxr.clear();
@@ -417,7 +421,7 @@ int main() {
             }
           }
           if (backend == "cpu" && !job.cancelFlag->load(std::memory_order_relaxed)) {
-            filePath = state.lighting.writeExposure(model->second, jobId, vector, *job.cancelFlag, parts);
+            filePath = state.lighting.writeExposure(model->second, jobId, vector, *job.cancelFlag, parts, castShadowsBetweenParts);
           }
           const double elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
           if (filePath.empty()) {

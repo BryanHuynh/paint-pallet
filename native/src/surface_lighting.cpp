@@ -15,11 +15,22 @@ namespace {
 
 constexpr size_t vertexStride = 4;
 
+struct PartRayContext {
+  RTCRayQueryContext context;
+  const ModelRecord* model;
+};
+
+void filterOtherParts(const RTCFilterFunctionNArguments* args) {
+  const auto* query = reinterpret_cast<const PartRayContext*>(args->context);
+  if (args->geometryUserPtr != query->model) std::fill_n(args->valid, args->N, 0);
+}
+
 float exposureAt(
     RTCScene scene,
     const float* vertices,
     const std::array<float, 3>& direction,
-    float bias) {
+    float bias,
+    const ModelRecord* selfOnly) {
   const float* a = vertices;
   const float* b = vertices + vertexStride;
   const float* c = vertices + 2 * vertexStride;
@@ -45,11 +56,51 @@ float exposureAt(
   ray.dir_z = direction[2];
   ray.tfar = std::numeric_limits<float>::infinity();
   ray.mask = 0xffffffffu;
-  rtcOccluded1(scene, &ray);
+  if (selfOnly) {
+    PartRayContext query;
+    rtcInitRayQueryContext(&query.context);
+    query.model = selfOnly;
+    RTCOccludedArguments args;
+    rtcInitOccludedArguments(&args);
+    args.context = &query.context;
+    args.flags = RTC_RAY_QUERY_FLAG_INVOKE_ARGUMENT_FILTER;
+    args.filter = filterOtherParts;
+    rtcOccluded1(scene, &ray, &args);
+  } else {
+    rtcOccluded1(scene, &ray);
+  }
   return ray.tfar < 0.0f ? 0.0f : static_cast<float>(std::min(1.0, light / area));
 }
 
 }  // namespace
+
+LightingTransform::LightingTransform(const std::array<float, 7>& pose) {
+  const auto [tx, ty, tz, x, y, z, w] = pose;
+  const float basis[3][3] = {
+    {1 - 2 * (y*y + z*z), 2 * (x*y - w*z), 2 * (x*z + w*y)},
+    {2 * (x*y + w*z), 1 - 2 * (x*x + z*z), 2 * (y*z - w*x)},
+    {2 * (x*z - w*y), 2 * (y*z + w*x), 1 - 2 * (x*x + y*y)},
+  };
+  for (size_t axis = 0; axis < 3; ++axis) {
+    std::copy_n(basis[axis], 3, basis_[axis]);
+    translation_[axis] = pose[axis];
+  }
+}
+
+float LightingTransform::transformCoordinate(const float* vertex, size_t axis) const {
+  return basis_[axis][0] * vertex[0] + basis_[axis][1] * vertex[1] +
+      basis_[axis][2] * vertex[2] + translation_[axis];
+}
+
+std::string lightingSceneKey(const ModelRecord& model, const std::vector<LightingPart>& layout) {
+  std::ostringstream key;
+  key << std::setprecision(std::numeric_limits<float>::max_digits10) << model.modelId;
+  for (const auto& part : layout) {
+    key << ':' << part.model->modelId << ':' << part.faceOffset;
+    for (float value : part.pose) key << ':' << value;
+  }
+  return key.str();
+}
 
 SurfaceLighting::~SurfaceLighting() {
   clear();
@@ -79,6 +130,7 @@ bool SurfaceLighting::prepare(
   RTCScene scene = rtcNewScene(device_);
   if (!scene) throw std::runtime_error("Embree could not allocate a lighting scene.");
   rtcSetSceneBuildQuality(scene, RTC_BUILD_QUALITY_MEDIUM);
+  if (parts.size() > 1) rtcSetSceneFlags(scene, RTC_SCENE_FLAG_FILTER_FUNCTION_IN_ARGUMENTS);
   std::vector<Batch> batches;
   std::array<float, 3> minimum, maximum;
   minimum.fill(std::numeric_limits<float>::infinity());
@@ -90,13 +142,7 @@ bool SurfaceLighting::prepare(
     for (const auto& part : parts) {
       if (canceled.load(std::memory_order_relaxed)) break;
       scoreCount = std::max(scoreCount, static_cast<size_t>(part.faceOffset) + part.model->triangleCount);
-      const auto [tx, ty, tz, x, y, z, w] = part.pose;
-      const float basis[3][3] = {
-        {1 - 2 * (y*y + z*z), 2 * (x*y - w*z), 2 * (x*z + w*y)},
-        {2 * (x*y + w*z), 1 - 2 * (x*x + z*z), 2 * (y*z - w*x)},
-        {2 * (x*z - w*y), 2 * (y*z + w*x), 1 - 2 * (x*x + y*y)},
-      };
-      const float translation[3] = {tx, ty, tz};
+      const LightingTransform transform(part.pose);
       for (const auto& batch : part.model->batches) {
         if (canceled.load(std::memory_order_relaxed)) break;
         const auto data = source.getOrLoad(batch.filePath);
@@ -107,6 +153,7 @@ bool SurfaceLighting::prepare(
         RTCGeometry geometry = rtcNewGeometry(device_, RTC_GEOMETRY_TYPE_TRIANGLE);
         if (!geometry) throw std::runtime_error("Embree could not allocate a mesh batch.");
         rtcSetGeometryBuildQuality(geometry, RTC_BUILD_QUALITY_MEDIUM);
+        rtcSetGeometryUserData(geometry, const_cast<ModelRecord*>(part.model));
         float* positions = static_cast<float*>(rtcSetNewGeometryBuffer(
             geometry, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, vertexStride * sizeof(float), triangleCount * 3));
         unsigned* indices = static_cast<unsigned*>(rtcSetNewGeometryBuffer(
@@ -119,9 +166,7 @@ bool SurfaceLighting::prepare(
 
         for (size_t vertex = 0; vertex < triangleCount * 3; ++vertex) {
           for (size_t axis = 0; axis < 3; ++axis) {
-            const float value = basis[axis][0] * data->positions[vertex * 3] +
-                                basis[axis][1] * data->positions[vertex * 3 + 1] +
-                                basis[axis][2] * data->positions[vertex * 3 + 2] + translation[axis];
+            const float value = transform.transformCoordinate(&data->positions[vertex * 3], axis);
             positions[vertex * vertexStride + axis] = value;
             minimum[axis] = std::min(minimum[axis], value);
             maximum[axis] = std::max(maximum[axis], value);
@@ -135,7 +180,7 @@ bool SurfaceLighting::prepare(
         if (id == RTC_INVALID_GEOMETRY_ID || rtcGetDeviceError(device_) != RTC_ERROR_NONE) {
           throw std::runtime_error("Embree could not attach a mesh batch.");
         }
-        batches.push_back({positions, data->faceIds, part.faceOffset});
+        batches.push_back({positions, data->faceIds, part.faceOffset, part.model});
       }
     }
 
@@ -167,8 +212,9 @@ bool SurfaceLighting::prepare(
 
 bool SurfaceLighting::trace(
     const std::array<float, 3>& direction,
-    const std::atomic<bool>& canceled) {
-  if (!exposure_.empty() && scoredDirection_ == direction) return true;
+    const std::atomic<bool>& canceled,
+    bool selfOnly) {
+  if (!exposure_.empty() && scoredDirection_ == direction && scoredSelfOnly_ == selfOnly) return true;
 
   std::vector<float> result(scoreCount_);
   const float bias = std::max(1e-7f, extent_ * 1e-6f);
@@ -182,7 +228,8 @@ bool SurfaceLighting::trace(
         if (i % 4096 == 0 && canceled.load(std::memory_order_relaxed)) return;
         const uint32_t id = batch.faceOffset + batch.faceIds[i];
         if (id >= result.size()) continue;
-        result[id] = exposureAt(scene_, &batch.vertices[i * 3 * vertexStride], direction, bias);
+        result[id] = exposureAt(scene_, &batch.vertices[i * 3 * vertexStride], direction, bias,
+          selfOnly ? batch.model : nullptr);
       }
     }
   };
@@ -195,6 +242,7 @@ bool SurfaceLighting::trace(
   }
   if (canceled.load(std::memory_order_relaxed)) return false;
   scoredDirection_ = direction;
+  scoredSelfOnly_ = selfOnly;
   exposure_ = std::move(result);
   return true;
 }
@@ -204,7 +252,8 @@ std::string SurfaceLighting::writeExposure(
     const std::string& jobId,
     const std::array<float, 3>& direction,
     const std::atomic<bool>& canceled,
-    const std::vector<LightingPart>& parts) {
+    const std::vector<LightingPart>& parts,
+    bool castShadowsBetweenParts) {
   const double length = std::hypot(direction[0], direction[1], direction[2]);
   if (!(length > 0.0) || !std::isfinite(length)) throw std::runtime_error("Invalid light direction.");
   const std::array<float, 3> normalized{
@@ -213,13 +262,8 @@ std::string SurfaceLighting::writeExposure(
       static_cast<float>(direction[2] / length)};
   const std::vector<LightingPart> single = {{&model}};
   const auto& layout = parts.empty() ? single : parts;
-  std::ostringstream key;
-  key << std::setprecision(std::numeric_limits<float>::max_digits10) << model.modelId;
-  for (const auto& part : layout) {
-    key << ':' << part.model->modelId << ':' << part.faceOffset;
-    for (float value : part.pose) key << ':' << value;
-  }
-  if (!prepare(layout, key.str(), canceled) || !trace(normalized, canceled) ||
+  if (!prepare(layout, lightingSceneKey(model, layout), canceled) ||
+      !trace(normalized, canceled, layout.size() > 1 && !castShadowsBetweenParts) ||
       canceled.load(std::memory_order_relaxed)) return {};
 
   return writeExposureFile(model, jobId, exposure_, canceled);

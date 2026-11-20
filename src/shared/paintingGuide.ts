@@ -7,7 +7,7 @@ export type GuideView = typeof GUIDE_VIEWS[number];
 export type GuidePaper = 'Letter' | 'A4';
 
 export interface GuideCallout {
-  regionId: string;
+  recipeId: string;
   view: GuideView;
   x: number;
   y: number;
@@ -23,7 +23,7 @@ export interface GuideRow {
 export type GuideImages = Record<ToneSlot, string[]> & { edge?: string[] };
 
 export interface GuideDetail {
-  regionId: string;
+  recipeId: string;
   view: GuideView | 'Top' | 'Bottom';
   image: string;
   x: number;
@@ -42,7 +42,7 @@ export interface InstallationStepView {
 export interface GuideExport {
   paper: GuidePaper;
   modelName: string;
-  snapshot: string;
+  lighting: string;
   rows: GuideRow[];
   callouts: GuideCallout[];
   details?: Partial<Record<GuidePass, GuideDetail[]>>;

@@ -10,16 +10,13 @@ import {
   undoShadowStroke,
   type ShadowCoverage,
   type ShadowHistory,
-  type ShadowRegion,
   type ShadowStroke,
   type ShadowTool,
   type SurfaceFace,
 } from './shadowPaint';
 import { packShadowCoverage, unpackShadowCoverage } from './projectMasks';
 
-export function useShadowPainting(recipes: PaintRecipe[]) {
-  const [regions, setRegions] = useState<ShadowRegion[]>([]);
-  const [regionId, setRegionId] = useState('');
+export function useShadowPainting(recipes: PaintRecipe[], activeRecipeId: string | null) {
   const [tool, setTool] = useState<ShadowTool | 'fill' | null>(null);
   const [brushSize, setBrushSize] = useState(32);
   const [history, setHistory] = useState(emptyShadowHistory);
@@ -27,32 +24,25 @@ export function useShadowPainting(recipes: PaintRecipe[]) {
   const [strokePending, setStrokePending] = useState(false);
   const [draft, setDraft] = useState<{ coverage: ShadowCoverage; faceDelta: number } | null>(null);
   const strokeRef = useRef<ShadowStroke | null>(null);
-  const region = regions.find((candidate) => candidate.id === regionId);
-  const recipe = recipes.find((candidate) => candidate.id === region?.recipeId);
-
-  const colors = useMemo(() => {
-    const byRecipe = new Map(recipes.map((entry) => [entry.id, entry.swatches.shadow.hex]));
-    return new Map(regions.map((entry) => [entry.id, byRecipe.get(entry.recipeId) ?? '#2b303a']));
-  }, [recipes, regions]);
-
-  const committedFaceCount = useMemo(() => {
-    let count = 0;
+  const recipe = recipes.find((candidate) => candidate.id === activeRecipeId) ?? recipes[0];
+  const recipeId = recipe?.id;
+  const colors = useMemo(() => new Map(recipes.map((entry) => [entry.id, entry.swatches.shadow.hex])), [recipes]);
+  const faceCounts = useMemo(() => {
+    const counts = new Map<string, number>();
     for (const batch of history.coverage.values()) {
-      for (const hit of batch.values()) if (hit.regionId === regionId) count++;
+      for (const hit of batch.values()) counts.set(hit.recipeId, (counts.get(hit.recipeId) ?? 0) + 1);
     }
-    return count;
-  }, [history.coverage, regionId]);
-
-  function createRegion() {
-    const number = regions.length + 1;
-    const id = `region-${number}`;
-    setRegions([...regions, { id, name: `Region ${number}`, recipeId: recipes[0]?.id ?? '' }]);
-    setRegionId(id);
-  }
-
-  function updateRegion(changes: Partial<Pick<ShadowRegion, 'name' | 'recipeId'>>) {
-    setRegions((previous) => previous.map((entry) => entry.id === regionId ? { ...entry, ...changes } : entry));
-  }
+    return counts;
+  }, [history.coverage]);
+  const usedRecipeIds = useMemo(() => {
+    const ids = new Set(faceCounts.keys());
+    for (const edits of [history.undo, history.redo]) {
+      for (const edit of edits) {
+        for (const id of edit.recipeIds) ids.add(id);
+      }
+    }
+    return ids;
+  }, [faceCounts, history.undo, history.redo]);
 
   function updateHistory(next: ShadowHistory) {
     historyRef.current = next;
@@ -61,8 +51,6 @@ export function useShadowPainting(recipes: PaintRecipe[]) {
 
   function reset() {
     strokeRef.current = null;
-    setRegions([]);
-    setRegionId('');
     updateHistory(emptyShadowHistory());
     setTool(null);
     setStrokePending(false);
@@ -70,8 +58,8 @@ export function useShadowPainting(recipes: PaintRecipe[]) {
   }
 
   function beginStroke(): boolean {
-    if (!tool || tool === 'fill' || !region || !recipe || strokeRef.current) return false;
-    strokeRef.current = startShadowStroke(historyRef.current.coverage, region.id, tool);
+    if (!tool || tool === 'fill' || !recipeId || strokeRef.current) return false;
+    strokeRef.current = startShadowStroke(historyRef.current.coverage, recipeId, tool);
     setStrokePending(true);
     return true;
   }
@@ -94,35 +82,29 @@ export function useShadowPainting(recipes: PaintRecipe[]) {
     setStrokePending(false);
   }
 
-  function commitFill(faces: Iterable<SurfaceFace>) {
-    if (!region || !recipe || strokeRef.current) return;
+  function commitFill(faces: Iterable<SurfaceFace>, repaint: boolean) {
+    if (!recipeId || strokeRef.current) return;
     const history = historyRef.current;
-    const fill = startShadowStroke(history.coverage, region.id, 'brush');
+    const fill = startShadowStroke(history.coverage, recipeId, repaint ? 'repaint' : 'brush');
     if (paintShadowFaces(fill, faces)) updateHistory(commitShadowStroke(history, fill));
   }
 
   function restoreProject(state: ProjectState, paint: Uint32Array) {
     reset();
-    setRegions(state.regions);
-    setRegionId(state.activeRegionId ?? '');
-    updateHistory({ ...emptyShadowHistory(), coverage: unpackShadowCoverage(paint, state.regions) });
+    updateHistory({ ...emptyShadowHistory(), coverage: unpackShadowCoverage(paint, state.recipes) });
   }
 
   return {
-    regions, region, recipe, colors, tool, brushSize, setBrushSize, strokePending,
-    paintedFaces: committedFaceCount + (draft?.faceDelta ?? 0),
-    exportProject: () => ({
-      regions,
-      activeRegionId: region?.id ?? null,
-      paint: packShadowCoverage(historyRef.current.coverage, regions),
-    }),
+    recipe, colors, faceCounts, usedRecipeIds, tool, brushSize, setBrushSize, strokePending,
+    paintedFaces: (recipeId ? faceCounts.get(recipeId) ?? 0 : 0) + (draft?.faceDelta ?? 0),
+    exportProject: () => packShadowCoverage(historyRef.current.coverage, recipes),
     restoreProject,
     coverage: draft?.coverage ?? history.coverage,
     committedCoverage: history.coverage,
     commitFill,
     canUndo: history.undo.length > 0,
     canRedo: history.redo.length > 0,
-    createRegion, updateRegion, setRegionId, setTool, reset, beginStroke, paintFaces, endStroke,
+    setTool, reset, beginStroke, paintFaces, endStroke,
     undo: () => {
       if (!strokeRef.current) updateHistory(undoShadowStroke(historyRef.current));
     },
